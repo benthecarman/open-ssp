@@ -1165,6 +1165,34 @@ async fn pay_between(
 }
 
 async fn static_deposit(client: &Client, config: &TestConfig, wallet: &Wallet) -> Result<()> {
+    let project = command_output(
+        "docker",
+        &[
+            "inspect",
+            "--format",
+            "{{ index .Config.Labels \"com.docker.compose.project\" }}",
+            &config.ssp_container,
+        ],
+    )
+    .await?;
+    let project_filter = format!("label=com.docker.compose.project={}", project.trim());
+    let miner_container = command_output(
+        "docker",
+        &[
+            "ps",
+            "-q",
+            "--filter",
+            &project_filter,
+            "--filter",
+            "label=com.docker.compose.service=bitcoin-miner",
+        ],
+    )
+    .await?;
+    ensure!(
+        miner_container.lines().count() == 1,
+        "test needs exactly one miner"
+    );
+    command_output("docker", &["stop", miner_container.trim()]).await?;
     let ssp_before = ssp_available_balance(client, config, wallet.ssp_url).await?;
     let before = wallet_balance(wallet).await?;
     let address = wallet
@@ -1216,7 +1244,96 @@ async fn static_deposit(client: &Client, config: &TestConfig, wallet: &Wallet) -
         ensure!(deposit.amount==9901,"deposit history amount is {}",deposit.amount);
         Ok(())
     }).await?;
-    println!("PASS static deposit: 10000 sats funded, 9901 sats credited, recovery broadcast");
+    let session = authenticate_wallet(client, wallet).await?;
+    let history = graphql_json(
+        client,
+        wallet,
+        Some(&session),
+        "FetchCurrentUserToUserRequestsConnection",
+        json!({"first":100,"types":["CLAIM_STATIC_DEPOSIT"]}),
+    )
+    .await?;
+    let record = history["current_user"]["user_requests"]["entities"]
+        .as_array()
+        .context("static deposit history missing")?
+        .iter()
+        .find(|r| r["transaction_id"] == txid)
+        .context("static deposit request missing")?;
+    ensure!(
+        record["status"] == "SPEND_TX_BROADCAST",
+        "unexpected deposit stage: {record}"
+    );
+    let id = record["id"].clone();
+    let broadcast_updated = record["updated_at"].clone();
+    bitcoin_rpc(client, config, "generatetoaddress", json!([1, miner])).await?;
+    poll(
+        "static deposit recovery confirmed",
+        config.timeout,
+        || async {
+            let current = graphql_json(
+                client,
+                wallet,
+                Some(&session),
+                "UserRequest",
+                json!({"request_id":id}),
+            )
+            .await?;
+            ensure!(
+                current["user_request"]["status"] == "SPEND_TX_CONFIRMED",
+                "deposit recovery not confirmed: {current}"
+            );
+            ensure!(
+                current["user_request"]["updated_at"] != broadcast_updated,
+                "deposit confirmation did not update timestamp"
+            );
+            Ok(())
+        },
+    )
+    .await?;
+    let confirmed = graphql_json(
+        client,
+        wallet,
+        Some(&session),
+        "UserRequest",
+        json!({"request_id":id}),
+    )
+    .await?;
+    let replay = graphql_json(
+        client,
+        wallet,
+        Some(&session),
+        "UserRequest",
+        json!({"request_id":id}),
+    )
+    .await?;
+    ensure!(confirmed == replay, "deposit read changed durable metadata");
+    for operation in [
+        "CreateInstantStaticDepositQuote",
+        "CreateClaimInstantStaticDeposit",
+    ] {
+        reject_request(
+            client,
+            wallet,
+            Some(&session),
+            operation,
+            json!({}),
+            "unsupported_operation",
+        )
+        .await?;
+    }
+    let quote = client.post(format!("{}/graphql/spark/rc", wallet.ssp_url))
+        .bearer_auth(&session).header("x-partner-jwt", "unconfigured-partner")
+        .json(&json!({"operationName":"LightningReceiveQuote","query":"mutation LightningReceiveQuote { result }","variables":{"amount_sats":1000}}))
+        .send().await?.json::<Value>().await?;
+    ensure!(
+        quote["data"]["lightning_receive_quote"]["attribution_status"]
+            == "PARTNER_ATTRIBUTION_UNSUPPORTED",
+        "partner header was ignored: {quote}"
+    );
+    println!(
+        "PASS static deposit: 9901 sats credited, recovery confirmed, stable metadata; instant stubs rejected"
+    );
+    command_output("docker", &["start", miner_container.trim()]).await?;
     Ok(())
 }
 

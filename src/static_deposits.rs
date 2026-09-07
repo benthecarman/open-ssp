@@ -43,6 +43,8 @@ pub struct DepositClaim {
     pub plan: StaticPlan,
     pub signed_spend: Option<String>,
     pub status: String,
+    #[serde(default)]
+    pub phase: String,
 }
 pub struct StaticDepositService {
     db: Arc<Db>,
@@ -296,11 +298,12 @@ impl StaticDepositService {
             plan,
             signed_spend: None,
             status: "IN_PROGRESS".into(),
+            phase: "CREATED".into(),
         };
         self.db.with(|c| {
             let tx=c.unchecked_transaction()?;
             tx.execute("INSERT INTO deposit_claims(id,txid,vout,owner,status,data) VALUES(?1,?2,?3,?4,?5,?6)",(&record.id,&txid,vout,owner,&record.status,json!(record).to_string()))?;
-            let payload=json!({"network":self.network,"transaction_id":txid,"output_index":vout,"credit_amount_sats":record.quote.credit,"deposit_amount_sats":record.quote.credit+record.quote.fee,"max_fee_sats":record.quote.fee,"status":"IN_PROGRESS","transfer_spark_id":record.transfer_id}).to_string();
+            let payload=json!({"network":self.network,"transaction_id":txid,"output_index":vout,"credit_amount_sats":record.quote.credit,"deposit_amount_sats":record.quote.credit+record.quote.fee,"max_fee_sats":record.quote.fee,"status":"IN_PROGRESS","phase":record.phase,"transfer_spark_id":record.transfer_id}).to_string();
             tx.execute("INSERT INTO requests(id,kind,owner,created_at,payload) VALUES(?1,'CLAIM_STATIC_DEPOSIT',?2,?3,?4)",(&record.id,owner,chrono::Utc::now().to_rfc3339(),payload))?;
             tx.commit()
         }).await?;
@@ -308,7 +311,7 @@ impl StaticDepositService {
         Ok(record.transfer_id)
     }
     async fn advance(&self, record: &mut DepositClaim) -> Result<(), String> {
-        if record.status == "SUCCEEDED" {
+        if record.phase == "SPEND_TX_CONFIRMED" {
             return Ok(());
         }
         if record.signed_spend.is_none() {
@@ -317,6 +320,7 @@ impl StaticDepositService {
                 .submit_static_claim(&record.quote, &record.transfer_id, &record.plan)
                 .await?;
             record.signed_spend = Some(hex::encode(serialize(&raw)));
+            record.phase = "SPEND_TX_CREATED".into();
             self.save(record).await?;
         }
         let raw = record
@@ -330,23 +334,29 @@ impl StaticDepositService {
             .bitcoin
             .bitcoin_rpc("gettransaction", json!([tx.compute_txid().to_string()]))
             .await;
-        if !observed
+        let confirmed = observed
             .as_ref()
             .ok()
-            .is_some_and(|v| v["confirmations"].as_i64().unwrap_or(0) > 0)
-        {
+            .is_some_and(|v| v["confirmations"].as_i64().unwrap_or(0) > 0);
+        if !confirmed {
             self.bitcoin
                 .bitcoin_rpc("sendrawtransaction", json!([raw]))
                 .await?;
         }
         record.status = "SUCCEEDED".into();
+        record.phase = if confirmed {
+            "SPEND_TX_CONFIRMED"
+        } else {
+            "SPEND_TX_BROADCAST"
+        }
+        .into();
         self.save(record).await
     }
     async fn save(&self, record: &DepositClaim) -> Result<(), String> {
         self.db.with(|c| {
             let tx=c.unchecked_transaction()?;
             tx.execute("UPDATE deposit_claims SET status=?2,data=?3,last_error=NULL WHERE id=?1",(&record.id,&record.status,json!(record).to_string()))?;
-            tx.execute("UPDATE requests SET payload=json_set(payload,'$.status',?2) WHERE id=?1",(&record.id,&record.status))?;
+            tx.execute("UPDATE requests SET payload=json_set(payload,'$.status',?2,'$.phase',?3) WHERE id=?1",(&record.id,&record.status,&record.phase))?;
             if record.signed_spend.is_some() {
                 tx.execute("INSERT INTO transfers(spark_id,request_id,kind,status,owner) VALUES(?1,?2,'CLAIM_STATIC_DEPOSIT','COMPLETED',?3) ON CONFLICT(spark_id) DO NOTHING",(&record.transfer_id,&record.id,&record.quote.owner))?;
             }
@@ -357,7 +367,7 @@ impl StaticDepositService {
         loop {
             {
                 let _guard = self.lock.lock().await;
-                let records:Result<Vec<DepositClaim>,String>=self.db.with(|c|{let mut s=c.prepare("SELECT data FROM deposit_claims WHERE status!='SUCCEEDED' ORDER BY rowid LIMIT 100")?;let rows=s.query_map([],row)?;rows.collect()}).await;
+                let records:Result<Vec<DepositClaim>,String>=self.db.with(|c|{let mut s=c.prepare("SELECT data FROM deposit_claims WHERE COALESCE(json_extract(data,'$.phase'),'')!='SPEND_TX_CONFIRMED' ORDER BY rowid LIMIT 100")?;let rows=s.query_map([],row)?;rows.collect()}).await;
                 match records {
                     Ok(records) => {
                         for mut record in records {

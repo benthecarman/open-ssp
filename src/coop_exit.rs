@@ -381,7 +381,7 @@ impl CoopExitService {
                     "withdrawal key or transfer ID was already used for another request".into(),
                 );
             }
-            return Ok(self.response(&record));
+            return self.response(&record).await;
         }
         if self.db.coop_exit_pending_for_owner(owner).await? {
             return Err("complete the pending withdrawal before requesting another".into());
@@ -502,7 +502,7 @@ impl CoopExitService {
         self.db
             .insert_coop_exit(&record, &outpoint.to_string())
             .await?;
-        Ok(self.response(&record))
+        self.response(&record).await
     }
 
     pub async fn complete(&self, owner: &str, input: &Value) -> Result<Value, String> {
@@ -526,29 +526,31 @@ impl CoopExitService {
             return Err("withdrawal request expired".into());
         }
         self.advance(&mut record).await?;
-        Ok(self.response(&record))
+        self.response(&record).await
     }
 
     pub async fn get(&self, id: &str, owner: &str) -> Result<Option<Value>, String> {
-        Ok(self
-            .db
-            .coop_exit(id, owner)
-            .await?
-            .map(|record| self.response(&record)))
+        match self.db.coop_exit(id, owner).await? {
+            Some(record) => Ok(Some(self.response(&record).await?)),
+            None => Ok(None),
+        }
     }
 
-    pub fn response(&self, record: &ExitRecord) -> Value {
+    pub async fn response(&self, record: &ExitRecord) -> Result<Value, String> {
+        let updated = self.db.request_updated_at(&record.id).await?;
         let tx: Transaction =
             deserialize(&hex::decode(&record.raw_exit).expect("stored transaction hex"))
                 .expect("stored transaction");
-        json!({"__typename":"CoopExitRequest", "id":record.id, "network":self.network_name,
-            "created_at":timestamp(record.created_at), "updated_at":timestamp(record.created_at),
+        Ok(
+            json!({"__typename":"CoopExitRequest", "id":record.id, "network":self.network_name,
+            "created_at":timestamp(record.created_at), "updated_at":updated,
             "expires_at":timestamp(record.expires_at), "withdrawal_address":record.quote.address,
             "fee":sats(record.quote.user_fee), "l1_broadcast_fee":sats(record.fee_sats),
             "fee_quote":self.quote_response(&record.quote), "exit_speed":record.speed,
             "status":record.status, "raw_connector_transaction":record.raw_connector,
             "raw_coop_exit_transaction":record.raw_exit, "coop_exit_txid":tx.compute_txid().to_string(),
-            "transfer_spark_id":record.transfer_id, "transfer":null})
+            "transfer_spark_id":record.transfer_id, "transfer":null}),
+        )
     }
 
     /// Raise the package fee by spending only the SSP change output. The

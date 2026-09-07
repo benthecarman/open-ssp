@@ -107,7 +107,7 @@ pub async fn dispatch(
                 .await?;
             let mut entities = Vec::with_capacity(page.records.len());
             for record in &page.records {
-                entities.push(user_request_union(&state, record).await);
+                entities.push(user_request_union(&state, record).await?);
             }
             Ok(json!({ "current_user": { "user_requests": {
                 "__typename": "SparkWalletUserToUserRequestsConnection",
@@ -128,7 +128,7 @@ pub async fn dispatch(
                 validate_network(&state, &requested_network)?;
             }
             Ok(
-                json!({"lightning_receive_quote":crate::quotes::issue(&state,&owner,amount,&input).await?}),
+                json!({"lightning_receive_quote":crate::quotes::issue(&state,&owner,amount,&input,headers.contains_key("x-partner-jwt")).await?}),
             )
         }
         "RequestBolt12Receive" | "request_bolt12_receive" => {
@@ -313,7 +313,7 @@ pub async fn dispatch(
                 {
                     state.ldk.submit_send(&send).await?;
                 }
-                return send_response_from_record(&state, &rec, &now).await;
+                return send_response_from_record(&state, &rec).await;
             }
             let send = state.ldk.prepare_send(&owner, &ext_id, &inv, amt).await?;
             let rec = state
@@ -321,7 +321,7 @@ pub async fn dispatch(
                 .prepare_lightning_send(&send, &idem, &state.config.network)
                 .await?;
             state.ldk.submit_send(&send).await?;
-            return send_response_from_record(&state, &rec, &now).await;
+            return send_response_from_record(&state, &rec).await;
         }
         // ---- swaps (SDK mutation name is RequestSwap / field request_swap) ----
         "RequestSwap" | "request_swap" => {
@@ -386,21 +386,8 @@ pub async fn dispatch(
                 )
                 .await?;
             let inbound_id = fill.transfer_id;
-            let swap_leaves = fill
-                .leaf_ids
-                .into_iter()
-                .map(|leaf_id| {
-                    json!({
-                        "leaf_id": leaf_id,
-                        "raw_unsigned_refund_transaction": "",
-                        "adaptor_signed_signature": "",
-                        "direct_raw_unsigned_refund_transaction": "",
-                        "direct_adaptor_signed_signature": "",
-                        "direct_from_cpfp_raw_unsigned_refund_transaction": "",
-                        "direct_from_cpfp_adaptor_signed_signature": "",
-                    })
-                })
-                .collect::<Vec<_>>();
+            let swap_leaves = fill.leaves;
+            let expires_at = fill.expires_at;
             let rec = store_request(
                 &state,
                 "LEAVES_SWAP",
@@ -409,7 +396,7 @@ pub async fn dispatch(
                 json!({"total_amount_sats": total, "target_amount_sats": target,
                        "fee_sats": fee,
                        "inbound_transfer_spark_id": inbound_id, "outbound_transfer_spark_id": ext_id,
-                       "network": network,"status":"OUTBOUND_TRANSFER_SENT","swap_leaves":swap_leaves}),
+                       "network": network,"status":"OUTBOUND_TRANSFER_SENT","swap_leaves":swap_leaves,"expires_at":expires_at}),
                 None,
             )
             .await?;
@@ -424,14 +411,15 @@ pub async fn dispatch(
                     .insert_transfer(&ext_id, &rid, "TRANSFER", "CREATED", &owner)
                     .await?;
             }
+            let updated = state.db.request_updated_at(&rid).await?;
             Ok(json!({ "request_swap": {
                 "request": {
                     "__typename": "LeavesSwapRequest",
                     "id": rec["id"],
                     "created_at": now,
-                    "updated_at": now,
+                    "updated_at": updated,
                     "network": network,
-                    "status": "CREATED",
+                    "status": "OUTBOUND_TRANSFER_SENT",
                     "total_amount": currency_amount(total),
                     "target_amount": currency_amount(target),
                     "fee": currency_amount(fee),
@@ -442,7 +430,7 @@ pub async fn dispatch(
                         "user_request": {"__typename": "LeavesSwapRequest", "id": rec["id"]},
                     },
                     "swap_leaves": swap_leaves,
-                    "expires_at": null,
+                    "expires_at": expires_at,
                 }
             }}))
         }
@@ -462,27 +450,12 @@ pub async fn dispatch(
                 json!({"claim_static_deposit":{"__typename":"ClaimStaticDepositOutput","transfer_id":service.claim(&owner,&input).await?}}),
             )
         }
-        "CreateInstantStaticDepositQuote" | "create_instant_static_deposit_quote" => {
-            let _ = auth::require_session(&state, headers).await?;
-            Ok(json!({ "create_instant_static_deposit_quote": {
-                "quote": {"id": Uuid::new_v4().to_string(), "status": "CREATED"},
-            }}))
-        }
-        "CreateClaimInstantStaticDeposit" | "create_claim_instant_static_deposit" => {
-            let owner = auth::require_session(&state, headers).await?;
-            enforce_compat_quota(&state, &owner).await?;
-            let rec = store_request(
-                &state,
-                "CLAIM_INSTANT_STATIC_DEPOSIT",
-                &owner,
-                &now,
-                static_deposit_payload(&input),
-                None,
-            )
-            .await?;
-            Ok(json!({ "create_claim_instant_static_deposit": {
-                "claim": {"id": rec["id"], "status": "CREATED"},
-            }}))
+        "CreateInstantStaticDepositQuote"
+        | "create_instant_static_deposit_quote"
+        | "CreateClaimInstantStaticDeposit"
+        | "create_claim_instant_static_deposit" => {
+            auth::require_session(&state, headers).await?;
+            Err("UNSUPPORTED_OPERATION: instant static deposits are not implemented; use static_deposit_quote after 3 confirmations".into())
         }
         // ---- cooperative withdrawals ----
         "RequestCoopExit" | "request_coop_exit" => {
@@ -519,7 +492,7 @@ pub async fn dispatch(
                     .get_request(request_id, &owner)
                     .await?
                     .ok_or_else(|| format!("transfer request {request_id} was not found"))?;
-                let user_request = user_request_union(&state, &request).await;
+                let user_request = user_request_union(&state, &request).await?;
                 list.push(transfer_response(row, user_request));
             }
             Ok(json!({ "transfers": list }))
@@ -529,7 +502,7 @@ pub async fn dispatch(
             let rid = str_of(&input, "request_id");
             let found = state.db.get_request(&rid, &owner).await?;
             match found {
-                Some(rec) => Ok(json!({ "user_request": user_request_union(&state, &rec).await })),
+                Some(rec) => Ok(json!({ "user_request": user_request_union(&state, &rec).await? })),
                 None => Ok(json!({ "user_request": null })),
             }
         }
@@ -689,7 +662,7 @@ fn apply_aliases_to_value(v: &mut Value, aliases: &[(String, String)]) {
 /// LIGHTNING_RECEIVE->LightningReceiveRequest, LEAVES_SWAP->LeavesSwapRequest,
 /// COOP_EXIT->CoopExitRequest, CLAIM_STATIC_DEPOSIT->ClaimStaticDeposit.
 /// Send status is refreshed from the payment tracker (event-driven).
-async fn user_request_union(state: &AppState, rec: &Value) -> Value {
+async fn user_request_union(state: &AppState, rec: &Value) -> Result<Value, String> {
     let kind = rec.get("type").and_then(|v| v.as_str()).unwrap_or("");
     let id = rec.get("id").cloned().unwrap_or(Value::Null);
     let created = rec
@@ -697,14 +670,18 @@ async fn user_request_union(state: &AppState, rec: &Value) -> Value {
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
-    let p = rec.get("payload").cloned().unwrap_or(json!({}));
+    let updated = state
+        .db
+        .request_updated_at(id.as_str().unwrap_or(""))
+        .await?;
+    let mut p = rec.get("payload").cloned().unwrap_or(json!({}));
     let net = p
         .get("network")
         .and_then(|v| v.as_str())
         .unwrap_or(&state.config.network)
         .to_string();
     let sats = currency_amount;
-    match kind {
+    Ok(match kind {
         "COOP_EXIT_V2" => match &state.coop_exit {
             Some(service) => service
                 .get(
@@ -727,7 +704,7 @@ async fn user_request_union(state: &AppState, rec: &Value) -> Value {
             };
             json!({
                 "__typename": "LightningSendRequest",
-                "id": id, "created_at": created, "updated_at": created,
+                "id": id, "created_at": created, "updated_at": updated,
                 "network": net,
                 "encoded_invoice": p.get("encoded_invoice").cloned().unwrap_or(Value::Null),
                 "fee": sats(0),
@@ -774,7 +751,7 @@ async fn user_request_union(state: &AppState, rec: &Value) -> Value {
                 });
             json!({
                 "__typename": "LightningReceiveRequest",
-                "id": id, "created_at": created, "updated_at": created,
+                "id": id, "created_at": created, "updated_at": updated,
                 "network": net,
                 "invoice": {
                     "__typename": "Invoice",
@@ -799,6 +776,26 @@ async fn user_request_union(state: &AppState, rec: &Value) -> Value {
             })
         }
         "LEAVES_SWAP" => {
+            let missing_refunds = p["swap_leaves"].as_array().is_none_or(|leaves| {
+                leaves.is_empty() || leaves.iter().any(|leaf| {
+                    leaf["raw_unsigned_refund_transaction"].as_str().is_none_or(str::is_empty)
+                })
+            });
+            if missing_refunds {
+                let transfer_id = p["inbound_transfer_spark_id"]
+                    .as_str().ok_or("legacy swap has no transfer ID")?;
+                let data = state.spark.swap_details(transfer_id).await?;
+                p["swap_leaves"] = json!(data.leaves);
+                p["expires_at"] = json!(data.expires_at);
+                // Preserve any settlement status changed by the worker.
+                state.db.with(|c| c.execute(
+                    "UPDATE requests SET payload=json_set(payload,'$.swap_leaves',json(?2),'$.expires_at',json(?3)) WHERE id=?1",
+                    (id.as_str(), p["swap_leaves"].to_string(), p["expires_at"].to_string()),
+                )).await?;
+            }
+            let updated = state.db.request_updated_at(
+                id.as_str().ok_or("swap has no request ID")?,
+            ).await?;
             let total = p
                 .get("total_amount_sats")
                 .and_then(|v| v.as_u64())
@@ -814,7 +811,7 @@ async fn user_request_union(state: &AppState, rec: &Value) -> Value {
                 .unwrap_or("");
             json!({
                 "__typename": "LeavesSwapRequest",
-                "id": id, "created_at": created, "updated_at": created,
+                "id": id, "created_at": created, "updated_at": updated,
                 "network": net, "status": p.get("status").cloned().unwrap_or(json!("CREATED")),
                 "total_amount": sats(total), "target_amount": sats(target),
                 "fee": sats(fee),
@@ -824,35 +821,32 @@ async fn user_request_union(state: &AppState, rec: &Value) -> Value {
                     "spark_id": inbound,
                     "user_request": {"id": id},
                 },
-                "swap_leaves": p.get("swap_leaves").cloned().unwrap_or(json!([])), "expires_at": null,
+                "swap_leaves": p.get("swap_leaves").cloned().unwrap_or(json!([])), "expires_at": p.get("expires_at"),
             })
         }
-        "COOP_EXIT" => json!({
-            "__typename": "CoopExitRequest",
-            "id": id, "created_at": created, "updated_at": created,
-            "network": net,
-            "fee": sats(1000), "l1_broadcast_fee": sats(500),
-            "fee_quote": null,
-            "exit_speed": p.get("exit_speed").and_then(Value::as_str).unwrap_or("MEDIUM"),
-            "status": p.get("status").and_then(Value::as_str).unwrap_or("CREATED"),
-            "expires_at": null,
-            "raw_connector_transaction": "", "raw_coop_exit_transaction": "",
-            "coop_exit_txid": p.get("coop_exit_txid").cloned().unwrap_or(Value::Null),
-        }),
-        "CLAIM_STATIC_DEPOSIT" => json!({
+        "COOP_EXIT" | "CLAIM_INSTANT_STATIC_DEPOSIT" => return Err(format!(
+            "legacy request {id} has no settlement record; its transaction and fee data are unavailable"
+        )),
+        "CLAIM_STATIC_DEPOSIT" => {
+            let amounts_known = ["credit_amount_sats", "deposit_amount_sats", "max_fee_sats"]
+                .iter().all(|key| p[*key].as_u64().is_some());
+            if !amounts_known {
+                return Err(format!("legacy deposit {id} has no settlement amounts"));
+            }
+            json!({
             "__typename": "ClaimStaticDeposit",
-            "id": id, "created_at": created, "updated_at": created,
+            "id": id, "created_at": created, "updated_at": updated,
             "network": net,
             "credit_amount": sats(p.get("credit_amount_sats").and_then(|v| v.as_u64()).unwrap_or(0)),
             "deposit_amount": sats(p.get("deposit_amount_sats").and_then(Value::as_u64).unwrap_or(0)),
             "max_fee": sats(p.get("max_fee_sats").and_then(Value::as_u64).unwrap_or(0)),
-            "status": if p["status"]=="SUCCEEDED" {"SPEND_TX_BROADCAST"} else {"CREATED"},
+            "status": p.get("phase").cloned().unwrap_or_else(|| json!(if p["status"]=="SUCCEEDED" {"SPEND_TX_BROADCAST"} else {"CREATED"})),
             "transaction_id": p.get("transaction_id").cloned().unwrap_or(Value::Null),
             "output_index": p.get("output_index").cloned().unwrap_or(Value::Null),
             "bitcoin_network": net, "transfer_spark_id": p.get("transfer_spark_id").cloned().unwrap_or(Value::Null),
-        }),
+        })},
         _ => Value::Null,
-    }
+    })
 }
 
 fn transfer_response(row: &Value, user_request: Value) -> Value {
@@ -871,11 +865,11 @@ fn transfer_response(row: &Value, user_request: Value) -> Value {
 /// Build the request_lightning_send response from a stored LIGHTNING_SEND
 /// record, refreshing status from the payment tracker (M4 idempotent replay
 /// shares this with the fresh-send path).
-async fn send_response_from_record(
-    state: &AppState,
-    rec: &Value,
-    now: &str,
-) -> Result<Value, String> {
+async fn send_response_from_record(state: &AppState, rec: &Value) -> Result<Value, String> {
+    let updated = state
+        .db
+        .request_updated_at(rec["id"].as_str().ok_or("missing request ID")?)
+        .await?;
     // Events and reconciliation both update the durable send status.
     let p = rec.get("payload").cloned().unwrap_or(Value::Null);
     let pid = p.get("payment_id").and_then(|v| v.as_str()).unwrap_or("");
@@ -890,7 +884,7 @@ async fn send_response_from_record(
             "__typename": "LightningSendRequest",
             "id": rec["id"],
             "created_at": rec.get("created_at").cloned().unwrap_or(Value::Null),
-            "updated_at": now,
+            "updated_at": updated,
             "network": state.config.network,
             "encoded_invoice": p.get("encoded_invoice").cloned().unwrap_or(Value::Null),
             "fee": currency_amount(0),
@@ -899,38 +893,8 @@ async fn send_response_from_record(
         }
     }}))
 }
-/// Compatibility-only request kinds: stubbed operations with no settlement
-/// lifecycle. Their durable footprint is bounded by a payload allowlist, a
-/// per-owner rolling quota, and TTL pruning (see `Db::prune_compat_requests`).
-const COMPAT_QUOTA_WINDOW_HOURS: i64 = 24;
-const MAX_COMPAT_REQUESTS_PER_OWNER: i64 = 1_000;
-/// Hard ceiling for any persisted request payload. Real financial payloads
-/// (invoices, offers) are a few KiB; anything larger is client padding.
+/// Bound client-derived request data. Swap refund data comes from operators.
 const MAX_REQUEST_PAYLOAD_BYTES: usize = 16 * 1024;
-
-/// Reject compatibility mutations once the owner already holds the quota of
-/// compat rows inside the rolling window.
-async fn enforce_compat_quota(state: &AppState, owner: &str) -> Result<(), String> {
-    let since =
-        (chrono::Utc::now() - chrono::Duration::hours(COMPAT_QUOTA_WINDOW_HOURS)).to_rfc3339();
-    let count = state.db.compat_request_count(owner, &since).await?;
-    if count >= MAX_COMPAT_REQUESTS_PER_OWNER {
-        return Err("compatibility request quota reached; try again later".to_string());
-    }
-    Ok(())
-}
-
-/// Copy only the small known static-deposit fields. Unknown client JSON
-/// (which may be megabytes of padding) must never reach durable storage.
-fn static_deposit_payload(input: &Value) -> Value {
-    let mut payload = serde_json::Map::new();
-    for key in ["transaction_id", "output_index", "quote_signature"] {
-        if let Some(value) = input.get(key) {
-            payload.insert(key.to_string(), value.clone());
-        }
-    }
-    Value::Object(payload)
-}
 
 /// Insert a user-request row into sqlite and return the record shape that
 /// `user_request_union` reads: {id, type, created_at, payload}.
@@ -943,7 +907,7 @@ async fn store_request(
     idempotency_key: Option<&str>,
 ) -> Result<Value, String> {
     let serialized = serde_json::to_string(&payload).map_err(|e| e.to_string())?;
-    if serialized.len() > MAX_REQUEST_PAYLOAD_BYTES {
+    if kind != "LEAVES_SWAP" && serialized.len() > MAX_REQUEST_PAYLOAD_BYTES {
         return Err("request payload is too large".to_string());
     }
     let id = Uuid::new_v4().to_string();
@@ -1031,8 +995,8 @@ fn ids_of(input: &Value, root: &Value) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_query_aliases, currency_amount, static_deposit_payload, str_of, transfer_response,
-        validate_network_name, validate_sats,
+        apply_query_aliases, currency_amount, str_of, transfer_response, validate_network_name,
+        validate_sats,
     };
     use serde_json::json;
 
@@ -1102,23 +1066,5 @@ mod tests {
             transfer["user_request"]["invoice"]["encoded_invoice"],
             "lnbcrt..."
         );
-    }
-
-    #[test]
-    fn static_deposit_payload_drops_unknown_client_fields() {
-        let input = json!({
-            "transaction_id": "00".repeat(32),
-            "output_index": 0,
-            "quote_signature": "sig",
-            "padding": "x".repeat(64),
-            "nested": {"deep": ["padding"]},
-        });
-
-        let payload = static_deposit_payload(&input);
-        assert_eq!(payload["transaction_id"], json!("00".repeat(32)));
-        assert_eq!(payload["output_index"], json!(0));
-        assert_eq!(payload["quote_signature"], json!("sig"));
-        assert!(payload.get("padding").is_none());
-        assert!(payload.get("nested").is_none());
     }
 }

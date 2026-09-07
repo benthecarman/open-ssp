@@ -56,7 +56,35 @@ pub struct SparkHealth {
 #[derive(Debug)]
 pub struct SwapFill {
     pub transfer_id: String,
-    pub leaf_ids: Vec<String>,
+    pub leaves: Vec<serde_json::Value>,
+    pub expires_at: Option<String>,
+}
+
+// Swap V3 sends only the CPFP refund. The operator stores its verified
+// adaptor signature in the witness; it is not the identity-key signature.
+fn swap_leaf_response(id: &str, raw: &str) -> Result<serde_json::Value, String> {
+    let mut tx: Transaction =
+        deserialize(&hex::decode(raw).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
+    let input = tx.input.first_mut().ok_or("swap refund has no input")?;
+    let signature = input
+        .witness
+        .iter()
+        .next()
+        .filter(|s| s.len() == 64)
+        .ok_or("swap refund has no 64-byte adaptor signature")?;
+    let signature = hex::encode(signature);
+    for input in &mut tx.input {
+        input.witness.clear();
+    }
+    Ok(serde_json::json!({
+        "leaf_id": id,
+        "raw_unsigned_refund_transaction": hex::encode(bitcoin::consensus::serialize(&tx)),
+        "adaptor_signed_signature": signature,
+        "direct_raw_unsigned_refund_transaction": null,
+        "direct_adaptor_signed_signature": null,
+        "direct_from_cpfp_raw_unsigned_refund_transaction": null,
+        "direct_from_cpfp_adaptor_signed_signature": null,
+    }))
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1095,12 +1123,12 @@ impl SparkService {
             }
         };
         validate_transfer(&counter, self.identity, owner_key, received_total_sats)?;
-        let leaf_ids = counter
+        let leaves = counter
             .leaves
             .iter()
-            .map(|leaf| leaf.leaf.id.to_string())
-            .collect::<Vec<_>>();
-        if leaf_ids.is_empty() {
+            .map(|leaf| swap_leaf_response(&leaf.leaf.id.to_string(), &leaf.intermediate_refund_tx))
+            .collect::<Result<Vec<_>, _>>()?;
+        if leaves.is_empty() {
             return Err("counter transfer has no leaves".to_string());
         }
         self.needs_topup.store(false, Ordering::Relaxed);
@@ -1108,7 +1136,10 @@ impl SparkService {
         tokio::spawn(async move { service.reconcile_swap_claim(primary_id).await });
         Ok(SwapFill {
             transfer_id: counter.id.to_string(),
-            leaf_ids,
+            leaves,
+            expires_at: counter
+                .expiry_time
+                .map(|time| chrono::DateTime::<chrono::Utc>::from(time).to_rfc3339()),
         })
     }
 
@@ -1411,6 +1442,29 @@ impl SparkService {
             .get_transfer(id)
             .await
             .map_err(|e| e.to_string())
+    }
+
+    /// Recover historical response data without creating another transfer.
+    pub async fn swap_details(&self, id: &str) -> Result<SwapFill, String> {
+        let transfer = self
+            .find_transfer(&id.parse()?)
+            .await?
+            .ok_or("swap counter transfer is unavailable")?;
+        let leaves = transfer
+            .leaves
+            .iter()
+            .map(|leaf| swap_leaf_response(&leaf.leaf.id.to_string(), &leaf.intermediate_refund_tx))
+            .collect::<Result<Vec<_>, _>>()?;
+        if leaves.is_empty() {
+            return Err("swap counter transfer has no refund data".into());
+        }
+        Ok(SwapFill {
+            transfer_id: transfer.id.to_string(),
+            leaves,
+            expires_at: transfer
+                .expiry_time
+                .map(|time| chrono::DateTime::<chrono::Utc>::from(time).to_rfc3339()),
+        })
     }
 
     pub async fn run_swap_history(self: Arc<Self>) {
@@ -1901,6 +1955,34 @@ fn deterministic_transfer_id(source: &[u8]) -> Result<TransferId, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn swap_response_preserves_operator_refund_and_signature() {
+        let mut tx = Transaction {
+            version: bitcoin::transaction::Version(3),
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: vec![bitcoin::TxIn::default()],
+            output: vec![bitcoin::TxOut {
+                value: bitcoin::Amount::from_sat(1000),
+                script_pubkey: bitcoin::ScriptBuf::new(),
+            }],
+        };
+        let raw = |tx: &Transaction| hex::encode(bitcoin::consensus::serialize(tx));
+        assert!(swap_leaf_response("leaf", &raw(&tx)).is_err());
+        tx.input[0].witness.push([42; 64]);
+        let result = swap_leaf_response("leaf", &raw(&tx)).unwrap();
+        let mut restored: Transaction = deserialize(
+            &hex::decode(result["raw_unsigned_refund_transaction"].as_str().unwrap()).unwrap(),
+        )
+        .unwrap();
+        assert!(restored.input[0].witness.is_empty());
+        restored.input[0]
+            .witness
+            .push(hex::decode(result["adaptor_signed_signature"].as_str().unwrap()).unwrap());
+        assert_eq!(restored, tx);
+        assert!(result["direct_adaptor_signed_signature"].is_null());
+        assert!(swap_leaf_response("leaf", "not hex").is_err());
+    }
 
     #[derive(Clone, Debug, Eq, PartialEq)]
     struct TestLeaf {

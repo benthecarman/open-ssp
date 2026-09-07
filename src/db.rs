@@ -171,6 +171,7 @@ impl Db {
         crate::internal_payments::migrate(&conn).map_err(|e| e.to_string())?;
         crate::history::migrate(&conn).map_err(|e| e.to_string())?;
         crate::webhooks::migrate(&conn).map_err(|e| e.to_string())?;
+        crate::request_updates::migrate(&conn).map_err(|e| e.to_string())?;
         Ok(Self {
             inner: Arc::new(Mutex::new(conn)),
         })

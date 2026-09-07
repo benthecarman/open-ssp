@@ -26,11 +26,22 @@ fn digest(bytes: Vec<u8>, network: i32, role: u32, target: Vec<u8>) -> Result<[u
         .map_err(|_| "invalid quote digest".into())
 }
 
+// The signed manifest has no partner fee. Do not claim that a supplied
+// token was absent or verified when this SSP has no partner registry.
+fn attribution_status(has_partner_jwt: bool) -> &'static str {
+    if has_partner_jwt {
+        "PARTNER_ATTRIBUTION_UNSUPPORTED"
+    } else {
+        "NO_PARTNER_JWT"
+    }
+}
+
 pub async fn issue(
     state: &AppState,
     owner: &str,
     amount: u64,
     input: &Value,
+    has_partner_jwt: bool,
 ) -> Result<Value, String> {
     let receiver = input["receiver_identity_pubkey"].as_str().unwrap_or(owner);
     let receiver: PublicKey = receiver.parse().map_err(|_| "invalid quote receiver")?;
@@ -93,7 +104,7 @@ pub async fn issue(
         })
         .await?;
     Ok(
-        json!({"issued_quote":{"serialized_manifest":hex::encode(bytes),"issuer_signature":signature},"attribution_status":"NO_PARTNER_JWT"}),
+        json!({"issued_quote":{"serialized_manifest":hex::encode(bytes),"issuer_signature":signature},"attribution_status":attribution_status(has_partner_jwt)}),
     )
 }
 
@@ -185,6 +196,12 @@ fn verify_attestation(
 mod tests {
     use super::*;
     use bitcoin::secp256k1::SecretKey;
+
+    #[test]
+    fn partner_tokens_are_reported_without_claiming_attribution() {
+        assert_eq!(attribution_status(false), "NO_PARTNER_JWT");
+        assert_eq!(attribution_status(true), "PARTNER_ATTRIBUTION_UNSUPPORTED");
+    }
 
     #[test]
     fn quote_signatures_bind_network_role_recipient_amount_and_hash() {

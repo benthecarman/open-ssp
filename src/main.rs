@@ -23,6 +23,7 @@ mod internal_payments;
 mod ldk;
 mod lightning_store;
 mod quotes;
+mod request_updates;
 mod spark;
 mod static_deposits;
 mod webhooks;
