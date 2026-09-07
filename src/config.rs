@@ -14,7 +14,6 @@ pub struct Config {
     /// Directory for sqlite state (volume-mount in compose).
     pub data_dir: String,
     /// Live LDK backend (host:port WITHOUT scheme, e.g. "ldk-server:3536").
-    /// Empty = fake mode.
     pub ldk_grpc_addr: String,
     pub ldk_api_key: String,
     pub ldk_api_key_file: String,
@@ -44,9 +43,6 @@ pub struct Config {
     /// Token for the integrated funding endpoints. A missing token fails
     /// closed unless SPARK_ADMIN_ALLOW_NO_AUTH=1 is explicit.
     pub spark_admin_token: String,
-    /// SO set for FROST share encryption: JSON array of
-    /// {id, identifier, identityPublicKey}. Empty = skip share storage.
-    pub frost_operators_json: String,
     /// FROST threshold (must match the SO signing threshold).
     pub frost_threshold: usize,
     /// Max total per swap (sats). Bounds operator exposure: user swap
@@ -92,7 +88,6 @@ impl Config {
             spark_admin_token: std::env::var("SPARK_ADMIN_TOKEN")
                 .or_else(|_| std::env::var("SIDECAR_TOKEN"))
                 .unwrap_or_default(),
-            frost_operators_json: get("SSP_FROST_OPERATORS", ""),
             frost_threshold: get("SSP_FROST_THRESHOLD", "2").parse().unwrap_or(2),
             max_swap_total_sats: get("MAX_SWAP_TOTAL_SATS", "1000000")
                 .parse()

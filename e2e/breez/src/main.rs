@@ -1,11 +1,14 @@
+mod regtest;
+
 use std::{env, path::PathBuf, time::Duration};
 
 use anyhow::{Context, Result, bail, ensure};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use breez_sdk_spark::{
-    BreezSdk, ChainApiType, GetInfoRequest, GetPaymentRequest, ListPaymentsRequest, Network,
-    Payment, PaymentDetails, PaymentRequest, PaymentStatus, PaymentType, PrepareSendPaymentRequest,
-    ReceivePaymentMethod, ReceivePaymentRequest, SdkBuilder, Seed, SendPaymentRequest,
+    BreezSdk, ChainApiType, FeePolicy, GetInfoRequest, GetPaymentRequest, ListPaymentsRequest,
+    Network, OnchainConfirmationSpeed, Payment, PaymentDetails, PaymentRequest, PaymentStatus,
+    PaymentType, PrepareSendPaymentRequest, ReceivePaymentMethod, ReceivePaymentRequest,
+    SdkBuilder, Seed, SendPaymentMethod, SendPaymentOptions, SendPaymentRequest,
     SignMessageRequest, SparkConfig, SparkSigningOperator, SparkSspConfig, SyncWalletRequest,
     default_config,
 };
@@ -21,8 +24,17 @@ const OPERATOR_IDENTITIES: [&str; 3] = [
     "0305ab8d485cc752394de4981f8a5ae004f2becfea6f432c9a59d5022d8764f0a6",
 ];
 
+struct SdkLogger;
+
+impl breez_sdk_spark::Logger for SdkLogger {
+    fn log(&self, entry: breez_sdk_spark::LogEntry) {
+        eprintln!("Breez {}: {}", entry.level, entry.line);
+    }
+}
+
 struct TestConfig {
     admin_token: String,
+    ssp_container: String,
     bitcoin_rpc_url: String,
     bitcoin_rpc_user: String,
     bitcoin_rpc_password: String,
@@ -50,16 +62,12 @@ struct Wallet {
     ldk: LdkClient,
 }
 
-fn required_env(name: &str) -> Result<String> {
-    env::var(name).with_context(|| format!("missing environment variable {name}"))
-}
-
 fn optional_env(name: &str, default: &str) -> String {
     env::var(name).unwrap_or_else(|_| default.to_string())
 }
 
 impl TestConfig {
-    fn from_env() -> Result<Self> {
+    fn from_env(admin_token: String, cert_dir: PathBuf, ssp_container: String) -> Result<Self> {
         let send_amount_sats = optional_env("BREEZ_SEND_AMOUNT_SATS", "1000")
             .parse()
             .context("BREEZ_SEND_AMOUNT_SATS is not an integer")?;
@@ -94,13 +102,20 @@ impl TestConfig {
         );
 
         Ok(Self {
-            admin_token: required_env("SPARK_ADMIN_TOKEN")?,
-            bitcoin_rpc_url: optional_env("BITCOIN_RPC_URL", "http://127.0.0.1:8332"),
+            admin_token,
+            ssp_container,
+            bitcoin_rpc_url: optional_env(
+                "BITCOIN_RPC_URL",
+                &format!(
+                    "http://127.0.0.1:{}",
+                    optional_env("BITCOIN_RPC_PORT", "8332")
+                ),
+            ),
             bitcoin_rpc_user: optional_env("BITCOIN_RPC_USER", "testutil"),
             bitcoin_rpc_password: optional_env("BITCOIN_RPC_PASSWORD", "testutilpassword"),
             bitcoin_rpc_wallet: optional_env("BITCOIN_RPC_WALLET", "default"),
             chain_service_url: optional_env("BREEZ_CHAIN_SERVICE_URL", "http://127.0.0.1:30000"),
-            cert_dir: PathBuf::from(required_env("BREEZ_OPERATOR_CERT_DIR")?),
+            cert_dir,
             send_amount_sats,
             receive_amount_sats,
             repeated_receive_amount_sats,
@@ -112,6 +127,7 @@ impl TestConfig {
 
 async fn command_output(program: &str, args: &[&str]) -> Result<String> {
     let output = Command::new(program)
+        .kill_on_drop(true)
         .args(args)
         .output()
         .await
@@ -127,27 +143,21 @@ async fn command_output(program: &str, args: &[&str]) -> Result<String> {
 
 impl LdkClient {
     async fn connect(container: String) -> Result<Self> {
-        let key = command_output(
-            "docker",
-            &[
-                "exec",
-                &container,
-                "sh",
-                "-c",
-                "od -A n -t x1 /data/regtest/api_key | tr -d ' \\n'",
-            ],
-        )
-        .await?
-        .trim()
-        .to_string();
-        ensure!(!key.is_empty(), "LDK API key is empty");
+        let output = Command::new("docker")
+            .kill_on_drop(true)
+            .args(["exec", &container, "cat", "/data/regtest/api_key"])
+            .output()
+            .await?;
+        ensure!(output.status.success(), "could not read the LDK API key");
+        ensure!(!output.stdout.is_empty(), "LDK API key is empty");
+        let key = hex::encode(output.stdout);
         Ok(Self {
             container,
             api_key: key,
         })
     }
 
-    async fn json(&self, args: &[&str]) -> Result<Value> {
+    async fn output(&self, args: &[&str]) -> Result<String> {
         let mut command_args = vec![
             "exec",
             self.container.as_str(),
@@ -160,8 +170,11 @@ impl LdkClient {
             "/data/tls.crt",
         ];
         command_args.extend_from_slice(args);
-        let output = command_output("docker", &command_args).await?;
-        serde_json::from_str(&output).context("LDK CLI output was not JSON")
+        command_output("docker", &command_args).await
+    }
+
+    async fn json(&self, args: &[&str]) -> Result<Value> {
+        serde_json::from_str(&self.output(args).await?).context("LDK CLI output was not JSON")
     }
 }
 
@@ -453,14 +466,9 @@ async fn ssp_available_balance(client: &Client, config: &TestConfig, ssp_url: &s
         .context("SSP status has no available Spark balance")
 }
 
-async fn restart_ssp(
-    client: &Client,
-    config: &TestConfig,
-    ssp_url: &str,
-    container_env: &str,
-) -> Result<()> {
-    let container = required_env(container_env)?;
-    command_output("docker", &["restart", &container]).await?;
+async fn restart_ssp(client: &Client, config: &TestConfig, ssp_url: &str) -> Result<()> {
+    let container = &config.ssp_container;
+    command_output("docker", &["restart", container]).await?;
     poll("SSP restart", config.timeout, || async {
         admin_json(client, config, ssp_url, "/status", None)
             .await
@@ -828,16 +836,27 @@ async fn setup_lightning(
         "first LDK node has no node ID"
     );
 
-    let address_a = ldk_a.json(&["onchain-receive"]).await?["address"]
-        .as_str()
-        .context("first LDK node returned no on-chain address")?
-        .to_string();
-    let address_b = ldk_b.json(&["onchain-receive"]).await?["address"]
-        .as_str()
-        .context("second LDK node returned no on-chain address")?
-        .to_string();
-    bitcoin_rpc(client, config, "sendtoaddress", json!([address_a, 2])).await?;
-    bitcoin_rpc(client, config, "sendtoaddress", json!([address_b, 1])).await?;
+    // Repeated `up` calls can reuse the existing chain funds and channel.
+    for (node, minimum, amount_btc) in [(ldk_a, 100_000_000, 2), (ldk_b, 500_000, 1)] {
+        let balances = node.json(&["get-balances"]).await?;
+        if balances["spendable_onchain_balance_sats"]
+            .as_u64()
+            .unwrap_or(0)
+            <= minimum
+        {
+            let address = node.json(&["onchain-receive"]).await?["address"]
+                .as_str()
+                .context("LDK node returned no on-chain address")?
+                .to_owned();
+            bitcoin_rpc(
+                client,
+                config,
+                "sendtoaddress",
+                json!([address, amount_btc]),
+            )
+            .await?;
+        }
+    }
     let miner_address = bitcoin_rpc(client, config, "getnewaddress", json!([]))
         .await?
         .as_str()
@@ -985,6 +1004,7 @@ async fn bootstrap_wallet(
 }
 
 async fn pay_between(
+    client: &Client,
     sender: &Wallet,
     receiver: &Wallet,
     amount_sats: u64,
@@ -1085,6 +1105,42 @@ async fn pay_between(
         succeeded_ldk_payment(&receiver.ldk, &payment_hash, "INBOUND", amount_sats)
     })
     .await?;
+
+    let session = authenticate_wallet(client, sender).await?;
+    let transfers = graphql_json(
+        client,
+        sender,
+        Some(&session),
+        "Transfers",
+        json!({"transfer_spark_ids": [sender_payment.id]}),
+    )
+    .await?;
+    let request = &transfers["transfers"][0]["user_request"];
+    let request_id = request["id"]
+        .as_str()
+        .context("send transfer has no SSP request")?;
+    ensure!(
+        request["idempotency_key"] == sender_payment.id,
+        "send idempotency key does not match funding transfer: {request}"
+    );
+    let replay = graphql_json(
+        client,
+        sender,
+        Some(&session),
+        "RequestLightningSend",
+        json!({"encoded_invoice":invoice,"user_outbound_transfer_external_id":sender_payment.id}),
+    )
+    .await?;
+    ensure!(
+        replay["request_lightning_send"]["request"]["id"] == request_id,
+        "send replay changed the request ID"
+    );
+    ensure!(
+        bolt11_payment_count(&sender.ldk, &payment_hash).await? == 1,
+        "send replay created another payment"
+    );
+    exact_balance(sender, sender_expected).await?;
+    println!("PASS send replay preserved request, payment count, and Spark balance");
 
     let htlc = match receiver_payment.details {
         Some(PaymentDetails::Lightning { htlc_details, .. }) => htlc_details,
@@ -1359,6 +1415,194 @@ async fn receive_bolt12(
     Ok(())
 }
 
+async fn reject_request(
+    client: &Client,
+    wallet: &Wallet,
+    session: Option<&str>,
+    operation: &str,
+    input: Value,
+    expected: &str,
+) -> Result<()> {
+    let error = graphql_json(client, wallet, session, operation, input)
+        .await
+        .expect_err("request should have failed");
+    ensure!(
+        error.to_string().to_lowercase().contains(expected),
+        "unexpected {operation} error: {error}"
+    );
+    Ok(())
+}
+
+async fn negative_lightning(
+    client: &Client,
+    config: &TestConfig,
+    wallet: &Wallet,
+    payer: &LdkClient,
+) -> Result<()> {
+    let before = wallet_balance(wallet).await?;
+    let session = authenticate_wallet(client, wallet).await?;
+    reject_request(
+        client,
+        wallet,
+        None,
+        "UserRequest",
+        json!({"request_id":"missing"}),
+        "unauthorized",
+    )
+    .await?;
+    reject_request(
+        client,
+        wallet,
+        Some(&session),
+        "RequestLightningReceive",
+        json!({"amount_sats":1000,"network":"REGTEST","payment_hash":"not-a-hash"}),
+        "payment_hash must be 32 bytes hex",
+    )
+    .await?;
+    let invoice = payer
+        .json(&["bolt11-receive", "700sat", "-d", "negative-send"])
+        .await?;
+    let hash = invoice["payment_hash"]
+        .as_str()
+        .context("negative invoice has no hash")?;
+    reject_request(
+        client,
+        wallet,
+        Some(&session),
+        "RequestLightningSend",
+        json!({"encoded_invoice":invoice["invoice"]}),
+        "user_outbound_transfer_external_id is required",
+    )
+    .await?;
+    reject_request(client, wallet, Some(&session), "RequestLightningSend",
+        json!({"encoded_invoice":invoice["invoice"],"user_outbound_transfer_external_id":"00000000-0000-4000-8000-000000000099"}), "matching preimage swap was not found").await?;
+    ensure!(
+        bolt11_payment_count(&wallet.ldk, hash).await? == 0,
+        "unfunded send reached LDK"
+    );
+    // This unpaid invoice uses a client-created hash and needs no shares.
+    let hash = hex::encode(Sha256::digest(b"expiry-only-test-preimage"));
+    let expiring = graphql_json(
+        client,
+        wallet,
+        Some(&session),
+        "RequestLightningReceive",
+        json!({"amount_sats":800,"network":"REGTEST","payment_hash":hash,"expiry_secs":1}),
+    )
+    .await?;
+    let request_id = expiring["request_lightning_receive"]["request"]["id"]
+        .as_str()
+        .context("expiry request has no ID")?;
+    poll("expired wallet invoice", config.timeout, || async {
+        let response = graphql_json(
+            client,
+            wallet,
+            Some(&session),
+            "UserRequest",
+            json!({"request_id":request_id}),
+        )
+        .await?;
+        ensure!(
+            response["user_request"]["status"] == "HTLC_FAILED",
+            "expired invoice is not failed yet"
+        );
+        Ok(())
+    })
+    .await?;
+    exact_balance(wallet, before).await?;
+    println!("PASS auth, malformed hash, missing funding, unknown funding, and invoice expiry");
+    Ok(())
+}
+
+async fn missed_receive(
+    client: &Client,
+    config: &TestConfig,
+    wallet: &Wallet,
+    payer: &LdkClient,
+) -> Result<()> {
+    let before = wallet_balance(wallet).await?;
+    let ssp_before = ssp_available_balance(client, config, wallet.ssp_url).await?;
+    let amount = 777;
+    let invoice = wallet
+        .sdk
+        .receive_payment(ReceivePaymentRequest {
+            payment_method: ReceivePaymentMethod::Bolt11Invoice {
+                description: "missed-event".into(),
+                amount_sats: Some(amount),
+                expiry_secs: Some(300),
+                payment_hash: None,
+            },
+        })
+        .await?
+        .payment_request;
+    let hash = decode_payment_hash(&wallet.ldk, &invoice).await?;
+    let container = &config.ssp_container;
+    let start = Instant::now();
+    command_output("docker", &["stop", "--time", "10", container]).await?;
+    let stop_elapsed = start.elapsed();
+    let held = async {
+        ensure!(
+            stop_elapsed < Duration::from_secs(5),
+            "SSP graceful stop took {stop_elapsed:?}"
+        );
+        payer.json(&["bolt11-send", &invoice]).await?;
+        poll(
+            "held payment while SSP is offline",
+            config.timeout,
+            || async {
+                let list = wallet.ldk.json(&["list-payments"]).await?;
+                ensure!(
+                    list["list"]
+                        .as_array()
+                        .context("missing LDK payments")?
+                        .iter()
+                        .any(|p| bolt11_hash(p).as_deref() == Some(hash.as_str())
+                            && p["status"] == "PENDING"),
+                    "payment is not held"
+                );
+                Ok(())
+            },
+        )
+        .await
+    }
+    .await;
+    command_output("docker", &["start", container]).await?;
+    held?;
+    poll("SSP restart", config.timeout, || async {
+        admin_json(client, config, wallet.ssp_url, "/status", None)
+            .await
+            .map(|_| ())
+    })
+    .await?;
+    poll("reconciled wallet receive", config.timeout, || {
+        received_payment(wallet, &invoice)
+    })
+    .await?;
+    poll("reconciled Spark balance", config.timeout, || {
+        exact_balance(wallet, before + amount)
+    })
+    .await?;
+    poll("reconciled inbound LDK payment", config.timeout, || {
+        succeeded_ldk_payment(&wallet.ldk, &hash, "INBOUND", amount)
+    })
+    .await?;
+    poll("reconciled outbound LDK payment", config.timeout, || {
+        succeeded_ldk_payment(payer, &hash, "OUTBOUND", amount)
+    })
+    .await?;
+    poll("reconciled SSP debit", config.timeout, || async {
+        let balance = ssp_available_balance(client, config, wallet.ssp_url).await?;
+        ensure!(
+            balance == ssp_before - amount,
+            "SSP balance did not reflect the receive debit"
+        );
+        Ok(())
+    })
+    .await?;
+    println!("PASS missed receive recovered after restart; graceful stop took {stop_elapsed:?}");
+    Ok(())
+}
+
 async fn run(
     client: &Client,
     config: &TestConfig,
@@ -1392,7 +1636,7 @@ async fn run(
     .context("wallet A exact bootstrap receive failed")?;
 
     println!("restart SSP A and split its previous change child again");
-    restart_ssp(client, config, wallet_a.ssp_url, "SSP1_CONTAINER").await?;
+    restart_ssp(client, config, wallet_a.ssp_url).await?;
     bootstrap_wallet(
         wallet_a,
         &wallet_b.ldk,
@@ -1435,6 +1679,7 @@ async fn run(
 
     println!("send from wallet B to wallet A over Lightning");
     let first_hash = pay_between(
+        client,
         wallet_b,
         wallet_a,
         config.send_amount_sats,
@@ -1446,6 +1691,7 @@ async fn run(
     .context("wallet B to wallet A payment failed")?;
     println!("send from wallet A to wallet B over Lightning");
     let second_hash = pay_between(
+        client,
         wallet_a,
         wallet_b,
         config.send_amount_sats,
@@ -1459,6 +1705,22 @@ async fn run(
         first_hash != second_hash,
         "the two wallet invoices reused a payment hash"
     );
+    negative_lightning(client, config, wallet_a, &wallet_b.ldk).await?;
+    missed_receive(client, config, wallet_a, &wallet_b.ldk).await?;
+    println!("withdraw wallet A's remaining Spark balance to Bitcoin");
+    withdraw_bitcoin(client, config, wallet_a)
+        .await
+        .context("cooperative withdrawal failed")?;
+    // The pinned Breez SDK cannot parse the BOLT12 extension's history.
+    // Complete standard SDK checks first, then refill for the extension tests.
+    bootstrap_wallet(
+        wallet_a,
+        &wallet_b.ldk,
+        config.send_amount_sats,
+        config.send_amount_sats,
+        config.timeout,
+    )
+    .await?;
     println!("send from wallet A through its SSP to a BOLT12 offer");
     send_bolt12(
         client,
@@ -1479,14 +1741,145 @@ async fn run(
     )
     .await
     .context("wallet A BOLT12 receive failed")?;
-    println!("BREEZ LN E2E PASS");
+    println!("BREEZ LN AND WITHDRAWAL E2E PASS");
     Ok(())
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+async fn withdraw_bitcoin(client: &Client, config: &TestConfig, wallet: &Wallet) -> Result<()> {
+    let before = wallet_balance(wallet).await?;
+    fund_ssp(client, config, wallet.ssp_url, 10_000).await?;
+    let ssp_before = ssp_available_balance(client, config, wallet.ssp_url).await?;
+    let address = bitcoin_rpc(
+        client,
+        config,
+        "getnewaddress",
+        json!(["coop-exit-recipient", "bech32m"]),
+    )
+    .await?
+    .as_str()
+    .context("Bitcoin returned no withdrawal address")?
+    .to_string();
+    let prepared = wallet
+        .sdk
+        .prepare_send_payment(PrepareSendPaymentRequest {
+            payment_request: PaymentRequest::Input {
+                input: address.clone(),
+            },
+            amount: Some(before.into()),
+            token_identifier: None,
+            conversion_options: None,
+            fee_policy: Some(FeePolicy::FeesIncluded),
+        })
+        .await
+        .context("prepare Bitcoin withdrawal")?;
+    let SendPaymentMethod::BitcoinAddress { fee_quote, .. } = &prepared.payment_method else {
+        bail!("withdrawal was not prepared as a Bitcoin payment");
+    };
+    let fee = fee_quote.speed_fast.total_fee_sat();
+    ensure!(before > fee, "wallet cannot cover the withdrawal fee");
+    let sent = wallet
+        .sdk
+        .send_payment(SendPaymentRequest {
+            prepare_response: prepared,
+            options: Some(SendPaymentOptions::BitcoinAddress {
+                confirmation_speed: OnchainConfirmationSpeed::Fast,
+            }),
+            idempotency_key: None,
+        })
+        .await
+        .context("send Bitcoin withdrawal")?;
+    restart_ssp(client, config, wallet.ssp_url).await?;
+    let mining_address = bitcoin_rpc(client, config, "getnewaddress", json!([])).await?;
+    bitcoin_rpc(
+        client,
+        config,
+        "generatetoaddress",
+        json!([12, mining_address]),
+    )
+    .await?;
+    let received = bitcoin_rpc(client, config, "getreceivedbyaddress", json!([address, 1])).await?;
+    let received_sats = (received
+        .as_f64()
+        .context("invalid Bitcoin received amount")?
+        * 100_000_000.0)
+        .round() as u64;
+    ensure!(
+        received_sats == before - fee,
+        "Bitcoin payout {received_sats} does not equal {}",
+        before - fee
+    );
+    poll("withdrawal Spark recovery", config.timeout, || async {
+        let current = ssp_available_balance(client, config, wallet.ssp_url).await?;
+        ensure!(
+            current == ssp_before + before,
+            "SSP balance {current}; expected {}",
+            ssp_before + before
+        );
+        Ok(())
+    })
+    .await?;
+    poll("withdrawal wallet balance", config.timeout, || {
+        exact_balance(wallet, 0)
+    })
+    .await?;
+    let payment = poll("Breez withdrawal record", config.timeout, || {
+        completed_payment(wallet, &sent.payment.id)
+    })
+    .await?;
+    let Some(PaymentDetails::Withdraw { tx_id }) = payment.details else {
+        bail!("Breez withdrawal details missing");
+    };
+    let session = authenticate_wallet(client, wallet).await?;
+    for _ in 0..2 {
+        let completed = graphql_json(
+            client,
+            wallet,
+            Some(&session),
+            "CompleteCoopExit",
+            json!({"input":{"user_outbound_transfer_external_id":sent.payment.id}}),
+        )
+        .await?;
+        let request = &completed["complete_coop_exit"]["request"];
+        ensure!(
+            request["status"] == "SUCCEEDED",
+            "withdrawal not settled: {request}"
+        );
+        ensure!(
+            request["coop_exit_txid"] == tx_id,
+            "retry changed the payout transaction"
+        );
+        let history = graphql_json(
+            client,
+            wallet,
+            Some(&session),
+            "UserRequest",
+            json!({"request_id":request["id"]}),
+        )
+        .await?;
+        ensure!(
+            history["user_request"]["status"] == "SUCCEEDED",
+            "withdrawal history missing: {history}"
+        );
+    }
+    let received_again =
+        bitcoin_rpc(client, config, "getreceivedbyaddress", json!([address, 1])).await?;
+    ensure!(
+        received_again == received,
+        "completion retry created another payout"
+    );
+    println!(
+        "PASS cooperative withdrawal: {before} Spark sats became {received_sats} Bitcoin sats with {fee} sats in fees; SSP recovered the Spark leaves after restart"
+    );
+    Ok(())
+}
+
+async fn acceptance(config: TestConfig, ldk_a: LdkClient, ldk_b: LdkClient) -> Result<()> {
+    breez_sdk_spark::init_logging(
+        None,
+        Some(Box::new(SdkLogger)),
+        Some("off,spark=warn,spark_wallet=warn".into()),
+    )?;
     let started = Instant::now();
-    let config = TestConfig::from_env()?;
     for id in 0..3 {
         let cert = config.cert_dir.join(format!("server_{id}.crt"));
         ensure!(
@@ -1501,8 +1894,6 @@ async fn main() -> Result<()> {
         .build()
         .context("could not build HTTP client")?;
     println!("create bidirectional Lightning liquidity");
-    let ldk_a = LdkClient::connect(required_env("LDK1_CONTAINER")?).await?;
-    let ldk_b = LdkClient::connect(required_env("LDK2_CONTAINER")?).await?;
     setup_lightning(&client, &config, &ldk_a, &ldk_b).await?;
 
     println!("connect Breez wallets");
@@ -1544,4 +1935,9 @@ async fn main() -> Result<()> {
     disconnect_a.context("could not disconnect wallet-a")?;
     println!("completed in {:.1}s", started.elapsed().as_secs_f64());
     Ok(())
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    regtest::run().await
 }

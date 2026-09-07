@@ -32,8 +32,7 @@ The SSP calls existing operator consensus code through this RPC.
 | `SSP_OPERATOR_HOSTS` | Optional ordered, comma-separated SSP-private operator gRPC addresses; enables just-in-time leaf splitting |
 | `SSP_OPERATOR_CERT_FILES` | Empty for public trust, or one ordered certificate file per SSP-private operator endpoint |
 | `SSP_MIN_SPLIT_CHILD_SATS` | Local minimum split-child value (default `330`, the standard P2TR relay dust floor) |
-| `SSP_FROST_OPERATORS` | JSON operator IDs, identifiers, and identity keys for receive shares |
-| `SSP_FROST_THRESHOLD` | Operator signing threshold |
+| `SSP_FROST_THRESHOLD` | Spark wallet signing threshold |
 | `SPARK_ADMIN_TOKEN` | Bearer token for the liquidity endpoints |
 | `LDK_GRPC_ADDR` | `ldk-server` gRPC address without a URL scheme |
 | `LDK_API_KEY` | Hex API key; use this or `LDK_API_KEY_FILE` |
@@ -44,24 +43,28 @@ The SSP calls existing operator consensus code through this RPC.
 | `SSP_CORS_ORIGINS` | Optional comma-separated browser origins |
 | `RUST_LOG` | Optional tracing filter; use `info` unless more detail is needed |
 
-Production must not set `SPARK_ADMIN_ALLOW_NO_AUTH=1` or
-`SSP_ALLOW_FAKE_LN=1`.
+Production must not set `SPARK_ADMIN_ALLOW_NO_AUTH=1`.
+The service requires a live LDK backend at startup. Start LDK first and wait
+for its health check before starting the SSP.
 
-`SSP_FROST_OPERATORS` has this shape:
+## Upgrade from the retired preimage extension
 
-```json
-[
-  {
-    "id": 0,
-    "identifier": "<64-character operator identifier>",
-    "identityPublicKey": "<compressed operator identity key>"
-  }
-]
-```
+`mint_invoice_preimage`, `reveal_preimage`, and same-SSP internal settlement
+have been removed. Standard receives still use preimages and shares created
+by the wallet. Remove `SSP_FROST_OPERATORS` and `SSP_ALLOW_FAKE_LN` from old
+deployment configuration. Keep `SSP_FROST_THRESHOLD` for wallet signing.
 
-Operator IDs must be contiguous and start at zero. Each identifier is the
-64-character hexadecimal form of `id + 1`. The number of entries must be at
-least the threshold, and every identity key must match its operator.
+Before upgrading, let pending SSP-owned receives and internal sends finish
+on the previous release. Back up the complete SSP data directory. Startup
+refuses the migration while these requests remain pending. After they finish,
+the migration creates explicit Lightning request relationships and removes
+the old `preimages` table. Standard receive settlement checkpoints remain.
+
+Send intent, funding, and idempotency records now commit before Lightning
+submission. A lost reply is an uncertain outcome, not a final failure. See
+[submission recovery](LDK_GAPS.md#submission-recovery) before investigating a
+send that stays pending. Back up SSP and LDK data together; restoring only
+one side can lose the link between a payment and its funding.
 
 ## Wallet initialization
 
@@ -160,7 +163,7 @@ backend gaps.
 Run the local Lightning acceptance test before deployment:
 
 ```sh
-./e2e/ln-e2e.sh
+cargo regtest test
 ```
 
 It starts a fresh regtest network with local Electrs, three unmodified Spark
@@ -184,6 +187,51 @@ node e2e/ln-receive.mjs
 This deployment-only check creates a normal wallet invoice, calls
 `mutinynet-cli lightning`, and verifies the Spark balance, transfer, LDK state,
 and claimed preimage.
+
+## Cooperative withdrawals
+
+Create and fund a dedicated Bitcoin Core wallet on the SSP network. Keep this
+wallet exclusive to one SSP and its SQLite database. Other processes must not
+spend its coins: withdrawal input reservations are stored in the SSP database.
+The Core wallet must have private keys, be unlocked for signing, and finish
+scanning before the SSP starts. The regtest fixture uses Bitcoin Core 28.
+
+| Variable | Requirement |
+|---|---|
+| `COOP_BITCOIN_RPC_URL` | Wallet endpoint, such as `http://bitcoind:8332/wallet/ssp-withdrawals`; enables withdrawals |
+| `COOP_BITCOIN_RPC_USER` | Bitcoin RPC user |
+| `COOP_BITCOIN_RPC_PASSWORD_FILE` | File with the RPC password; preferred over the environment variable |
+| `COOP_BITCOIN_RPC_PASSWORD` | RPC password when no password file is configured |
+| `COOP_EXIT_FEE_SATS` | Flat SSP fee in addition to the miner fee; defaults to `0` |
+
+The SSP rejects a node on the wrong network. Fee quotes use Core's conservative
+estimates for 2, 6, and 12 blocks. Only regtest permits a 1 sat/vB fallback when
+estimates are unavailable. Confirmation speed is an estimate, not a guarantee.
+
+Each withdrawal needs one unreserved, confirmed P2WPKH or P2TR coin that covers
+the payout, miner fee, connector funding, and a change output. The connector
+reserves 330 sats per Spark leaf plus one extra output. This connector funding
+stays reserved until the SSP recovers the Spark leaves. Keep several suitable
+coins available for concurrent users;
+this implementation does not combine inputs or batch withdrawals.
+
+Wallets can first request a Spark swap to create separate payout and fee
+leaves. Keep enough Spark liquidity for that swap. The total quoted fee must
+also be representable by the available leaves or permitted split sizes. The
+regtest fixture permits 1-sat split children for its small fee amounts; the
+default deployment split minimum remains 330 sats.
+
+The SSP signs only after the operators report the matching conditional Spark
+transfer. A background task retries pending payouts and Spark recovery after
+restart. Do not remove reservations or replace payout transactions manually.
+A Bitcoin conflict keeps the reservation in place. Automatic fee bumping is
+not implemented. The operator's confirmation rules control when the SSP can
+recover the Spark leaves.
+
+Back up the Core wallet, Spark mnemonic, and complete SSP SQLite data. Keep the
+RPC credentials with the deployment secrets. Restoring only the Core wallet
+does not restore withdrawal commitments. Run `cargo regtest test` to check a real
+Breez withdrawal, exact Bitcoin payout, and Spark recovery after an SSP restart.
 
 ## Upgrade and rollback
 

@@ -34,24 +34,14 @@ jobs:
       LN_STREAM_IDLE_SECONDS: 95
     steps:
       - uses: actions/checkout@v5
-      - name: Configure temporary checkouts
-        run: |
-          echo "SPARK_REF=$RUNNER_TEMP/spark-ref" >> "$GITHUB_ENV"
-          echo "LDK_SERVER_REF=$RUNNER_TEMP/ldk-server-ref" >> "$GITHUB_ENV"
+        with:
+          submodules: recursive
       - uses: actions/setup-node@v6
         with:
           node-version: "22"
-      - name: Check out pinned upstream sources
-        run: |
-          git clone --filter=blob:none --no-checkout https://github.com/benthecarman/spark "$SPARK_REF"
-          git -C "$SPARK_REF" fetch --depth=1 origin dad8bc6cf109b5946eec6860fb84bf247c8cae98
-          git -C "$SPARK_REF" checkout --detach FETCH_HEAD
-          git clone --filter=blob:none --no-checkout https://github.com/lightningdevkit/ldk-server "$LDK_SERVER_REF"
-          git -C "$LDK_SERVER_REF" fetch --depth=1 origin 6d6d810714706c225ce7effc2163eff6a1b54221
-          git -C "$LDK_SERVER_REF" checkout --detach FETCH_HEAD
       - name: Build pinned Spark SDK
         run: |
-          cd "$SPARK_REF/sdks/js"
+          cd vendor/spark/sdks/js
           corepack enable
           yarn install --no-immutable
           yarn build:sdk
@@ -67,32 +57,26 @@ jobs:
     permissions:
       contents: read
     env:
-      SPARK_OPERATOR_COMMIT: dad8bc6cf109b5946eec6860fb84bf247c8cae98
       SPARK_ADMIN_TOKEN: regtest-spark-admin-token
       BREEZ_E2E_PROJECT_NAME: open-ssp-breez-e2e-ci
     steps:
       - uses: actions/checkout@v5
-      - name: Configure temporary checkouts
-        run: |
-          echo "SPARK_REF=$RUNNER_TEMP/spark-ref" >> "$GITHUB_ENV"
-          echo "LDK_SERVER_REF=$RUNNER_TEMP/ldk-server-ref" >> "$GITHUB_ENV"
+        with:
+          submodules: recursive
       - name: Install build dependencies
         run: sudo apt-get update && sudo apt-get install -y libprotobuf-dev protobuf-compiler
-      - name: Check out pinned upstream sources
+      - name: Check Rust regtest runner
         run: |
-          git clone --filter=blob:none --no-checkout https://github.com/benthecarman/spark "$SPARK_REF"
-          git -C "$SPARK_REF" fetch --depth=1 origin "$SPARK_OPERATOR_COMMIT"
-          git -C "$SPARK_REF" checkout --detach FETCH_HEAD
-          git clone --filter=blob:none --no-checkout https://github.com/lightningdevkit/ldk-server "$LDK_SERVER_REF"
-          git -C "$LDK_SERVER_REF" fetch --depth=1 origin 6d6d810714706c225ce7effc2163eff6a1b54221
-          git -C "$LDK_SERVER_REF" checkout --detach FETCH_HEAD
+          cargo test --locked --manifest-path e2e/breez/Cargo.toml
+          cargo clippy --locked --manifest-path e2e/breez/Cargo.toml --all-targets -- -D warnings
       - name: Run Breez Lightning regtest
-        run: ./e2e/ln-e2e.sh
+        run: cargo regtest test
       - name: Stop Lightning test stack
         if: always()
-        run: docker compose -p "$BREEZ_E2E_PROJECT_NAME" -f docker-compose.regtest.yml down --volumes --remove-orphans
+        run: cargo regtest --project "$BREEZ_E2E_PROJECT_NAME" reset
 
   ssp:
+    needs: [rust, e2e, lightning-e2e]
     runs-on: ubuntu-latest
     permissions:
       contents: read

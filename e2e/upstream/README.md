@@ -3,30 +3,65 @@
 The `operator_*.key` files in this directory are public regtest fixtures.
 Never reuse these keys on a network that carries value.
 
-The supplemental JavaScript suite uses these revisions:
+## Pinned source submodules
 
-- MutinyNet Spark fork: `06614d2e3535385f15aef3749b2c8a780f679ebc`
-- ldk-server: `6d6d810714706c225ce7effc2163eff6a1b54221`
+Both acceptance suites use the Git submodules recorded by this repository:
 
-The Breez Lightning acceptance test was verified with these clean upstream
-revisions:
+| Path | Source | Use |
+|---|---|---|
+| `vendor/spark` | [Spark fork](https://github.com/benthecarman/spark) | Three Spark Operators and the supplemental JavaScript SDK |
+| `vendor/ldk-server` | [ldk-server](https://github.com/lightningdevkit/ldk-server) | Two Lightning nodes and their CLI |
 
-- Spark Operators fork: `dad8bc6cf109b5946eec6860fb84bf247c8cae98`
-- ldk-server: `6d6d810714706c225ce7effc2163eff6a1b54221`
+The gitlinks store the exact commits. Inspect them with `git submodule status`.
+Initialize the sources from the repository root:
 
-The supplemental JavaScript suite builds the SDK and runs `e2e/e2e.sh`. Local
-runs must set `SPARK_REF`, `SDK_REF`, and `LDK_SERVER_REF` if the checkouts are
-not in a shared temporary checkout.
+```sh
+git submodule update --init --recursive
+```
 
-The Lightning acceptance test runs `e2e/ln-e2e.sh`. It uses the Spark checkout
-only to build three local operators and uses the Rust Breez SDK at revision
-`c7eecfe` as the wallet client. It does not patch the operator checkout.
-The test also starts a pinned Electrs image and uses its local Esplora API for
-Breez chain data. It tests BOLT11 in both directions and separate BOLT12 send
-and receive flows. The runner builds the operators from a clean detached
-worktree at `SPARK_REF`'s `HEAD`. Set `SPARK_OPERATOR_COMMIT` to test another
-commit. Set `SPARK_REF` and `LDK_SERVER_REF` when the source checkouts are not
-at their default paths.
+New clones can use `git clone --recurse-submodules`. Run the update command
+again after pulling changes to the parent repository. Normal setup must not
+use `git submodule update --remote`, which follows upstream branches.
 
-Update a revision only with the tests and production dependency pin that need
-the same behavior.
+The Compose file, test runners, and CI use these same source paths. Set
+`SPARK_REF` and `LDK_SERVER_REF` to use other local checkouts. Set `SDK_REF`
+only when the JavaScript SDK checkout differs from `SPARK_REF`.
+
+## Run the suites
+
+The Lightning acceptance test runs `cargo regtest test`. It uses the Spark
+submodule only to build three local operators. The Rust Breez SDK wallet dependency is
+pinned in `e2e/breez/Cargo.toml` and `e2e/breez/Cargo.lock`; Cargo fetches it.
+The SSP's Rust Spark dependencies are pinned separately in the root Cargo
+files. Neither Rust dependency needs another submodule.
+
+The runner builds the operators from a clean detached worktree at the Spark
+checkout's `HEAD`. It does not include uncommitted operator changes. Set
+`SPARK_OPERATOR_COMMIT` to test another commit present in that checkout.
+It starts a pinned Electrs image and uses its local Esplora API for Breez chain
+data. See [the regtest guide](../../docs/REGTEST_BREEZ.md) for the full setup.
+
+For the supplemental JavaScript suite, build the SDK first (Node.js 22 and
+Corepack are required):
+
+```sh
+(cd vendor/spark/sdks/js && corepack enable && yarn install --no-immutable && yarn build:sdk)
+./e2e/e2e.sh
+```
+
+If you set `SDK_REF`, build the SDK in that checkout instead.
+
+## Update a source pin
+
+Fetch and check out the intended commit inside the submodule, then record its
+new gitlink in the parent repository. For example, from the repository root:
+
+```sh
+git -C vendor/spark fetch origin <commit>
+git -C vendor/spark checkout --detach <commit>
+git add vendor/spark
+```
+
+Use `vendor/ldk-server` for an LDK update. Run both acceptance suites and the
+Rust checks before committing the pin update with the related changes. Update
+Cargo dependency pins separately when the change requires it.

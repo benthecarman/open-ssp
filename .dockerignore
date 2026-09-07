@@ -8,3 +8,5 @@ swap-sidecar/node_modules/
 *.key
 .env
 deploy/.env
+vendor/
+.regtest/

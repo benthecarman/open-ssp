@@ -1,19 +1,20 @@
 # Local regtest e2e stack: bitcoind + postgres + 3 Spark Operators + our SSP.
 #
 # Usage:
-#   SPARK_REF=/tmp/open-ssp/spark-ref docker compose -f docker-compose.regtest.yml up --build -d
+#   git submodule update --init --recursive
+#   SPARK_ADMIN_TOKEN=regtest-spark-admin-token docker compose -f docker-compose.regtest.yml up --build -d
 #   ./e2e/e2e.sh   # runs the SDK end-to-end test, tears nothing down
 #   docker compose -f docker-compose.regtest.yml down
 #
-# SPARK_REF must point at a checkout of https://github.com/benthecarman/spark
-# (used to build the SO image and for the SDK test). Defaults below.
+# Sources default to the pinned Git submodules in vendor/. Override SPARK_REF
+# or LDK_SERVER_REF to build from other local checkouts.
 #
 # Host ports: bitcoind RPC uses BITCOIN_RPC_PORT (8332 by default), SOs use
 # 8535-8537, and SSP uses 5000. PostgreSQL and bitcoind ZMQ stay private.
 
 x-operator-common: &operator-common
   build:
-    context: ${SPARK_REF:-/tmp/open-ssp/spark-ref}
+    context: ${SPARK_REF:-./vendor/spark}
     dockerfile: Dockerfile
   depends_on:
     postgres:
@@ -128,6 +129,19 @@ services:
           echo "Funded wallet with 101 blocks"
         fi
         echo "Bitcoin wallet ready"
+        if ! $$CLI listwallets | grep -q '"ssp-withdrawals"'; then
+          if $$CLI listwalletdir | grep -q '"name": "ssp-withdrawals"'; then
+            $$CLI loadwallet ssp-withdrawals > /dev/null
+          else
+            $$CLI createwallet ssp-withdrawals false false '' false true > /dev/null
+          fi
+        fi
+        if [ "$$($$CLI -rpcwallet=ssp-withdrawals getbalance)" = "0.00000000" ]; then
+          ADDRESS=$$($$CLI -rpcwallet=ssp-withdrawals getnewaddress '' bech32m)
+          $$CLI -rpcwallet=default sendtoaddress "$$ADDRESS" 1 > /dev/null
+          MINE_ADDRESS=$$($$CLI -rpcwallet=default getnewaddress)
+          $$CLI generatetoaddress 3 "$$MINE_ADDRESS" > /dev/null
+        fi
 
   bitcoin-miner:
     image: lncm/bitcoind:v28.0
@@ -213,7 +227,7 @@ services:
   # to it over gRPC whenever LDK_GRPC_ADDR and credentials are set.
   ldk-server:
     build:
-      context: ${LDK_SERVER_REF:-/tmp/open-ssp/ldk-server-ref}
+      context: ${LDK_SERVER_REF:-./vendor/ldk-server}
       dockerfile: Dockerfile
     depends_on:
       bitcoind:
@@ -249,7 +263,7 @@ services:
   # Second node: LN counterparty for e2e send/receive (channel peer for ldk-server).
   ldk-server-2:
     build:
-      context: ${LDK_SERVER_REF:-/tmp/open-ssp/ldk-server-ref}
+      context: ${LDK_SERVER_REF:-./vendor/ldk-server}
       dockerfile: Dockerfile
     depends_on:
       bitcoind:
@@ -289,10 +303,14 @@ services:
       context: .
       dockerfile: ssp.Dockerfile
     depends_on:
-      - spark-operator-0
-      - spark-operator-1
-      - spark-operator-2
-      - ldk-server
+      spark-operator-0:
+        condition: service_started
+      spark-operator-1:
+        condition: service_started
+      spark-operator-2:
+        condition: service_started
+      ldk-server:
+        condition: service_healthy
     ports:
       - "127.0.0.1:5000:5000"
     healthcheck:
@@ -310,13 +328,17 @@ services:
       SSP_NETWORK: ${SSP_NETWORK:-REGTEST}
       SSP_DATA_DIR: /data
       SSP_PUBLIC_URL: http://ssp:5000
+      COOP_BITCOIN_RPC_URL: http://bitcoind:8332/wallet/ssp-withdrawals
+      COOP_BITCOIN_RPC_USER: testutil
+      COOP_BITCOIN_RPC_PASSWORD: testutilpassword
       SPARK_MNEMONIC_FILE: /data/spark.mnemonic
       SO_HOSTS: ${SO_HOSTS:-spark-operator-0.minikube.local:8535,spark-operator-1.minikube.local:8535,spark-operator-2.minikube.local:8535}
       SO_IDENTITY_PUBKEYS: ${SO_IDENTITY_PUBKEYS:-0322ca18fc489ae25418a0e768273c2c61cabb823edfb14feb891e9bec62016510,0341727a6c41b168f07eb50865ab8c397a53c7eef628ac1020956b705e43b6cb27,0305ab8d485cc752394de4981f8a5ae004f2becfea6f432c9a59d5022d8764f0a6}
       SO_CERT_FILES: /tls/server_0.crt,/tls/server_1.crt,/tls/server_2.crt
       SSP_OPERATOR_HOSTS: spark-operator-0.minikube.local:8536,spark-operator-1.minikube.local:8536,spark-operator-2.minikube.local:8536
       SSP_OPERATOR_CERT_FILES: /tls/server_0.crt,/tls/server_1.crt,/tls/server_2.crt
-      SSP_MIN_SPLIT_CHILD_SATS: 330
+      # Regtest withdrawal fees can require leaves smaller than 330 sats.
+      SSP_MIN_SPLIT_CHILD_SATS: 1
       SPARK_ADMIN_TOKEN: ${SPARK_ADMIN_TOKEN:?set SPARK_ADMIN_TOKEN}
       # Live LDK backend: bitcoind-backed ldk-server above.
       LDK_GRPC_ADDR: ${LDK_GRPC_ADDR:-ldk-server:3536}
@@ -325,7 +347,6 @@ services:
       LDK_TLS_CERT_FILE: ${LDK_TLS_CERT_FILE:-/ldk-data/tls.crt}
       SSP_SWAP_FEE_SATS: 0
       SSP_FROST_THRESHOLD: 2
-      SSP_FROST_OPERATORS: '[{"id":0,"identifier":"0000000000000000000000000000000000000000000000000000000000000001","identityPublicKey":"0322ca18fc489ae25418a0e768273c2c61cabb823edfb14feb891e9bec62016510"},{"id":1,"identifier":"0000000000000000000000000000000000000000000000000000000000000002","identityPublicKey":"0341727a6c41b168f07eb50865ab8c397a53c7eef628ac1020956b705e43b6cb27"},{"id":2,"identifier":"0000000000000000000000000000000000000000000000000000000000000003","identityPublicKey":"0305ab8d485cc752394de4981f8a5ae004f2becfea6f432c9a59d5022d8764f0a6"}]'
       RUST_LOG: info
 
   # The second SSP gives each Breez wallet a distinct Lightning node. This
@@ -336,10 +357,14 @@ services:
       context: .
       dockerfile: ssp.Dockerfile
     depends_on:
-      - spark-operator-0
-      - spark-operator-1
-      - spark-operator-2
-      - ldk-server-2
+      spark-operator-0:
+        condition: service_started
+      spark-operator-1:
+        condition: service_started
+      spark-operator-2:
+        condition: service_started
+      ldk-server-2:
+        condition: service_healthy
     ports:
       - "127.0.0.1:5001:5000"
     healthcheck:
@@ -369,7 +394,6 @@ services:
       LDK_TLS_CERT_FILE: /ldk-data/tls.crt
       SSP_SWAP_FEE_SATS: 0
       SSP_FROST_THRESHOLD: 2
-      SSP_FROST_OPERATORS: '[{"id":0,"identifier":"0000000000000000000000000000000000000000000000000000000000000001","identityPublicKey":"0322ca18fc489ae25418a0e768273c2c61cabb823edfb14feb891e9bec62016510"},{"id":1,"identifier":"0000000000000000000000000000000000000000000000000000000000000002","identityPublicKey":"0341727a6c41b168f07eb50865ab8c397a53c7eef628ac1020956b705e43b6cb27"},{"id":2,"identifier":"0000000000000000000000000000000000000000000000000000000000000003","identityPublicKey":"0305ab8d485cc752394de4981f8a5ae004f2becfea6f432c9a59d5022d8764f0a6"}]'
       RUST_LOG: info
 
 volumes:

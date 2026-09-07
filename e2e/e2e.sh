@@ -17,10 +17,18 @@ failure_logs() {
   fi
   exit "$status"
 }
-trap failure_logs EXIT
 
-export SPARK_REF="${SPARK_REF:-/tmp/open-ssp/spark-ref}"
+export SPARK_REF="${SPARK_REF:-$PWD/vendor/spark}"
 export SDK_REF="${SDK_REF:-$SPARK_REF}"
+export LDK_SERVER_REF="${LDK_SERVER_REF:-$PWD/vendor/ldk-server}"
+for source_ref in "$SPARK_REF" "$LDK_SERVER_REF"; do
+  if [ ! -f "$source_ref/Dockerfile" ]; then
+    echo "Missing source checkout: $source_ref" >&2
+    echo "Run: git submodule update --init --recursive (or check your path overrides)" >&2
+    exit 1
+  fi
+done
+trap failure_logs EXIT
 export SPARK_DANGEROUSLY_DISABLE_TLS_VERIFICATION=1
 export MINING=1
 export SPARK_ADMIN_TOKEN="${SPARK_ADMIN_TOKEN:-regtest-spark-admin-token}"

@@ -21,9 +21,11 @@ operator build must expose the authenticated counter-swap RPC used by the SSP.
   the Lightning payment completes.
 - Durable payment state, event-stream reconnect, and payment reconciliation.
 - Authenticated Spark liquidity deposits and leaf funding.
+- Cooperative Bitcoin withdrawals through a dedicated Bitcoin Core wallet,
+  with durable input reservations and recovery after restart.
 
-Static-deposit quotes are test-only on regtest. Cooperative exits, instant
-static deposits, receive quotes, request history pagination, and wallet
+Static-deposit quotes are test-only on regtest. Instant static deposits,
+receive quotes, request history pagination, and wallet
 webhooks are not production-complete. See
 [SSP API coverage](docs/SSP_API_COVERAGE.md) for the exact operation status.
 
@@ -98,34 +100,48 @@ operators and SSP:
 
 ## Local end-to-end test
 
+For setup instructions and a client configuration example, see
+[Run on regtest with the Breez SDK](docs/REGTEST_BREEZ.md).
+
 The Lightning acceptance stack contains bitcoind, a local Electrs Esplora
 service, PostgreSQL, three Spark Operators, two `ldk-server` nodes, two SSP
 instances, and three Breez SDK wallets. It needs Docker Compose, Rust, and
-checkouts of the pinned Spark and `ldk-server` revisions. The
-revisions are listed in
-[the fixture README](e2e/upstream/README.md).
+the pinned Spark and `ldk-server` Git submodules in `vendor/`. See
+[the fixture README](e2e/upstream/README.md) for source and update details.
 
-With the two checkouts at their default paths, run:
+Clone with `git clone --recurse-submodules`, or initialize an existing
+checkout, then run:
 
 ```sh
-./e2e/ln-e2e.sh
+git submodule update --init --recursive
+cargo regtest test
 ```
 
-The script always creates a separate Compose project with empty volumes. It
-funds each SSP with 1,000-sat receive leaves, creates bidirectional Lightning
-liquidity, and bootstraps both Breez wallets with 1,500-sat standard BOLT11
-receives. It verifies that an unsafe internal payment between two wallets on
-the same SSP is rejected before funding, with unchanged balances and no LDK
-payment. It then makes payments in both
-directions between the SSPs. Finally, one wallet sends to a BOLT12 offer through
-its SSP, and another Lightning node pays an SSP offer that credits the wallet.
-This proves that a receive can combine two leaves for the larger invoice and
-prefer an exact leaf when one is available. The test verifies each Spark
-balance, each Breez payment record, the LDK payment records, the BOLT12 offer
-IDs, and the received preimages.
+For a persistent development stack, use `cargo regtest up`. The `stop`,
+`start`, `status`, `fund`, and `ldk` commands manage it from Rust.
 
-Run `./e2e/e2e.sh` for the supplemental API, idempotency, failure, reconnect,
-restart, concurrency, and shutdown checks.
+The test runner creates a separate Compose project with empty volumes and
+two real LDK nodes. It funds each SSP with a coarse leaf, then receives exact amounts
+through the Breez SDK. A restart between receives checks that the SSP can
+split a previous change leaf again using persisted keys.
+
+The wallets send BOLT11 payments in both directions. The runner checks Spark
+balances, Breez records, Lightning payment records, and preimage hashes.
+It also checks send replay, same-SSP rejection before funding, authentication,
+malformed hashes, missing or unknown funding, invoice expiry, and a payment
+that arrives while the SSP is stopped. Recovery must complete that payment
+after restart without a second Spark payout.
+
+The test then withdraws a wallet's balance to Bitcoin. It restarts the SSP
+after broadcast, mines the payout, and checks the Bitcoin amount, Breez
+withdrawal record, and Spark leaves recovered by the SSP. Repeated completion
+calls must keep the same payout. Separate BOLT12 send and receive checks run
+last because the pinned Breez SDK cannot parse the extension's history.
+
+Run `./e2e/e2e.sh` for the separate JavaScript SDK checks of API responses,
+authentication, static deposits, and atomic Spark swaps. It verifies repeated
+splits on every operator. It does not run Lightning payment scenarios.
+Image publication waits for both acceptance suites and the Rust checks.
 
 ## Deployment
 

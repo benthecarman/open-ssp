@@ -10,7 +10,7 @@ if [ -z "$LDK_DATA" ]; then echo "ldk-data volume not found; is the stack up?"; 
 if [ ! -r "$LDK_DATA/regtest/api_key" ]; then echo "need read access to $LDK_DATA (try sudo)"; exit 1; fi
 
 # Build the CLI once from the ldk-server checkout (cached afterwards).
-LDK_REF="${LDK_SERVER_REF:-/tmp/opencode/ldk-server-ref}"
+LDK_REF="${LDK_SERVER_REF:-$PWD/vendor/ldk-server}"
 CLI="$LDK_REF/target/release/ldk-server-cli"
 if [ ! -x "$CLI" ]; then
   echo "building ldk-server-cli (one time)..."

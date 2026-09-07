@@ -1,5 +1,4 @@
 use std::{
-    collections::HashMap,
     fs::OpenOptions,
     io::Write,
     os::unix::fs::OpenOptionsExt,
@@ -66,13 +65,6 @@ pub struct LightningReceiveSwap {
     pub preimage: String,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum LightningFundingState {
-    Claimable,
-    Settled,
-    Unavailable,
-}
-
 pub struct SparkService {
     wallet: Arc<SparkWallet>,
     network: Network,
@@ -87,6 +79,99 @@ pub struct SparkService {
 }
 
 impl SparkService {
+    pub async fn coop_exit_leaves(
+        &self,
+        owner: &str,
+        ids: &[String],
+    ) -> Result<Vec<crate::coop_exit::ExitLeaf>, String> {
+        use ::spark::operator::rpc::spark::{
+            query_nodes_request::Source, QueryNodesRequest, TreeNodeIds,
+        };
+        let response = self
+            .operator_pool
+            .get_coordinator()
+            .client
+            .query_nodes(QueryNodesRequest {
+                source: Some(Source::NodeIds(TreeNodeIds {
+                    node_ids: ids.to_vec(),
+                })),
+                network: self.network.to_proto_network() as i32,
+                ..Default::default()
+            })
+            .await
+            .map_err(|error| error.to_string())?;
+        let owner = spark_wallet::PublicKey::from_str(owner).map_err(|error| error.to_string())?;
+        ids.iter().map(|id| {
+            let node = response.nodes.get(id).ok_or("withdrawal leaf unavailable; the operator must permit this SSP to read the leaf")?;
+            if node.owner_identity_public_key != owner.serialize() || node.network != self.network.to_proto_network() as i32 {
+                return Err("withdrawal leaf owner or network mismatch".into());
+            }
+            if node.status != "AVAILABLE" || node.value == 0 {
+                return Err("withdrawal leaf is not available".into());
+            }
+            Ok(crate::coop_exit::ExitLeaf { id:id.clone(), value:node.value })
+        }).collect()
+    }
+
+    pub async fn coop_exit_transfer_exists(&self, id: &str) -> Result<bool, String> {
+        let id = TransferId::from_str(id).map_err(|error| error.to_string())?;
+        Ok(self
+            .transfer_service
+            .query_transfer(&id)
+            .await
+            .map_err(|error| error.to_string())?
+            .is_some())
+    }
+
+    pub async fn verify_coop_exit(
+        &self,
+        record: &crate::coop_exit::ExitRecord,
+    ) -> Result<(), String> {
+        let id = TransferId::from_str(&record.transfer_id).map_err(|error| error.to_string())?;
+        let transfer = self
+            .transfer_service
+            .query_transfer(&id)
+            .await
+            .map_err(|error| error.to_string())?
+            .ok_or("conditional withdrawal transfer is not available yet")?;
+        validate_coop_exit_transfer(&transfer, record, &self.identity)
+    }
+
+    pub async fn claim_coop_exit(
+        &self,
+        record: &crate::coop_exit::ExitRecord,
+    ) -> Result<(), String> {
+        let _guard = self.liquidity_lock.lock().await;
+        let id = TransferId::from_str(&record.transfer_id).map_err(|error| error.to_string())?;
+        let transfer = self
+            .wallet
+            .get_transfer(&id)
+            .await
+            .map_err(|error| error.to_string())?
+            .ok_or("withdrawal Spark transfer not found")?;
+        if transfer.transfer_type != TransferType::CooperativeExit
+            || transfer.receiver_id != self.identity
+        {
+            return Err("withdrawal transfer is not addressed to this SSP".into());
+        }
+        if transfer.status != TransferStatus::Completed {
+            self.wallet
+                .process_transfer(&transfer)
+                .await
+                .map_err(|error| error.to_string())?;
+        }
+        let transfer = self
+            .wallet
+            .get_transfer(&id)
+            .await
+            .map_err(|error| error.to_string())?
+            .ok_or("withdrawal Spark transfer disappeared")?;
+        if transfer.status != TransferStatus::Completed {
+            return Err("withdrawal Spark claim is pending".into());
+        }
+        Ok(())
+    }
+
     pub async fn connect(config: &Config, db: Arc<Db>) -> Result<Arc<Self>, String> {
         let network = parse_network(&config.network)?;
         let mnemonic =
@@ -331,19 +416,6 @@ impl SparkService {
             .map_err(|e| e.to_string())
     }
 
-    pub async fn store_preimage_shares(
-        &self,
-        payment_hash: Vec<u8>,
-        shares: HashMap<String, Vec<u8>>,
-        threshold: u32,
-        invoice: String,
-    ) -> Result<(), String> {
-        self.wallet
-            .store_preimage_shares(payment_hash, shares, threshold, invoice, self.identity)
-            .await
-            .map_err(|e| e.to_string())
-    }
-
     pub async fn verify_lightning_send(
         &self,
         owner: &str,
@@ -460,28 +532,6 @@ impl SparkService {
             return Err("sender funding has not committed".to_string());
         }
         Ok(())
-    }
-
-    /// A transport failure is retryable. An expired, returned, or missing
-    /// transfer is a terminal funding failure and must not cause a payout.
-    pub async fn lightning_funding_state(
-        &self,
-        outbound_transfer_id: &str,
-        payment_hash: &str,
-    ) -> Result<LightningFundingState, String> {
-        let Some(request) = self.find_htlc(outbound_transfer_id, payment_hash).await? else {
-            return Ok(LightningFundingState::Unavailable);
-        };
-        let Some(transfer) = request.transfer.as_ref() else {
-            return Ok(LightningFundingState::Unavailable);
-        };
-        Ok(lightning_funding_state(
-            request.status,
-            request.preimage.is_some(),
-            &transfer.status,
-            request.expiry_time,
-            std::time::SystemTime::now(),
-        ))
     }
 
     pub async fn settle_lightning_receive(
@@ -615,6 +665,11 @@ impl SparkService {
             owner_key,
             amount_sats,
         )?;
+        // The direct operator call bypasses the wallet's local transfer cache.
+        // Keep the committed result even if refreshing the cache is unavailable.
+        if let Err(error) = self.wallet.sync().await {
+            tracing::warn!(%error, "receive committed; Spark balance refresh is pending");
+        }
         self.needs_topup.store(false, Ordering::Relaxed);
         Ok(result)
     }
@@ -1087,34 +1142,83 @@ impl SparkService {
     }
 }
 
-fn lightning_funding_state(
-    status: PreimageRequestStatus,
-    has_preimage: bool,
-    transfer_status: &TransferStatus,
-    expiry: std::time::SystemTime,
-    now: std::time::SystemTime,
-) -> LightningFundingState {
-    if matches!(
-        transfer_status,
-        TransferStatus::Returned | TransferStatus::Expired
-    ) {
-        return LightningFundingState::Unavailable;
+fn validate_coop_exit_transfer(
+    transfer: &SparkTransfer,
+    record: &crate::coop_exit::ExitRecord,
+    identity: &spark_wallet::PublicKey,
+) -> Result<(), String> {
+    let sender =
+        spark_wallet::PublicKey::from_str(&record.owner).map_err(|error| error.to_string())?;
+    if transfer.id.to_string() != record.transfer_id
+        || transfer.sender_identity_public_key != sender
+        || transfer.receiver_identity_public_key != *identity
+        || transfer.transfer_type != TransferType::CooperativeExit
+    {
+        return Err("withdrawal transfer identity or type mismatch".into());
     }
-    match status {
-        PreimageRequestStatus::PreimageShared if has_preimage => {
-            if funding_transfer_committed(transfer_status) {
-                LightningFundingState::Settled
-            } else {
-                // A prepare can reveal the secret before the transfer commits.
-                // Retry the claim, but never treat that reveal as payment.
-                LightningFundingState::Claimable
+    // The committed operator flow keeps these leaves locked until the exact
+    // exit transaction confirms. Earlier or returned transfers cannot fund a payout.
+    if transfer.status != TransferStatus::SenderKeyTweakPending {
+        return Err(format!(
+            "withdrawal transfer is not locked: {:?}",
+            transfer.status
+        ));
+    }
+    let value = record
+        .leaves
+        .iter()
+        .try_fold(0u64, |sum, leaf| sum.checked_add(leaf.value))
+        .ok_or("withdrawal value overflow")?;
+    if transfer.total_value != value || transfer.leaves.len() != record.leaves.len() {
+        return Err("withdrawal transfer value or leaf count mismatch".into());
+    }
+    let connector: Transaction =
+        deserialize(&hex::decode(&record.raw_connector).map_err(|error| error.to_string())?)
+            .map_err(|error| error.to_string())?;
+    let connector_id = connector.compute_txid();
+    let mut used_outputs = std::collections::HashSet::new();
+    for expected in &record.leaves {
+        let mut matches = transfer
+            .leaves
+            .iter()
+            .filter(|leaf| leaf.leaf.id.to_string() == expected.id);
+        let leaf = matches
+            .next()
+            .ok_or("withdrawal transfer has different leaves")?;
+        if matches.next().is_some() || leaf.leaf.value != expected.value {
+            return Err("withdrawal transfer has duplicate or changed leaves".into());
+        }
+        let connector_output = leaf
+            .intermediate_refund_tx
+            .input
+            .get(1)
+            .ok_or("withdrawal refund has no connector input")?
+            .previous_output;
+        if connector_output.txid != connector_id
+            || connector_output.vout as usize >= record.leaves.len()
+            || !used_outputs.insert(connector_output)
+        {
+            return Err(
+                "withdrawal connector outputs must be distinct and cover the leaves".into(),
+            );
+        }
+        for refund in [
+            Some(&leaf.intermediate_refund_tx),
+            leaf.intermediate_direct_refund_tx.as_ref(),
+            leaf.intermediate_direct_from_cpfp_refund_tx.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if refund.input.len() != 2 || refund.input[1].previous_output != connector_output {
+                return Err("withdrawal refund does not bind the expected connector output".into());
             }
         }
-        PreimageRequestStatus::WaitingForPreimage if !has_preimage && expiry > now => {
-            LightningFundingState::Claimable
+        if leaf.intermediate_direct_from_cpfp_refund_tx.is_none() {
+            return Err("withdrawal transfer is missing its direct refund".into());
         }
-        _ => LightningFundingState::Unavailable,
     }
+    Ok(())
 }
 
 fn funding_transfer_committed(status: &TransferStatus) -> bool {
@@ -1480,83 +1584,6 @@ mod tests {
     }
 
     #[test]
-    fn funding_expiry_and_return_are_terminal_before_claim() {
-        let now = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(100);
-        for expiry in [now - Duration::from_secs(1), now] {
-            assert_eq!(
-                lightning_funding_state(
-                    PreimageRequestStatus::WaitingForPreimage,
-                    false,
-                    &TransferStatus::SenderKeyTweakPending,
-                    expiry,
-                    now,
-                ),
-                LightningFundingState::Unavailable
-            );
-        }
-        assert_eq!(
-            lightning_funding_state(
-                PreimageRequestStatus::Returned,
-                false,
-                &TransferStatus::Returned,
-                now + Duration::from_secs(60),
-                now,
-            ),
-            LightningFundingState::Unavailable
-        );
-        assert_eq!(
-            lightning_funding_state(
-                PreimageRequestStatus::WaitingForPreimage,
-                false,
-                &TransferStatus::SenderKeyTweakPending,
-                now + Duration::from_secs(60),
-                now,
-            ),
-            LightningFundingState::Claimable
-        );
-    }
-
-    #[test]
-    fn shared_preimage_is_not_payment_until_funding_commits() {
-        let now = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(100);
-        let expiry = now - Duration::from_secs(1);
-        assert_eq!(
-            lightning_funding_state(
-                PreimageRequestStatus::PreimageShared,
-                true,
-                &TransferStatus::SenderKeyTweakPending,
-                expiry,
-                now,
-            ),
-            LightningFundingState::Claimable
-        );
-        for status in [TransferStatus::SenderKeyTweaked, TransferStatus::Completed] {
-            assert_eq!(
-                lightning_funding_state(
-                    PreimageRequestStatus::PreimageShared,
-                    true,
-                    &status,
-                    expiry,
-                    now,
-                ),
-                LightningFundingState::Settled
-            );
-        }
-        for status in [TransferStatus::Returned, TransferStatus::Expired] {
-            assert_eq!(
-                lightning_funding_state(
-                    PreimageRequestStatus::PreimageShared,
-                    true,
-                    &status,
-                    expiry,
-                    now,
-                ),
-                LightningFundingState::Unavailable
-            );
-        }
-    }
-
-    #[test]
     fn payment_ids_match_the_previous_sidecar_format() {
         let hash = "00112233445566778899aabbccddeeff00000000000000000000000000000000";
         assert_eq!(
@@ -1816,6 +1843,101 @@ mod tests {
         let error = load_or_create_mnemonic(path.to_str().unwrap(), true).unwrap_err();
         assert!(error.contains("is required"));
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn withdrawal_requires_the_locked_leaves_and_the_exact_connector() {
+        use ::spark::{
+            services::TransferLeaf,
+            tree::{SigningKeyshare, TreeNodeId},
+        };
+        use bitcoin::{
+            secp256k1::{Secp256k1, SecretKey},
+            OutPoint,
+        };
+        let key = |byte| {
+            spark_wallet::PublicKey::from_secret_key(
+                &Secp256k1::new(),
+                &SecretKey::from_slice(&[byte; 32]).unwrap(),
+            )
+        };
+        let sender = key(1);
+        let receiver = key(2);
+        let mut record = crate::coop_exit::tests::record();
+        record.owner = sender.to_string();
+        let connector: Transaction =
+            deserialize(&hex::decode(&record.raw_connector).unwrap()).unwrap();
+        let mut refund = connector.clone();
+        refund.input.push(refund.input[0].clone());
+        refund.input[1].previous_output = OutPoint::new(connector.compute_txid(), 0);
+        let leaf = TreeNode {
+            id: TreeNodeId::from_str(&record.leaves[0].id).unwrap(),
+            tree_id: uuid::Uuid::new_v4().to_string(),
+            value: 10_000,
+            parent_node_id: None,
+            node_tx: connector.clone(),
+            refund_tx: Some(refund.clone()),
+            direct_tx: None,
+            direct_refund_tx: None,
+            direct_from_cpfp_refund_tx: Some(refund.clone()),
+            vout: 0,
+            verifying_public_key: sender,
+            owner_identity_public_key: Some(sender),
+            signing_keyshare: SigningKeyshare {
+                owner_identifiers: vec![],
+                threshold: 2,
+                public_key: sender,
+            },
+            status: TreeNodeStatus::TransferLocked,
+        };
+        let transfer = SparkTransfer {
+            id: TransferId::from_str(&record.transfer_id).unwrap(),
+            sender_identity_public_key: sender,
+            receiver_identity_public_key: receiver,
+            status: TransferStatus::SenderKeyTweakPending,
+            total_value: 10_000,
+            expiry_time: None,
+            created_time: None,
+            updated_time: None,
+            spark_invoice: None,
+            transfer_type: TransferType::CooperativeExit,
+            leaves: vec![TransferLeaf {
+                leaf,
+                secret_cipher: vec![],
+                signature: None,
+                intermediate_refund_tx: refund.clone(),
+                intermediate_direct_refund_tx: None,
+                intermediate_direct_from_cpfp_refund_tx: Some(refund),
+            }],
+        };
+        assert!(validate_coop_exit_transfer(&transfer, &record, &receiver).is_ok());
+        let mut changed = transfer.clone();
+        changed.transfer_type = TransferType::Transfer;
+        assert!(validate_coop_exit_transfer(&changed, &record, &receiver).is_err());
+        changed = transfer.clone();
+        changed.receiver_identity_public_key = sender;
+        assert!(validate_coop_exit_transfer(&changed, &record, &receiver).is_err());
+        changed = transfer.clone();
+        changed.total_value -= 1;
+        assert!(validate_coop_exit_transfer(&changed, &record, &receiver).is_err());
+        changed = transfer.clone();
+        changed.leaves[0].intermediate_refund_tx.input[1]
+            .previous_output
+            .vout = 1;
+        assert!(validate_coop_exit_transfer(&changed, &record, &receiver).is_err());
+        for status in [
+            TransferStatus::SenderInitiated,
+            TransferStatus::Returned,
+            TransferStatus::Expired,
+        ] {
+            changed = transfer.clone();
+            changed.status = status;
+            assert!(validate_coop_exit_transfer(&changed, &record, &receiver).is_err());
+        }
+        let mut different_connector = connector;
+        different_connector.output[0].value = bitcoin::Amount::from_sat(331);
+        record.raw_connector = bitcoin::consensus::encode::serialize_hex(&different_connector);
+        assert!(validate_coop_exit_transfer(&transfer, &record, &receiver).is_err());
     }
 
     #[cfg(unix)]

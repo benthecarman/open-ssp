@@ -8,30 +8,43 @@ verified limitations.
 
 ### BOLT11 send
 
-The SSP verifies that the wallet funded the payment with a matching Spark
-preimage-swap transfer. It then calls `Bolt11Send`. Payment success or failure
-comes from `SubscribeEvents` and is also recovered through
-`GetPaymentDetails` and `ListPayments`. On success, the SSP gives the Lightning
-preimage to the Spark transfer.
+The SSP verifies a matching Spark preimage-swap transfer. It stores the send
+intent, funding transfer, and wallet idempotency key in one SQLite transaction
+before it calls `Bolt11Send`. Events and reconciliation then update the send.
+On success, the SSP gives the Lightning preimage to the Spark transfer.
 
 Retries with the same wallet, invoice, transfer ID, and idempotency key return
-the stored request and do not start a second Lightning payment.
+the stored request. A funding transfer can belong to only one send intent.
 
-If the encoded BOLT11 invoice exactly matches an open receive request created
-by the same SSP, internal settlement is available only for the explicit
-SSP-owned HODL extension, where the SSP already holds the preimage. The SSP
-claims the payer's Spark funding before paying the receiver. A persistent
-reservation prevents a competing Lightning payment from claiming the same
-receive. Pending settlements resume after a retry or process restart;
-expired or returned funding produces a failed send.
+All BOLT11 invoices created by the same SSP are rejected during fee estimation
+and send validation. They can be paid from an external Lightning wallet.
+The SSP-owned preimage and internal settlement extensions have been removed.
 
-Standard wallet-created invoices from the same SSP are rejected during fee
-estimation and send validation. Recovering their preimage requires an
-irreversible receiver payout, while the payer's funding can expire before it
-is claimed. Supporting these invoices safely requires an operator operation
-that commits both transfers atomically. They can still be paid from an
-external Lightning wallet. Existing pending internal requests without a
-reservation cannot reuse a receive that has already started or completed.
+### Submission recovery
+
+A send starts in `PREPARED`. The SSP rechecks its Spark funding and durably
+changes it to `SUBMITTING` before the network call. A returned LDK payment ID
+changes it to `PENDING`. An RPC error leaves it in `SUBMITTING`, with the error
+saved in `lightning_sends.last_error`. It is not a final payment failure.
+
+After a lost reply or restart, reconciliation finds BOLT11 payments by hash.
+For new BOLT12 sends, the SSP puts `open-ssp:<request UUID>` in the payer note.
+It finds that note in LDK payment records and checks the offer ID, outbound
+direction, and amount before it attaches the payment to the intent. Events
+that arrived before the attachment are recovered from LDK payment state.
+Only a confirmed final Lightning failure can start a BOLT12 refund.
+
+LDK does not accept a caller-defined submission key. A crash after the
+`SUBMITTING` checkpoint but before the RPC is indistinguishable from an
+accepted payment whose record is unavailable. The SSP therefore never
+resubmits a `SUBMITTING` intent or refunds it on a timeout. The public status
+stays `LIGHTNING_PAYMENT_INITIATED`. Keep the SSP and LDK data intact and
+restore their connection so reconciliation can find the original payment.
+If no record appears, operator investigation is required; do not delete the
+intent or create replacement funding on the assumption that payment failed.
+A legacy BOLT12 send with a lost submission reply has no correlation note and
+also needs investigation. An idempotent submission API in LDK is needed to
+remove this uncertainty.
 
 ### BOLT11 receive
 
@@ -50,8 +63,8 @@ hold invoice expires.
 
 ### BOLT12 send
 
-The SSP verifies a completed standard Spark transfer from the wallet and then
-calls `Bolt12Send`. It verifies the final payment hash and preimage. A final
+The SSP verifies a completed standard Spark transfer from the wallet, stores
+the durable intent, and then calls `Bolt12Send`. It verifies the final payment hash and preimage. A final
 Lightning failure starts a deterministic Spark refund. Reconciliation can
 repeat the refund without creating a second transfer.
 
@@ -123,8 +136,13 @@ These limitations are in the SSP and must not be attributed to `ldk-server`:
 - `lightning_receive_quote` does not emit the protobuf `TransferManifest`
   required by the SDK quote flow.
 - Wallet webhook handlers do not persist subscriptions or deliver events.
-- Cooperative exits and instant static deposits return compatibility data but
-  do not complete their financial operations.
+- Instant static deposits return compatibility data but do not complete their
+  financial operations.
+
+Cooperative withdrawals use a dedicated Bitcoin Core wallet. The pinned
+`ldk-server` API can send Bitcoin, but it cannot prepare and sign a transaction
+in separate steps. Cooperative exits need the payout transaction ID before
+the wallet commits its conditional Spark transfer.
 
 See [SSP API coverage](SSP_API_COVERAGE.md) for the operation-level status.
 
@@ -135,5 +153,6 @@ Production must provide `LDK_GRPC_ADDR`, either `LDK_API_KEY` or
 `ldk_mode: "live"` and the expected `ldk_node_id`; `/health` reports only basic
 process liveness.
 
-Do not enable `SSP_ALLOW_FAKE_LN` in production. Fake mode is only for isolated
-development tests.
+The service has one live LDK backend. Startup fails if LDK is unavailable or
+its credentials cannot be read. Event reconnection and payment reconciliation
+continue to handle interruptions after startup.

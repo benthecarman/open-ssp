@@ -14,30 +14,28 @@ use tracing::info;
 
 mod auth;
 mod config;
+mod coop_exit;
 mod db;
-mod frost;
 mod fs;
 mod graphql;
 mod ldk;
+mod lightning_store;
 mod spark;
 
 use config::Config;
 use db::Db;
-use ldk::{Backend, LdkBackend, LdkGrpcBackend};
+use ldk::LdkGrpcBackend;
 use spark::SparkService;
 
 #[derive(Clone)]
 pub struct AppState {
     pub config: Config,
     pub db: Arc<Db>,
-    pub ldk: Arc<tokio::sync::RwLock<Backend>>,
+    pub ldk: Arc<LdkGrpcBackend>,
     pub spark: Arc<SparkService>,
+    pub coop_exit: Option<Arc<coop_exit::CoopExitService>>,
     /// Serializes the check-and-pay section for idempotent Lightning sends.
     pub send_lock: Arc<tokio::sync::Mutex<()>>,
-}
-
-pub async fn backend(state: &AppState) -> tokio::sync::RwLockReadGuard<'_, Backend> {
-    state.ldk.read().await
 }
 
 pub async fn ssp_identity(state: &AppState) -> Result<String, String> {
@@ -75,7 +73,7 @@ async fn status(State(state): State<AppState>, headers: HeaderMap) -> impl IntoR
             Json(serde_json::json!({"error": "unauthorized"})),
         );
     }
-    let backend = state.ldk.read().await;
+    let backend = &state.ldk;
     let spark = state.spark.health().await;
     (
         StatusCode::OK,
@@ -85,8 +83,8 @@ async fn status(State(state): State<AppState>, headers: HeaderMap) -> impl IntoR
         "identity_source": "spark-wallet",
         "spark": spark.as_ref().ok(),
         "spark_error": spark.as_ref().err(),
-        "ldk_mode": if backend.live_node_id().is_some() { "live" } else { "fake" },
-        "ldk_node_id": backend.live_node_id(),
+        "ldk_mode": "live",
+        "ldk_node_id": backend.node_id,
         })),
     )
 }
@@ -278,12 +276,11 @@ fn detect_operation(req: &GraphqlRequest) -> String {
         "RequestCoopExit",
         "CompleteCoopExit",
         "CoopExitFeeEstimates",
+        "CoopExitFeeEstimate",
         "CoopExitFeeQuote",
         "Transfers",
         "UserRequest",
         "FetchCurrentUserToUserRequestsConnection",
-        "MintInvoicePreimage",
-        "RevealPreimage",
         "RegisterWalletWebhook",
         "DeleteWalletWebhook",
         "ListSparkWalletWebhooks",
@@ -314,47 +311,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .await
         .map_err(|e| format!("spark: {e}"))?;
     info!(identity = %spark.identity(), "embedded Spark wallet connected");
-    // Fake Lightning is never silent: refuse unless explicitly allowed.
-    let allow_fake = std::env::var("SSP_ALLOW_FAKE_LN").unwrap_or_default() == "1";
-    let backend = Arc::new(tokio::sync::RwLock::new(
-        Backend::select(&config, db.clone(), spark.clone()).await,
-    ));
-    if backend.read().await.live_node_id().is_none() && !allow_fake {
-        return Err("ldk-server unreachable and SSP_ALLOW_FAKE_LN!=1; refusing fake mode".into());
-    }
-    // Live event pump + recovery: if we started fake, keep retrying connect
-    // and swap the backend live when ldk-server answers.
-    {
-        let backend = backend.clone();
-        if let Backend::Live(live) = backend.read().await.clone() {
-            tokio::spawn(Backend::run_event_pump(live.clone()));
-            tokio::spawn(Backend::run_reconciler(live));
-        }
-        let backend = backend.clone();
-        let config = config.clone();
-        let db = db.clone();
-        let retry_spark = spark.clone();
-        tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
-                if backend.read().await.live_node_id().is_some() {
-                    continue;
-                }
-                match LdkGrpcBackend::connect(&config, db.clone(), retry_spark.clone()).await {
-                    Ok(live) => {
-                        let live = Arc::new(live);
-                        tracing::info!("ldk-server reachable; switching to live mode");
-                        tokio::spawn(Backend::run_event_pump(live.clone()));
-                        tokio::spawn(Backend::run_reconciler(live.clone()));
-                        *backend.write().await = Backend::Live(live);
-                    }
-                    Err(e) => tracing::warn!("ldk-server still unreachable: {e}"),
-                }
-            }
-        });
-    }
-    // Periodic prune: expired sessions, challenges older than 1h, orphan
-    // preimages and stubbed compatibility requests older than 24h.
+    let coop_exit =
+        coop_exit::CoopExitService::from_env(db.clone(), spark.clone(), &config.network).await?;
+    let backend = Arc::new(LdkGrpcBackend::connect(&config, db.clone(), spark.clone()).await?);
+    tokio::spawn(LdkGrpcBackend::run_event_pump(backend.clone()));
+    tokio::spawn(LdkGrpcBackend::run_reconciler(backend.clone()));
+    // Prune expired sessions, old challenges, and compatibility requests.
     {
         let db = db.clone();
         tokio::spawn(async move {
@@ -368,18 +330,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 let _ = db
                     .prune_compat_requests(&(now - chrono::Duration::hours(24)).to_rfc3339())
                     .await;
-                let _ = db
-                    .prune_orphan_preimages(&(now - chrono::Duration::hours(24)).to_rfc3339())
-                    .await;
             }
         });
     }
     let addr: SocketAddr = config.listen_addr.parse()?;
+    if let Some(service) = coop_exit.clone() {
+        tokio::spawn(service.run());
+    }
     let state = AppState {
         config: config.clone(),
         db,
         ldk: backend,
         spark: spark.clone(),
+        coop_exit,
         send_lock: Arc::new(tokio::sync::Mutex::new(())),
     };
     info!("SSP listening on {} (network={})", addr, config.network);

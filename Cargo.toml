@@ -30,16 +30,10 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 bip39 = { version = "2", features = ["rand"] }
 bitcoin = "0.32"
 lightning-invoice = "0.33"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 spark-wallet = { git = "https://github.com/benthecarman/spark-sdk", rev = "4345469d40c665c0968fcba0af5797830e7a86a4" }
 spark = { git = "https://github.com/benthecarman/spark-sdk", rev = "4345469d40c665c0968fcba0af5797830e7a86a4" }
 subtle = "2"
-# FROST VSS share splitting (mirrors signer/spark-frost vss.rs).
-k256 = { version = "0.13", features = ["arithmetic"] }
-vsss-rs = { version = "5", default-features = false, features = ["alloc", "primitive"] }
-ecies = { version = "0.2.11", default-features = false, features = ["aes-rust"] }
-
-# LDK backend client (always built; live mode selected at runtime when
-# LDK_GRPC_ADDR + credentials are set, fake mode otherwise).
 ldk-server-client = { git = "https://github.com/lightningdevkit/ldk-server", package = "ldk-server-client" }
 
 [dev-dependencies]

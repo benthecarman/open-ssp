@@ -4,7 +4,7 @@ use serde_json::Value;
 use tokio::sync::Mutex;
 
 /// SQLite persistence for everything the SSP must survive restarts with:
-/// auth challenges/sessions, user requests, LN preimages, payment states.
+/// auth challenges/sessions, user requests, and settlement checkpoints.
 /// Single file at `<SSP_DATA_DIR>/ssp.sqlite` (volume-mount in compose).
 #[derive(Clone)]
 pub struct Db {
@@ -18,27 +18,10 @@ pub struct LightningReceive {
     pub receiver: String,
     pub amount_sats: u64,
     pub invoice: String,
-    pub status: String,
+    pub status: crate::lightning_store::ReceiveStatus,
     pub transfer_id: Option<String>,
     pub preimage: Option<String>,
     pub claim_submitted: bool,
-    pub internal_payment_id: Option<String>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct LightningSend {
-    pub owner: String,
-    pub outbound_transfer_id: String,
-    pub payment_kind: String,
-    pub amount_sats: u64,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct InternalLightningSend {
-    pub payment_hash: String,
-    pub payment_id: String,
-    pub outbound_transfer_id: String,
-    pub invoice: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -101,7 +84,6 @@ impl Db {
              CREATE TABLE IF NOT EXISTS sessions(token TEXT PRIMARY KEY, identity TEXT NOT NULL, valid_until TEXT NOT NULL);
              CREATE TABLE IF NOT EXISTS requests(id TEXT PRIMARY KEY, kind TEXT NOT NULL, owner TEXT NOT NULL, created_at TEXT NOT NULL, payload TEXT NOT NULL);
              CREATE TABLE IF NOT EXISTS transfers(spark_id TEXT PRIMARY KEY, request_id TEXT NOT NULL, kind TEXT NOT NULL, status TEXT NOT NULL);
-             CREATE TABLE IF NOT EXISTS preimages(hash TEXT PRIMARY KEY, preimage TEXT NOT NULL, owner TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL DEFAULT '1970-01-01T00:00:00+00:00');
              CREATE TABLE IF NOT EXISTS payments(id TEXT PRIMARY KEY, status TEXT NOT NULL);
              CREATE TABLE IF NOT EXISTS receive_payments(hash TEXT PRIMARY KEY, status TEXT NOT NULL, transfer_id TEXT, preimage TEXT, claimable_amount_msat INTEGER, claim_submitted INTEGER NOT NULL DEFAULT 0);
              CREATE TABLE IF NOT EXISTS static_quotes(txid TEXT NOT NULL, vout INTEGER NOT NULL, credit INTEGER NOT NULL, signature TEXT NOT NULL, created_at TEXT NOT NULL, claimed INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(txid, vout));
@@ -150,16 +132,6 @@ impl Db {
                 "ALTER TABLE requests ADD COLUMN idempotency_key TEXT",
             ),
             (
-                "preimages",
-                "owner",
-                "ALTER TABLE preimages ADD COLUMN owner TEXT NOT NULL DEFAULT ''",
-            ),
-            (
-                "preimages",
-                "created_at",
-                "ALTER TABLE preimages ADD COLUMN created_at TEXT NOT NULL DEFAULT '1970-01-01T00:00:00+00:00'",
-            ),
-            (
                 "static_quotes",
                 "claimed",
                 "ALTER TABLE static_quotes ADD COLUMN claimed INTEGER NOT NULL DEFAULT 0",
@@ -184,11 +156,6 @@ impl Db {
                 "claim_submitted",
                 "ALTER TABLE receive_payments ADD COLUMN claim_submitted INTEGER NOT NULL DEFAULT 0",
             ),
-            (
-                "receive_payments",
-                "internal_payment_id",
-                "ALTER TABLE receive_payments ADD COLUMN internal_payment_id TEXT",
-            ),
         ] {
             ensure_column(&conn, table, column, migration).map_err(|e| e.to_string())?;
         }
@@ -197,12 +164,13 @@ impl Db {
             [],
         )
         .map_err(|e| e.to_string())?;
+        crate::lightning_store::migrate(&conn)?;
         Ok(Self {
             inner: Arc::new(Mutex::new(conn)),
         })
     }
 
-    async fn with<T, F>(&self, f: F) -> Result<T, String>
+    pub(crate) async fn with<T, F>(&self, f: F) -> Result<T, String>
     where
         F: FnOnce(&rusqlite::Connection) -> rusqlite::Result<T> + Send,
         T: Send + 'static,
@@ -331,11 +299,13 @@ impl Db {
     ) -> Result<(), String> {
         let payload = serde_json::to_string(payload).map_err(|e| e.to_string())?;
         self.with(|c| {
-            c.execute(
+            let tx = c.unchecked_transaction()?;
+            tx.execute(
                 "INSERT INTO requests(id,kind,owner,created_at,payload,idempotency_key) VALUES(?1,?2,?3,?4,?5,?6)",
-                (id, kind, owner, created_at, payload, idempotency_key),
-            )
-            .map(|_| ())
+                (id, kind, owner, created_at, &payload, idempotency_key),
+            )?;
+            crate::lightning_store::index_request(&tx,id,kind,owner,created_at,&payload)?;
+            tx.commit()
         })
         .await
     }
@@ -450,39 +420,6 @@ impl Db {
         .await
     }
 
-    pub async fn lightning_send_for_payment(
-        &self,
-        payment_id: &str,
-    ) -> Result<Option<LightningSend>, String> {
-        self.with(|c| {
-            c.query_row(
-                "SELECT owner,
-                        json_extract(payload, '$.user_outbound_transfer_external_id'),
-                        COALESCE(json_extract(payload, '$.payment_kind'), 'BOLT11'),
-                        COALESCE(json_extract(payload, '$.amount_sats'), 0)
-                 FROM requests
-                 WHERE kind='LIGHTNING_SEND'
-                   AND json_extract(payload, '$.payment_id')=?1
-                 LIMIT 1",
-                (payment_id,),
-                |row| {
-                    Ok(LightningSend {
-                        owner: row.get(0)?,
-                        outbound_transfer_id: row.get(1)?,
-                        payment_kind: row.get(2)?,
-                        amount_sats: row.get(3)?,
-                    })
-                },
-            )
-            .map(Some)
-            .or_else(|error| match error {
-                rusqlite::Error::QueryReturnedNoRows => Ok(None),
-                error => Err(error),
-            })
-        })
-        .await
-    }
-
     pub async fn commit_bolt12_receive(
         &self,
         offer_id: &str,
@@ -508,9 +445,7 @@ impl Db {
                 (offer_id, transfer_id),
             )?;
             tx.execute(
-                "UPDATE requests SET payload=json_set(payload, '$.settled_payment_hash', ?1)
-                 WHERE id=?2 AND owner=?3
-                   AND json_extract(payload, '$.offer_id')=?4",
+                "UPDATE lightning_receives SET settled_payment_hash=?1 WHERE request_id=?2 AND owner=?3 AND hash=?4",
                 (payment_hash, request_id, owner, offer_id),
             )?;
             tx.commit()
@@ -524,16 +459,10 @@ impl Db {
     ) -> Result<Option<LightningReceive>, String> {
         self.with(|c| {
             c.query_row(
-                "SELECT r.id, r.owner,
-                        COALESCE(json_extract(r.payload, '$.receiver_identity_pubkey'), r.owner),
-                        json_extract(r.payload, '$.amount_sats'),
-                        COALESCE(json_extract(r.payload, '$.invoice'), ''),
+                "SELECT r.request_id, r.owner, r.receiver, r.amount_sats, r.invoice,
                         COALESCE(p.status, 'INVOICE_CREATED'), p.transfer_id,
-                        p.preimage, COALESCE(p.claim_submitted, 0), p.internal_payment_id
-                 FROM requests r
-                 LEFT JOIN receive_payments p ON p.hash=?1
-                 WHERE r.kind='LIGHTNING_RECEIVE'
-                   AND json_extract(r.payload, '$.payment_hash')=?1
+                        p.preimage, COALESCE(p.claim_submitted, 0)
+                 FROM lightning_receives r LEFT JOIN receive_payments p ON p.hash=r.hash WHERE r.hash=?1
                  LIMIT 1",
                 (payment_hash,),
                 |row| {
@@ -547,7 +476,6 @@ impl Db {
                         transfer_id: row.get(6)?,
                         preimage: row.get(7)?,
                         claim_submitted: row.get::<_, i64>(8)? != 0,
-                        internal_payment_id: row.get(9)?,
                     })
                 },
             )
@@ -562,18 +490,14 @@ impl Db {
 
     /// Match the exact invoice issued by this SSP. Matching the encoded
     /// invoice, rather than only its payment hash, prevents an unrelated
-    /// invoice that reuses a hash from entering the internal payment path.
+    /// invoice that reuses a hash from being rejected as a local invoice.
     pub async fn lightning_receive_hash_for_invoice(
         &self,
         invoice: &str,
     ) -> Result<Option<String>, String> {
         self.with(|c| {
             c.query_row(
-                "SELECT json_extract(payload, '$.payment_hash')
-                 FROM requests
-                 WHERE kind='LIGHTNING_RECEIVE'
-                   AND json_extract(payload, '$.invoice')=?1
-                   AND COALESCE(json_extract(payload, '$.payment_kind'), 'BOLT11')='BOLT11'
+                "SELECT hash FROM lightning_receives WHERE invoice=?1 AND kind='BOLT11'
                  LIMIT 1",
                 (invoice,),
                 |row| row.get(0),
@@ -583,92 +507,6 @@ impl Db {
                 rusqlite::Error::QueryReturnedNoRows => Ok(None),
                 error => Err(error),
             })
-        })
-        .await
-    }
-
-    /// Internal sends stay pending until both Spark transfers are complete.
-    /// The Lightning reconciler uses these rows to resume work after a crash
-    /// or a transient operator failure.
-    pub async fn pending_internal_lightning_sends(
-        &self,
-    ) -> Result<Vec<InternalLightningSend>, String> {
-        self.with(|c| {
-            let mut stmt = c.prepare(
-                "SELECT json_extract(r.payload, '$.internal_payment_hash'),
-                        json_extract(r.payload, '$.payment_id'),
-                        json_extract(r.payload, '$.user_outbound_transfer_external_id'),
-                        json_extract(r.payload, '$.encoded_invoice')
-                 FROM requests r
-                 JOIN payments p ON p.id=json_extract(r.payload, '$.payment_id')
-                 WHERE r.kind='LIGHTNING_SEND'
-                   AND json_extract(r.payload, '$.payment_kind')='INTERNAL_BOLT11'
-                   AND p.status='PENDING'",
-            )?;
-            let rows = stmt.query_map([], |row| {
-                Ok(InternalLightningSend {
-                    payment_hash: row.get(0)?,
-                    payment_id: row.get(1)?,
-                    outbound_transfer_id: row.get(2)?,
-                    invoice: row.get(3)?,
-                })
-            })?;
-            rows.collect()
-        })
-        .await
-    }
-
-    pub async fn has_internal_lightning_send(&self, payment_hash: &str) -> Result<bool, String> {
-        self.with(|c| {
-            c.query_row(
-                "SELECT EXISTS(
-                    SELECT 1 FROM requests r
-                    JOIN payments p ON p.id=json_extract(r.payload, '$.payment_id')
-                    WHERE r.kind='LIGHTNING_SEND'
-                      AND json_extract(r.payload, '$.payment_kind')='INTERNAL_BOLT11'
-                      AND json_extract(r.payload, '$.internal_payment_hash')=?1
-                      AND p.status != 'FAILED'
-                )",
-                (payment_hash,),
-                |row| row.get(0),
-            )
-        })
-        .await
-    }
-
-    /// Choose the internal settlement path before contacting the operators.
-    /// Callers share the receive lock with the Lightning event handlers.
-    pub async fn reserve_internal_receive(
-        &self,
-        hash: &str,
-        payment_id: &str,
-    ) -> Result<bool, String> {
-        self.with(|c| {
-            c.execute(
-                "UPDATE receive_payments SET internal_payment_id=?2
-                 WHERE hash=?1 AND status='INVOICE_CREATED'
-                   AND transfer_id IS NULL AND internal_payment_id IS NULL",
-                (hash, payment_id),
-            )
-            .map(|changed| changed == 1)
-        })
-        .await
-    }
-
-    /// Release a failed attempt only if it has not committed a payout.
-    pub async fn fail_internal_send(&self, hash: &str, payment_id: &str) -> Result<(), String> {
-        self.with(|c| {
-            let tx = c.unchecked_transaction()?;
-            tx.execute(
-                "UPDATE payments SET status='FAILED' WHERE id=?1",
-                (payment_id,),
-            )?;
-            tx.execute(
-                "UPDATE receive_payments SET internal_payment_id=NULL
-                 WHERE hash=?1 AND internal_payment_id=?2 AND transfer_id IS NULL",
-                (hash, payment_id),
-            )?;
-            tx.commit()
         })
         .await
     }
@@ -964,142 +802,18 @@ impl Db {
         })
         .await
     }
-    // ---- preimages ----
-    pub async fn save_preimage(
-        &self,
-        hash: &str,
-        preimage: &str,
-        owner: &str,
-        created_at: &str,
-    ) -> Result<(), String> {
-        self.with(|c| {
-            c.execute(
-                "INSERT INTO preimages(hash,preimage,owner,created_at) VALUES(?1,?2,?3,?4)
-                 ON CONFLICT(hash) DO UPDATE SET preimage=excluded.preimage, owner=excluded.owner, created_at=excluded.created_at",
-                (hash, preimage, owner, created_at),
-            )
-            .map(|_| ())
-        })
-        .await
-    }
-
-    pub async fn get_preimage(&self, hash: &str) -> Result<Option<String>, String> {
-        self.with(|c| {
-            c.query_row(
-                "SELECT preimage FROM preimages WHERE hash=?1",
-                (hash,),
-                |r| r.get(0),
-            )
-            .map(Some)
-            .or_else(|e| match e {
-                rusqlite::Error::QueryReturnedNoRows => Ok(None),
-                e => Err(e),
-            })
-        })
-        .await
-    }
-
-    pub async fn get_preimage_for_owner(
-        &self,
-        hash: &str,
-        owner: &str,
-    ) -> Result<Option<String>, String> {
-        self.with(|c| {
-            c.query_row(
-                "SELECT preimage FROM preimages WHERE hash=?1 AND owner=?2",
-                (hash, owner),
-                |r| r.get(0),
-            )
-            .map(Some)
-            .or_else(|e| match e {
-                rusqlite::Error::QueryReturnedNoRows => Ok(None),
-                e => Err(e),
-            })
-        })
-        .await
-    }
-
-    pub async fn delete_preimage(&self, hash: &str) -> Result<(), String> {
-        self.with(|c| {
-            c.execute("DELETE FROM preimages WHERE hash=?1", (hash,))
-                .map(|_| ())
-        })
-        .await
-    }
-
-    pub async fn prune_orphan_preimages(&self, older_than_rfc3339: &str) -> Result<(), String> {
-        self.with(|c| {
-            c.execute(
-                "DELETE FROM preimages
-                 WHERE created_at<?1
-                   AND NOT EXISTS (
-                     SELECT 1 FROM requests
-                     WHERE kind='LIGHTNING_RECEIVE'
-                       AND json_extract(payload, '$.payment_hash')=preimages.hash
-                   )",
-                (older_than_rfc3339,),
-            )
-            .map(|_| ())
-        })
-        .await
-    }
+    // ---- Lightning receive expiry and status ----
 
     pub async fn expired_receive_hashes(&self, now_epoch: i64) -> Result<Vec<String>, String> {
         self.with(|c| {
-            let mut stmt = c.prepare(
-                "SELECT r.created_at,r.payload
-                 FROM requests r
-                 LEFT JOIN receive_payments p
-                   ON p.hash=json_extract(r.payload, '$.payment_hash')
-                 WHERE r.kind='LIGHTNING_RECEIVE'
-                   AND COALESCE(p.status, '') NOT IN ('TRANSFER_COMPLETED','HTLC_FAILED')
-                   AND p.transfer_id IS NULL
-                   AND p.internal_payment_id IS NULL
-                   AND NOT EXISTS (
-                     SELECT 1 FROM transfers t
-                     WHERE t.request_id=r.id AND t.kind='LIGHTNING_RECEIVE'
-                   )",
-            )?;
-            let rows =
-                stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
-            let mut expired = Vec::new();
-            for row in rows {
-                let (created_at, payload) = row?;
-                let created = chrono::DateTime::parse_from_rfc3339(&created_at)
-                    .map(|value| value.timestamp())
-                    .unwrap_or(i64::MAX);
-                let payload: Value = serde_json::from_str(&payload).unwrap_or(Value::Null);
-                let expiry = payload
-                    .get("expiry_secs")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(86_400);
-                if created.saturating_add(expiry.min(i64::MAX as u64) as i64) <= now_epoch {
-                    if let Some(hash) = payload.get("payment_hash").and_then(Value::as_str) {
-                        expired.push(hash.to_string());
-                    }
-                }
-            }
-            Ok(expired)
-        })
-        .await
-    }
-
-    pub async fn has_receive_request(&self, hash: &str, owner: &str) -> Result<bool, String> {
-        self.with(|c| {
-            c.query_row(
-                "SELECT EXISTS(
-                    SELECT 1 FROM requests
-                    WHERE kind='LIGHTNING_RECEIVE' AND owner=?1
-                      AND json_extract(payload, '$.payment_hash')=?2
-                )",
-                (owner, hash),
-                |r| r.get(0),
-            )
-        })
-        .await
+            let mut stmt=c.prepare("SELECT r.hash FROM lightning_receives r LEFT JOIN receive_payments p ON p.hash=r.hash WHERE r.kind='BOLT11' AND r.expires_at<=?1 AND COALESCE(p.status,'INVOICE_CREATED') NOT IN ('TRANSFER_COMPLETED','HTLC_FAILED') AND p.transfer_id IS NULL AND NOT EXISTS(SELECT 1 FROM transfers t WHERE t.request_id=r.request_id AND t.kind='LIGHTNING_RECEIVE')")?;
+            let rows=stmt.query_map([now_epoch],|r|r.get(0))?;
+            rows.collect()
+        }).await
     }
 
     pub async fn set_receive_status(&self, hash: &str, status: &str) -> Result<(), String> {
+        let status: crate::lightning_store::ReceiveStatus = status.parse()?;
         self.with(|c| {
             c.execute(
                 "INSERT INTO receive_payments(hash,status) VALUES(?1,?2)
@@ -1115,8 +829,7 @@ impl Db {
         self.with(|c| {
             c.execute(
                 "UPDATE receive_payments SET status='HTLC_FAILED'
-                 WHERE hash=?1 AND internal_payment_id IS NULL
-                   AND status != 'TRANSFER_COMPLETED'",
+                 WHERE hash=?1 AND status != 'TRANSFER_COMPLETED'",
                 (hash,),
             )
             .map(|_| ())
@@ -1144,7 +857,9 @@ impl Db {
 
     // ---- payments ----
     pub async fn set_payment(&self, id: &str, status: &str) -> Result<(), String> {
+        let status: crate::lightning_store::SendStatus = status.parse()?;
         self.with(|c| {
+            c.execute("UPDATE lightning_sends SET status=?2 WHERE (request_id=?1 OR payment_id=?1) AND status NOT IN ('SUCCEEDED','FAILED')", (id,status))?;
             c.execute(
                 "INSERT INTO payments(id,status) VALUES(?1,?2)
                  ON CONFLICT(id) DO UPDATE SET status=excluded.status",
@@ -1158,7 +873,7 @@ impl Db {
     pub async fn payment_status(&self, id: &str) -> Result<String, String> {
         let found: Option<String> = self
             .with(|c| {
-                c.query_row("SELECT status FROM payments WHERE id=?1", (id,), |r| {
+                c.query_row("SELECT status FROM lightning_sends WHERE request_id=?1 OR payment_id=?1 UNION ALL SELECT status FROM payments WHERE id=?1 LIMIT 1", (id,), |r| {
                     r.get(0)
                 })
                 .map(Some)
@@ -1796,24 +1511,6 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn minted_preimage_is_owner_scoped() {
-        let (db, dir) = test_db();
-        db.save_preimage("hash", "preimage", "alice", "now")
-            .await
-            .unwrap();
-
-        assert_eq!(
-            db.get_preimage_for_owner("hash", "alice").await.unwrap(),
-            Some("preimage".to_string())
-        );
-        assert_eq!(
-            db.get_preimage_for_owner("hash", "bob").await.unwrap(),
-            None
-        );
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
     async fn lightning_receive_links_request_and_transfer() {
         let (db, dir) = test_db();
         db.insert_request(
@@ -1839,11 +1536,10 @@ mod tests {
                 receiver: "owner".to_string(),
                 amount_sats: 1234,
                 invoice: "ln-invoice".to_string(),
-                status: "INVOICE_CREATED".to_string(),
+                status: crate::lightning_store::ReceiveStatus::InvoiceCreated,
                 transfer_id: None,
                 preimage: None,
                 claim_submitted: false,
-                internal_payment_id: None,
             })
         );
         assert_eq!(
@@ -1880,47 +1576,6 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn pending_internal_send_is_recoverable() {
-        let (db, dir) = test_db();
-        db.insert_request(
-            "send-request",
-            "LIGHTNING_SEND",
-            "sender",
-            "now",
-            &serde_json::json!({
-                "payment_id": "internal:hash",
-                "payment_kind": "INTERNAL_BOLT11",
-                "internal_payment_hash": "hash",
-                "encoded_invoice": "ln-invoice",
-                "user_outbound_transfer_external_id": "outbound-transfer",
-            }),
-            Some("idempotency-key"),
-        )
-        .await
-        .unwrap();
-        db.set_payment("internal:hash", "PENDING").await.unwrap();
-
-        assert!(db.has_internal_lightning_send("hash").await.unwrap());
-        assert_eq!(
-            db.pending_internal_lightning_sends().await.unwrap(),
-            vec![InternalLightningSend {
-                payment_hash: "hash".to_string(),
-                payment_id: "internal:hash".to_string(),
-                outbound_transfer_id: "outbound-transfer".to_string(),
-                invoice: "ln-invoice".to_string(),
-            }]
-        );
-
-        db.set_payment("internal:hash", "SUCCEEDED").await.unwrap();
-        assert!(db
-            .pending_internal_lightning_sends()
-            .await
-            .unwrap()
-            .is_empty());
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
     async fn bolt12_send_restores_funding_metadata() {
         let (db, dir) = test_db();
         db.insert_request(
@@ -1939,15 +1594,15 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(
-            db.lightning_send_for_payment("payment").await.unwrap(),
-            Some(LightningSend {
-                owner: "owner".to_string(),
-                outbound_transfer_id: "funding".to_string(),
-                payment_kind: "BOLT12".to_string(),
-                amount_sats: 1234,
-            })
-        );
+        let send = db
+            .lightning_send_for_payment("payment")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(send.owner, "owner");
+        assert_eq!(send.outbound_transfer_id, "funding");
+        assert_eq!(send.kind, crate::lightning_store::SendKind::Bolt12);
+        assert_eq!(send.amount_sats, 1234);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -1989,7 +1644,17 @@ mod tests {
         );
         let request = db.get_request("request", "owner").await.unwrap().unwrap();
         assert_eq!(request["payload"]["payment_hash"], "offer");
-        assert_eq!(request["payload"]["settled_payment_hash"], "hash");
+        let settled: String = db
+            .with(|c| {
+                c.query_row(
+                    "SELECT settled_payment_hash FROM lightning_receives WHERE hash='offer'",
+                    [],
+                    |r| r.get(0),
+                )
+            })
+            .await
+            .unwrap();
+        assert_eq!(settled, "hash");
         std::fs::remove_dir_all(dir).unwrap();
     }
 

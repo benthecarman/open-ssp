@@ -4,7 +4,6 @@ const COMMAND_TIMEOUT_MS = Number(process.env.E2E_COMMAND_TIMEOUT_MS ?? "30000")
 const HTTP_TIMEOUT_MS = Number(process.env.E2E_HTTP_TIMEOUT_MS ?? "15000");
 
 export const SSP_BASE_URL = process.env.SSP_BASE_URL ?? "http://127.0.0.1:5000";
-export const GRAPHQL_URL = `${SSP_BASE_URL}/graphql/spark/rc`;
 const SPARK_ADMIN_TOKEN = process.env.SPARK_ADMIN_TOKEN ?? "";
 
 const apiKeys = new Map();
@@ -120,9 +119,9 @@ export async function initializeWallet() {
   const sdk = process.env.SPARK_SDK_DIST;
   if (!sdk) throw new Error("set SPARK_SDK_DIST");
   const health = await assertLiveHealth();
-  const { SparkWallet, generateTransferId } = await import(sdk);
+  const { SparkWallet } = await import(sdk);
   const initialized = await SparkWallet.initialize({ options: walletOptions(health) });
-  return { ...initialized, health, generateTransferId };
+  return { ...initialized, health };
 }
 
 export async function poll(label, check, options = {}) {
@@ -181,31 +180,6 @@ export function assertPayment(payment, expected) {
     }
   }
   return payment;
-}
-
-export async function mintInvoicePreimage(wallet) {
-  // This mint is an SSP extension. The invoice and status calls below use
-  // public SparkWallet methods. The SDK client supplies wallet authentication.
-  const sspClient = wallet.getSspClient();
-  const result = await sspClient.executeRawQuery({
-    queryPayload:
-      "mutation MintInvoicePreimage { mint_invoice_preimage { payment_hash } }",
-    variables: {},
-    constructObject: (response) => response.mint_invoice_preimage,
-  });
-  const paymentHash = result?.payment_hash;
-  if (!/^[0-9a-f]{64}$/i.test(paymentHash ?? "")) {
-    throw new Error(`SSP returned an invalid payment hash: ${JSON.stringify(result)}`);
-  }
-  return paymentHash.toLowerCase();
-}
-
-export async function authenticatedRaw(wallet, queryPayload, variables = {}) {
-  return await wallet.getSspClient().executeRawQuery({
-    queryPayload,
-    variables,
-    constructObject: (response) => response,
-  });
 }
 
 export async function cleanupWallet(wallet) {

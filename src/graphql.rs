@@ -1,11 +1,10 @@
 use axum::http::HeaderMap;
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use serde_json::{json, Value};
-use sha2::{Digest, Sha256};
 use std::str::FromStr;
 use uuid::Uuid;
 
-use crate::{auth, ldk::LdkBackend, AppState, GraphqlRequest};
+use crate::{auth, AppState, GraphqlRequest};
 
 /// Dispatch a GraphQL document to the matching SSP resolver.
 /// Operation names mirror spark-sdk `SspClient` methods (client.ts) and the
@@ -68,10 +67,7 @@ pub async fn dispatch(
             let inv = str_of(&input, "encoded_invoice");
             validate_internal_send_support(&state.db, &inv).await?;
             let amt = opt_num(&input, "amount_sats");
-            let msat = crate::backend(&state)
-                .await
-                .fee_estimate_msat(&inv, amt)
-                .await;
+            let msat = state.ldk.fee_estimate_msat(&inv, amt).await;
             Ok(json!({ "lightning_send_fee_estimate": {
                 "fee_estimate": {
                     "original_value": msat / 1000,
@@ -81,30 +77,27 @@ pub async fn dispatch(
                 }
             }}))
         }
-        "CoopExitFeeEstimates" | "coop_exit_fee_estimates" => Ok(json!({
-            "coop_exit_fee_estimates": {
-                "slow": {"fee_sats": 500}, "medium": {"fee_sats": 1000}, "fast": {"fee_sats": 2000},
-            }
-        })),
-        "CoopExitFeeQuote" | "coop_exit_fee_quote" => {
-            let id = Uuid::new_v4().to_string();
-            let sats = currency_amount;
-            Ok(json!({ "coop_exit_fee_quote": {
-                "quote": {
-                    "__typename": "CoopExitFeeQuote",
-                    "id": id,
-                    "created_at": now,
-                    "updated_at": now,
-                    "network": state.config.network,
-                    "total_amount": sats(0),
-                    "user_fee_fast": sats(2000),
-                    "user_fee_medium": sats(1000),
-                    "user_fee_slow": sats(500),
-                    "l1_broadcast_fee_fast": sats(800),
-                    "l1_broadcast_fee_medium": sats(500),
-                    "l1_broadcast_fee_slow": sats(300),
-                }
+        "CoopExitFeeEstimate" | "CoopExitFeeEstimates" | "coop_exit_fee_estimates" => {
+            let owner = auth::require_session(&state, headers).await?;
+            let service = state
+                .coop_exit
+                .as_ref()
+                .ok_or("cooperative withdrawals are not configured")?;
+            let quote = service.quote(&owner, &input).await?;
+            Ok(json!({"coop_exit_fee_estimates": {
+                "speed_fast": {"user_fee": currency_amount(quote.user_fee), "l1_broadcast_fee": currency_amount(quote.fees[0])},
+                "speed_medium": {"user_fee": currency_amount(quote.user_fee), "l1_broadcast_fee": currency_amount(quote.fees[1])},
+                "speed_slow": {"user_fee": currency_amount(quote.user_fee), "l1_broadcast_fee": currency_amount(quote.fees[2])},
             }}))
+        }
+        "CoopExitFeeQuote" | "coop_exit_fee_quote" => {
+            let owner = auth::require_session(&state, headers).await?;
+            let service = state
+                .coop_exit
+                .as_ref()
+                .ok_or("cooperative withdrawals are not configured")?;
+            let quote = service.quote(&owner, &input).await?;
+            Ok(json!({"coop_exit_fee_quote": {"quote": service.quote_response(&quote)}}))
         }
         // Paginated user-request history for the session wallet.
         "FetchCurrentUserToUserRequestsConnection"
@@ -183,10 +176,7 @@ pub async fn dispatch(
             }
             let invoice_expires_at =
                 (chrono::Utc::now() + chrono::Duration::seconds(expiry as i64)).to_rfc3339();
-            let offer = crate::backend(&state)
-                .await
-                .create_bolt12_offer(amount, &memo, expiry)
-                .await?;
+            let offer = state.ldk.create_bolt12_offer(amount, &memo, expiry).await?;
             let rec = store_request(
                 &state,
                 "LIGHTNING_RECEIVE",
@@ -261,25 +251,11 @@ pub async fn dispatch(
             }
             let invoice_expires_at =
                 (chrono::Utc::now() + chrono::Duration::seconds(expiry as i64)).to_rfc3339();
-            let inv = crate::backend(&state)
-                .await
+            let inv = state
+                .ldk
                 .create_invoice(amount, &hash, &memo, expiry)
                 .await
                 .map_err(|e| format!("ldk create_invoice: {e}"))?;
-            // The explicit SSP-minted HODL extension still stores its own
-            // shares. A standard SDK receive stores wallet-created shares in
-            // the SDK after this invoice has been validated.
-            if state
-                .db
-                .get_preimage_for_owner(&hash, &owner)
-                .await?
-                .is_some()
-            {
-                if let Err(e) = store_preimage_shares(&state, &hash, &inv.invoice).await {
-                    let _ = crate::backend(&state).await.fail_hold(&hash).await;
-                    return Err(e);
-                }
-            }
             let rec = store_request(
                 &state,
                 "LIGHTNING_RECEIVE",
@@ -337,163 +313,31 @@ pub async fn dispatch(
                 explicit_idem
             };
             let _send_guard = state.send_lock.lock().await;
-            // Idempotency: a retry with the same key returns the stored
-            // request (with live status) instead of paying twice. The lock
-            // makes the lookup and payment one process-local critical section.
             if let Some(rec) = state.db.find_by_idempotency(&owner, &idem).await? {
-                let payload = rec.get("payload").cloned().unwrap_or(Value::Null);
-                if payload.get("encoded_invoice").and_then(Value::as_str) != Some(inv.as_str())
-                    || payload
-                        .get("user_outbound_transfer_external_id")
-                        .and_then(Value::as_str)
+                let payload = &rec["payload"];
+                if payload["encoded_invoice"].as_str() != Some(inv.as_str())
+                    || payload["user_outbound_transfer_external_id"].as_str()
                         != Some(ext_id.as_str())
-                    || payload.get("amount_sats").and_then(Value::as_u64) != amt
+                    || payload["amount_sats"].as_u64() != amt
                 {
-                    return Err("idempotency key was already used for another payment".to_string());
+                    return Err("idempotency key was already used for another payment".into());
                 }
-                if payload.get("payment_kind").and_then(Value::as_str) == Some("INTERNAL_BOLT11") {
-                    let payment_hash = payload
-                        .get("internal_payment_hash")
-                        .and_then(Value::as_str)
-                        .ok_or_else(|| "internal payment record has no payment hash".to_string())?;
-                    let payment_id = payload
-                        .get("payment_id")
-                        .and_then(Value::as_str)
-                        .ok_or_else(|| "internal payment record has no payment ID".to_string())?;
-                    if let Err(error) = crate::backend(&state)
-                        .await
-                        .settle_internal_bolt11(payment_hash, &inv, &ext_id, payment_id)
-                        .await
-                    {
-                        tracing::warn!(
-                            payment_hash,
-                            payment_id,
-                            "internal Spark payment settlement is pending: {error}"
-                        );
-                    }
+                if let Some(send) = state
+                    .db
+                    .lightning_send_for_payment(rec["id"].as_str().unwrap_or(""))
+                    .await?
+                {
+                    state.ldk.submit_send(&send).await?;
                 }
                 return send_response_from_record(&state, &rec, &now).await;
             }
-            let local_payment_hash = if inv.to_ascii_lowercase().starts_with("lno1") {
-                None
-            } else {
-                state.db.lightning_receive_hash_for_invoice(&inv).await?
-            };
-            if let Some(payment_hash) = local_payment_hash.as_deref() {
-                validate_internal_send_support(&state.db, &inv).await?;
-                let decoded = lightning_invoice::Bolt11Invoice::from_str(&inv)
-                    .map_err(|error| format!("decode internal BOLT11 invoice: {error}"))?;
-                if amt.is_some() {
-                    return Err("amount_sats is only valid for zero-amount invoices".to_string());
-                }
-                if decoded.payment_hash().to_string() != payment_hash {
-                    return Err(
-                        "internal Lightning invoice payment hash does not match its request"
-                            .to_string(),
-                    );
-                }
-                let now_since_epoch = std::time::SystemTime::now()
-                    .duration_since(std::time::SystemTime::UNIX_EPOCH)
-                    .map_err(|_| "system clock is before the Unix epoch".to_string())?;
-                if decoded.would_expire(now_since_epoch) {
-                    return Err("internal Lightning invoice has expired".to_string());
-                }
-                let receive = state
-                    .db
-                    .lightning_receive_for_hash(payment_hash)
-                    .await?
-                    .ok_or_else(|| {
-                        "internal Lightning receive request was not found".to_string()
-                    })?;
-                let expected_msat = receive
-                    .amount_sats
-                    .checked_mul(1000)
-                    .ok_or_else(|| "internal Lightning amount is too large".to_string())?;
-                if decoded.amount_milli_satoshis() != Some(expected_msat) {
-                    return Err(
-                        "internal Lightning invoice amount does not match its request".to_string(),
-                    );
-                }
-                if receive.status != "INVOICE_CREATED" {
-                    return Err(format!(
-                        "internal Lightning invoice is not payable in status {}",
-                        receive.status
-                    ));
-                }
-                if state.db.has_internal_lightning_send(payment_hash).await? {
-                    return Err("internal Lightning invoice already has a payment".to_string());
-                }
-                state
-                    .spark
-                    .verify_lightning_send(&owner, &ext_id, payment_hash, receive.amount_sats)
-                    .await?;
-            } else {
-                crate::backend(&state)
-                    .await
-                    .verify_lightning_send_funding(&owner, &ext_id, &inv, amt)
-                    .await?;
-            }
-            let payment_kind = if local_payment_hash.is_some() {
-                "INTERNAL_BOLT11"
-            } else if inv.to_ascii_lowercase().starts_with("lno1") {
-                "BOLT12"
-            } else {
-                "BOLT11"
-            };
-            let pay = if local_payment_hash.is_some() {
-                // Each attempt needs its own payment row. Reusing the hash
-                // would revive failed requests with stale funding transfers.
-                let payment_id = format!("internal:{}", Uuid::new_v4());
-                state.db.set_payment(&payment_id, "PENDING").await?;
-                crate::ldk::PayResult {
-                    payment_id,
-                    status: "PENDING".to_string(),
-                }
-            } else {
-                crate::backend(&state).await.pay_invoice(&inv, amt).await
-            };
-            let rec = store_request(
-                &state,
-                "LIGHTNING_SEND",
-                &owner,
-                &now,
-                json!({"encoded_invoice": inv, "amount_sats": amt,
-                       "idempotency_key": idem,
-                       "payment_id": pay.payment_id, "status": pay.status,
-                       "payment_kind": payment_kind,
-                       "internal_payment_hash": local_payment_hash,
-                       "network": state.config.network,
-                       "user_outbound_transfer_external_id": ext_id}),
-                Some(idem.as_str()),
-            )
-            .await?;
-            state
+            validate_internal_send_support(&state.db, &inv).await?;
+            let send = state.ldk.prepare_send(&owner, &ext_id, &inv, amt).await?;
+            let rec = state
                 .db
-                .insert_transfer(
-                    &ext_id_or_new(&ext_id),
-                    rec["id"].as_str().unwrap_or(""),
-                    if payment_kind == "BOLT12" {
-                        "BOLT12_FUNDING"
-                    } else {
-                        "PREIMAGE_SWAP"
-                    },
-                    &pay.status,
-                    &owner,
-                )
+                .prepare_lightning_send(&send, &idem, &state.config.network)
                 .await?;
-            if let Some(payment_hash) = local_payment_hash.as_deref() {
-                if let Err(error) = crate::backend(&state)
-                    .await
-                    .settle_internal_bolt11(payment_hash, &inv, &ext_id, &pay.payment_id)
-                    .await
-                {
-                    tracing::warn!(
-                        payment_hash,
-                        payment_id = pay.payment_id,
-                        "internal Spark payment settlement is pending: {error}"
-                    );
-                }
-            }
+            state.ldk.submit_send(&send).await?;
             return send_response_from_record(&state, &rec, &now).await;
         }
         // ---- swaps (SDK mutation name is RequestSwap / field request_swap) ----
@@ -611,7 +455,7 @@ pub async fn dispatch(
                         "__typename": "Transfer",
                         "total_amount": currency_amount(total),
                         "spark_id": inbound_id,
-                        "user_request": {"id": rec["id"]},
+                        "user_request": {"__typename": "LeavesSwapRequest", "id": rec["id"]},
                     },
                     "swap_leaves": swap_leaves,
                     "expires_at": null,
@@ -717,111 +561,22 @@ pub async fn dispatch(
                 "claim": {"id": rec["id"], "status": "CREATED"},
             }}))
         }
-        // ---- coop exit ----
+        // ---- cooperative withdrawals ----
         "RequestCoopExit" | "request_coop_exit" => {
             let owner = auth::require_session(&state, headers).await?;
-            let exit_speed = str_of(&input, "exit_speed");
-            let exit_speed = if exit_speed.is_empty() {
-                "MEDIUM".to_string()
-            } else {
-                exit_speed
-            };
-            let coop_exit_txid = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
-            let mut payload = json!({
-                "coop_exit_txid": coop_exit_txid,
-                "exit_speed": exit_speed,
-            });
-            if let Some(ext_id) = input
-                .get("user_outbound_transfer_external_id")
-                .and_then(Value::as_str)
-            {
-                payload["user_outbound_transfer_external_id"] = Value::String(ext_id.to_string());
-            }
-            enforce_compat_quota(&state, &owner).await?;
-            let rec = store_request(&state, "COOP_EXIT", &owner, &now, payload, None).await?;
-            let req_id = rec["id"].as_str().unwrap_or("").to_string();
-            // Compatibility stub: never insert the client-supplied
-            // `user_outbound_transfer_external_id` into the global transfers
-            // namespace. The id is unverified, yet receive settlement derives
-            // deterministic transfer ids a caller can compute in advance; a
-            // poisoned row would break the post-commit receive checkpoint
-            // after the Spark transfer is already irreversible.
-            Ok(json!({ "request_coop_exit": {
-                "request": {
-                    "__typename": "CoopExitRequest",
-                    "id": req_id,
-                    "created_at": now,
-                    "updated_at": now,
-                    "network": state.config.network,
-                    "fee": currency_amount(1000),
-                    "l1_broadcast_fee": currency_amount(500),
-                    "fee_quote": null,
-                    "exit_speed": exit_speed,
-                    "status": "CREATED",
-                    "expires_at": null,
-                    "raw_connector_transaction": "",
-                    "raw_coop_exit_transaction": "",
-                    "coop_exit_txid": coop_exit_txid,
-                }
-            }}))
+            let service = state
+                .coop_exit
+                .as_ref()
+                .ok_or("cooperative withdrawals are not configured")?;
+            Ok(json!({"request_coop_exit": {"request": service.request(&owner, &input).await?}}))
         }
         "CompleteCoopExit" | "complete_coop_exit" => {
             let owner = auth::require_session(&state, headers).await?;
-            let transfer_id = str_of(&input, "user_outbound_transfer_external_id");
-            if transfer_id.is_empty() {
-                return Err("user_outbound_transfer_external_id is required".to_string());
-            }
-            // Correlate through the stored compatibility request only. The
-            // client-supplied Spark id stays out of the transfers namespace,
-            // where it could collide with SSP-derived receive transfer ids.
-            let request_id = state
-                .db
-                .request_id_for_ext_id("COOP_EXIT", &transfer_id, &owner)
-                .await?
-                .ok_or_else(|| "cooperative exit request not found".to_string())?;
-            state
-                .db
-                .set_request_status(&request_id, &owner, "COMPLETED")
-                .await?;
-            Ok(json!({ "complete_coop_exit": {
-                "request": {"id": request_id,
-                            "status": "COMPLETED"}
-            }}))
-        }
-        // ---- preimage mint + reveal (SSP extensions, not in stock SDK) ----
-        // SSP-owned preimage model: the wallet mints a hash here FIRST, uses
-        // it in createLightningHodlInvoice, and the SSP holds the preimage
-        // before payment (compliant: attestor == holder). On LN arrival the
-        // SSP auto-claims; cooperative wallets can also reveal explicitly.
-        "MintInvoicePreimage" | "mint_invoice_preimage" => {
-            let owner = auth::require_session(&state, headers).await?;
-            let preimage: [u8; 32] = rand::random();
-            let payment_hash = hex::encode(Sha256::digest(preimage));
-            state
-                .db
-                .save_preimage(&payment_hash, &hex::encode(preimage), &owner, &now)
-                .await?;
-            Ok(json!({ "mint_invoice_preimage": {
-                "__typename": "MintInvoicePreimageOutput",
-                "payment_hash": payment_hash,
-            }}))
-        }
-        "RevealPreimage" | "reveal_preimage" => {
-            let owner = auth::require_session(&state, headers).await?;
-            let hash = str_of(&input, "payment_hash").to_lowercase();
-            let preimage = str_of(&input, "preimage").to_lowercase();
-            if !state.db.has_receive_request(&hash, &owner).await? {
-                return Err("no matching lightning receive request".to_string());
-            }
-            let claimed = crate::backend(&state)
-                .await
-                .reveal_and_claim(&hash, &preimage)
-                .await;
-            Ok(json!({ "reveal_preimage": {
-                "__typename": "RevealPreimageOutput",
-                "ok": claimed,
-                "claimed": claimed,
-            }}))
+            let service = state
+                .coop_exit
+                .as_ref()
+                .ok_or("cooperative withdrawals are not configured")?;
+            Ok(json!({"complete_coop_exit": {"request": service.complete(&owner, &input).await?}}))
         }
         // ---- reads ----
         // SDK Transfers query only. All rows here were created by this SSP, so
@@ -1012,14 +767,22 @@ async fn user_request_union(state: &AppState, rec: &Value) -> Value {
         .to_string();
     let sats = currency_amount;
     match kind {
+        "COOP_EXIT_V2" => match &state.coop_exit {
+            Some(service) => service
+                .get(
+                    rec["id"].as_str().unwrap_or(""),
+                    rec["owner_identity_pubkey"].as_str().unwrap_or(""),
+                )
+                .await
+                .ok()
+                .flatten()
+                .unwrap_or(Value::Null),
+            None => Value::Null,
+        },
+
         "LIGHTNING_SEND" => {
             let pid = p.get("payment_id").and_then(|v| v.as_str()).unwrap_or("");
-            let status = match crate::backend(state)
-                .await
-                .payment_status(pid)
-                .await
-                .as_str()
-            {
+            let status = match state.ldk.payment_status(pid).await.as_str() {
                 "SUCCEEDED" => "LIGHTNING_PAYMENT_SUCCEEDED",
                 "FAILED" => "LIGHTNING_PAYMENT_FAILED",
                 _ => "LIGHTNING_PAYMENT_INITIATED",
@@ -1167,13 +930,14 @@ fn transfer_response(row: &Value, user_request: Value) -> Value {
 
 /// Reject unsupported local invoices before the wallet locks sender funding.
 async fn validate_internal_send_support(db: &crate::db::Db, invoice: &str) -> Result<(), String> {
-    if let Some(hash) = db.lightning_receive_hash_for_invoice(invoice).await? {
-        if db.get_preimage(&hash).await?.is_none() {
-            return Err(
-                "this invoice cannot be paid internally; use an external Lightning wallet"
-                    .to_string(),
-            );
-        }
+    if db
+        .lightning_receive_hash_for_invoice(invoice)
+        .await?
+        .is_some()
+    {
+        return Err(
+            "this invoice cannot be paid internally; use an external Lightning wallet".into(),
+        );
     }
     Ok(())
 }
@@ -1186,11 +950,10 @@ async fn send_response_from_record(
     rec: &Value,
     now: &str,
 ) -> Result<Value, String> {
-    // Send only inits: status stays INITIATED until SubscribeEvents
-    // reports finality (see LdkBackend::apply_ln_event).
+    // Events and reconciliation both update the durable send status.
     let p = rec.get("payload").cloned().unwrap_or(Value::Null);
     let pid = p.get("payment_id").and_then(|v| v.as_str()).unwrap_or("");
-    let live = crate::backend(state).await.payment_status(pid).await;
+    let live = state.ldk.payment_status(pid).await;
     let status = match live.as_str() {
         "SUCCEEDED" => "LIGHTNING_PAYMENT_SUCCEEDED",
         "FAILED" => "LIGHTNING_PAYMENT_FAILED",
@@ -1269,66 +1032,6 @@ async fn store_request(
     }))
 }
 
-/// Split the SSP-held preimage for `payment_hash` into FROST shares, ECIES
-/// each to its operator, and store via the embedded wallet's coordinator session
-/// (same `store_preimage_share_v2` call a wallet makes; owner = SSP).
-async fn store_preimage_shares(
-    state: &AppState,
-    payment_hash_hex: &str,
-    invoice: &str,
-) -> Result<(), String> {
-    use crate::frost;
-    #[derive(serde::Deserialize)]
-    struct Operator {
-        id: u32,
-        identifier: String,
-        #[serde(rename = "identityPublicKey")]
-        identity_public_key: String,
-    }
-    let mut operators: Vec<Operator> = if state.config.frost_operators_json.trim().is_empty() {
-        Vec::new()
-    } else {
-        serde_json::from_str(&state.config.frost_operators_json)
-            .map_err(|_| "SSP_FROST_OPERATORS is invalid".to_string())?
-    };
-    if operators.is_empty() {
-        return Ok(());
-    }
-    operators.sort_by_key(|o| o.id);
-    let preimage_hex = crate::backend(state)
-        .await
-        .preimage_for(payment_hash_hex)
-        .await
-        .ok_or_else(|| "preimage not held for hash".to_string())?;
-    let preimage = hex::decode(preimage_hex).map_err(|e| e.to_string())?;
-    let shares =
-        frost::split_secret_with_proofs(&preimage, state.config.frost_threshold, operators.len())?;
-    let mut wire = std::collections::HashMap::with_capacity(operators.len());
-    for (op, share) in operators.iter().zip(shares.iter()) {
-        let expected_identifier = format!("{:064x}", share.index);
-        if share.index != op.id + 1 || op.identifier.to_lowercase() != expected_identifier {
-            return Err(format!(
-                "FROST operator {} does not match share index {}",
-                op.id, share.index
-            ));
-        }
-        // Self-check before sending: a bad share would fail SO-side.
-        frost::validate_share(&share.share, share.index, &share.proofs)?;
-        let proto = frost::encode_secret_share_proto(&share.share, &share.proofs);
-        let enc = frost::encrypt_share_to_operator(&proto, &op.identity_public_key)?;
-        wire.insert(op.identifier.clone(), enc);
-    }
-    state
-        .spark
-        .store_preimage_shares(
-            hex::decode(payment_hash_hex).map_err(|e| e.to_string())?,
-            wire,
-            state.config.frost_threshold as u32,
-            invoice.to_string(),
-        )
-        .await
-}
-
 fn str_of(v: &Value, k: &str) -> String {
     match v.get(k) {
         Some(Value::String(value)) => value.clone(),
@@ -1398,13 +1101,6 @@ fn ids_of(input: &Value, root: &Value) -> Vec<String> {
     }
     vec![]
 }
-fn ext_id_or_new(ext: &str) -> String {
-    if ext.is_empty() {
-        Uuid::new_v4().to_string()
-    } else {
-        ext.to_string()
-    }
-}
 
 /// SSP signature with the identity key of the embedded Spark wallet.
 async fn sign_with_ssp(state: &AppState, message: &str) -> Result<String, String> {
@@ -1418,39 +1114,6 @@ mod tests {
         validate_network_name, validate_sats,
     };
     use serde_json::json;
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn internal_invoice_support_requires_an_ssp_owned_secret() {
-        let dir =
-            std::env::temp_dir().join(format!("open-ssp-internal-quote-{}", uuid::Uuid::new_v4()));
-        let db = crate::db::Db::open(dir.to_str().unwrap()).unwrap();
-        db.insert_request(
-            "receive",
-            "LIGHTNING_RECEIVE",
-            "owner",
-            "now",
-            &json!({"payment_hash": "hash", "invoice": "local-invoice", "amount_sats": 1000}),
-            None,
-        )
-        .await
-        .unwrap();
-        assert!(
-            super::validate_internal_send_support(&db, "external-invoice")
-                .await
-                .is_ok()
-        );
-        let error = super::validate_internal_send_support(&db, "local-invoice")
-            .await
-            .unwrap_err();
-        assert!(error.contains("cannot be paid internally"));
-        db.save_preimage("hash", "secret", "owner", "now")
-            .await
-            .unwrap();
-        assert!(super::validate_internal_send_support(&db, "local-invoice")
-            .await
-            .is_ok());
-        std::fs::remove_dir_all(dir).unwrap();
-    }
 
     #[test]
     fn string_input_does_not_turn_null_into_text() {
