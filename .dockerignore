@@ -8,5 +8,13 @@ swap-sidecar/node_modules/
 *.key
 .env
 deploy/.env
-vendor/
+vendor/*
+!vendor/breez-sdk/
+vendor/breez-sdk/.git
+vendor/breez-sdk/target/
 .regtest/
+
+!vendor/spark/
+vendor/spark/*
+!vendor/spark/signer/
+!vendor/spark/protos/

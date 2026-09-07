@@ -279,6 +279,22 @@ impl CoopExitService {
         })))
     }
 
+    pub(crate) async fn bitcoin_rpc(&self, method: &str, params: Value) -> Result<Value, String> {
+        self.bitcoin.rpc(method, params).await
+    }
+    pub(crate) async fn bitcoin_change_address(&self) -> Result<Address, String> {
+        let value = self
+            .bitcoin
+            .rpc("getrawchangeaddress", json!(["bech32"]))
+            .await?;
+        parse_address(
+            value
+                .as_str()
+                .ok_or("Bitcoin returned no recovery address")?,
+            self.network,
+        )
+    }
+
     pub async fn quote(&self, owner: &str, input: &Value) -> Result<ExitQuote, String> {
         let leaf_ids = ids(&input["leaf_external_ids"])?;
         let address = parse_address(
@@ -535,6 +551,116 @@ impl CoopExitService {
             "transfer_spark_id":record.transfer_id, "transfer":null})
     }
 
+    /// Raise the package fee by spending only the SSP change output. The
+    /// payout and connector parent transaction IDs remain unchanged.
+    pub async fn bump_fee(
+        &self,
+        id: &str,
+        fee_rate: u64,
+        max_fee_sats: u64,
+    ) -> Result<Value, String> {
+        if !(1..=10_000).contains(&fee_rate) || max_fee_sats == 0 {
+            return Err(
+                "fee_rate must be 1 to 10000 sat/vB and max_fee_sats must be positive".into(),
+            );
+        }
+        let _guard = self.lock.lock().await;
+        let record: ExitRecord = self
+            .db
+            .with(|c| c.query_row("SELECT data FROM coop_exits WHERE id=?1", [id], decode_row))
+            .await?;
+        if record.status != "TX_BROADCASTED" {
+            return Err("only an unconfirmed broadcast withdrawal can be bumped".into());
+        }
+        let parent: Transaction = deserialize(
+            &hex::decode(
+                record
+                    .signed_exit
+                    .as_deref()
+                    .ok_or("withdrawal is unsigned")?,
+            )
+            .map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| e.to_string())?;
+        let parent_txid = parent.compute_txid().to_string();
+        let observed = self
+            .bitcoin
+            .rpc("gettransaction", json!([parent_txid]))
+            .await?;
+        if observed["confirmations"].as_i64() != Some(0) {
+            return Err("withdrawal is confirmed or conflicted".into());
+        }
+        let existing: Option<(String, u64)> = self
+            .db
+            .with(|c| {
+                use rusqlite::OptionalExtension;
+                c.query_row(
+                    "SELECT raw,fee_rate FROM coop_exit_bumps WHERE request_id=?1",
+                    [id],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()
+            })
+            .await?;
+        if let Some((raw, previous_rate)) = existing {
+            if previous_rate != fee_rate {
+                return Err("a fee bump already exists; retry with its original fee_rate".into());
+            }
+            let child: Transaction = deserialize(&hex::decode(&raw).map_err(|e| e.to_string())?)
+                .map_err(|e| e.to_string())?;
+            let fee = parent.output[2].value.to_sat() - child.output[0].value.to_sat();
+            if fee > max_fee_sats {
+                return Err("stored fee bump exceeds max_fee_sats".into());
+            }
+            self.bitcoin.rpc("sendrawtransaction", json!([raw])).await?;
+            return Ok(
+                json!({"txid":child.compute_txid().to_string(),"fee_sats":fee,"parent_txid":parent_txid}),
+            );
+        }
+        let coin = self
+            .bitcoin
+            .rpc("gettxout", json!([parent_txid, 2, true]))
+            .await?;
+        if coin.is_null() {
+            return Err("withdrawal change is not available for a fee bump".into());
+        }
+        let destination = self.bitcoin.address(self.network).await?;
+        let (child, fee) = cpfp_transaction(
+            &parent,
+            record.fee_sats,
+            fee_rate,
+            max_fee_sats,
+            destination.script_pubkey(),
+        )?;
+        let signed = self
+            .bitcoin
+            .rpc(
+                "signrawtransactionwithwallet",
+                json!([serialize_hex(&child)]),
+            )
+            .await?;
+        if signed["complete"] != true {
+            return Err("Bitcoin wallet could not sign fee bump".into());
+        }
+        let raw = signed["hex"]
+            .as_str()
+            .ok_or("Bitcoin returned no fee bump transaction")?;
+        validate_signed_exit(&child, raw)?;
+        self.db
+            .with(|c| {
+                c.execute(
+                    "INSERT INTO coop_exit_bumps(request_id,raw,fee_rate) VALUES(?1,?2,?3)",
+                    (id, raw, fee_rate),
+                )
+                .map(|_| ())
+            })
+            .await?;
+        self.bitcoin.rpc("sendrawtransaction", json!([raw])).await?;
+        Ok(
+            json!({"txid":child.compute_txid().to_string(),"fee_sats":fee,"parent_txid":parent_txid}),
+        )
+    }
+
     async fn advance(&self, record: &mut ExitRecord) -> Result<(), String> {
         if matches!(record.status.as_str(), "SUCCEEDED" | "EXPIRED") {
             return Ok(());
@@ -588,6 +714,21 @@ impl CoopExitService {
                 .await?;
             record.status = "TX_BROADCASTED".into();
             self.db.update_coop_exit(record).await?;
+            let bump: Option<String> = self
+                .db
+                .with(|c| {
+                    use rusqlite::OptionalExtension;
+                    c.query_row(
+                        "SELECT raw FROM coop_exit_bumps WHERE request_id=?1",
+                        [&record.id],
+                        |r| r.get(0),
+                    )
+                    .optional()
+                })
+                .await?;
+            if let Some(raw) = bump {
+                self.bitcoin.rpc("sendrawtransaction", json!([raw])).await?;
+            }
             return Ok(());
         }
         record.status = "ON_CHAIN_TX_CONFIRMED".into();
@@ -639,6 +780,47 @@ impl CoopExitService {
             tokio::time::sleep(Duration::from_secs(5)).await;
         }
     }
+}
+
+fn cpfp_transaction(
+    parent: &Transaction,
+    parent_fee: u64,
+    rate: u64,
+    max_fee: u64,
+    destination: ScriptBuf,
+) -> Result<(Transaction, u64), String> {
+    let change = parent.output.get(2).ok_or("withdrawal has no SSP change")?;
+    if !(change.script_pubkey.is_p2tr() || change.script_pubkey.is_p2wpkh()) {
+        return Err("fee bump needs SegWit SSP change".into());
+    }
+    let mut child = transaction(
+        vec![OutPoint::new(parent.compute_txid(), 2)],
+        vec![TxOut {
+            value: change.value,
+            script_pubkey: destination,
+        }],
+    );
+    // Upper bound for a P2WPKH witness, which is larger than a P2TR witness.
+    let vbytes = child.vsize() as u64 + 28;
+    let package_fee = rate
+        .checked_mul(parent.vsize() as u64 + vbytes)
+        .ok_or("fee overflow")?;
+    let fee = package_fee
+        .saturating_sub(parent_fee)
+        .max(rate.checked_mul(vbytes).ok_or("fee overflow")?);
+    if fee > max_fee {
+        return Err("fee bump exceeds max_fee_sats".into());
+    }
+    let value = change
+        .value
+        .to_sat()
+        .checked_sub(fee)
+        .ok_or("SSP change cannot fund the fee bump")?;
+    if value < child.output[0].script_pubkey.minimal_non_dust().to_sat() {
+        return Err("fee bump leaves a dust output".into());
+    }
+    child.output[0].value = Amount::from_sat(value);
+    Ok((child, fee))
 }
 
 async fn withdrawal_amount(
@@ -697,7 +879,7 @@ fn transaction(inputs: Vec<OutPoint>, output: Vec<TxOut>) -> Transaction {
     }
 }
 
-fn btc_amount(value: &Value) -> Result<u64, String> {
+pub(crate) fn btc_amount(value: &Value) -> Result<u64, String> {
     let text = match value.as_str() {
         Some(text) => text.to_owned(),
         None => value
@@ -725,7 +907,8 @@ impl Db {
     async fn init_coop_exits(&self) -> Result<(), String> {
         self.with(|db| db.execute_batch("CREATE TABLE IF NOT EXISTS coop_exit_quotes(id TEXT PRIMARY KEY, owner TEXT NOT NULL, expires_at INTEGER NOT NULL, data TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS coop_exits(id TEXT PRIMARY KEY, owner TEXT NOT NULL, transfer_id TEXT NOT NULL UNIQUE, idem TEXT NOT NULL, status TEXT NOT NULL, data TEXT NOT NULL, UNIQUE(owner,idem));
-            CREATE TABLE IF NOT EXISTS coop_exit_inputs(outpoint TEXT PRIMARY KEY, request_id TEXT NOT NULL REFERENCES coop_exits(id));")).await
+            CREATE TABLE IF NOT EXISTS coop_exit_inputs(outpoint TEXT PRIMARY KEY, request_id TEXT NOT NULL REFERENCES coop_exits(id));
+            CREATE TABLE IF NOT EXISTS coop_exit_bumps(request_id TEXT PRIMARY KEY REFERENCES coop_exits(id),raw TEXT NOT NULL,fee_rate INTEGER NOT NULL);")).await
     }
 
     async fn save_coop_quote(&self, quote: &ExitQuote) -> Result<(), String> {
@@ -808,6 +991,8 @@ impl Db {
             // Keep the connector funding available until Spark recovery, even
             // after the exit confirms and Core lists this output as spendable.
             tx.execute("INSERT INTO coop_exit_inputs VALUES(?1,?2)", (connector_funding,&record.id))?;
+            // Keep the SSP change for CPFP until this withdrawal is complete.
+            tx.execute("INSERT INTO coop_exit_inputs VALUES(?1,?2)", (OutPoint::new(exit.compute_txid(),2).to_string(),&record.id))?;
             let payload = json!({"total_amount_sats":record.leaves.iter().map(|leaf| leaf.value).sum::<u64>()}).to_string();
             tx.execute("INSERT INTO requests(id,kind,owner,created_at,payload) VALUES(?1,'COOP_EXIT_V2',?2,?3,?4)", (&record.id,&record.owner,timestamp(record.created_at),payload))?;
             tx.commit()
@@ -920,6 +1105,34 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn cpfp_preserves_payout_and_connector_and_enforces_budget() {
+        let script = ScriptBuf::from_bytes([vec![0x51, 0x20], vec![2; 32]].concat());
+        let mut parent: Transaction =
+            deserialize(&hex::decode(record().raw_exit).unwrap()).unwrap();
+        parent.output.push(TxOut {
+            value: Amount::from_sat(660),
+            script_pubkey: script.clone(),
+        });
+        parent.output.push(TxOut {
+            value: Amount::from_sat(10_000),
+            script_pubkey: script.clone(),
+        });
+        parent.input[0].witness.push([0; 64]);
+        let original = parent.clone();
+        let (child, fee) = cpfp_transaction(&parent, 210, 5, 5_000, script.clone()).unwrap();
+        assert_eq!(parent, original);
+        assert_eq!(
+            child.input[0].previous_output,
+            OutPoint::new(parent.compute_txid(), 2)
+        );
+        assert_eq!(child.output[0].value.to_sat() + fee, 10_000);
+        assert!(210 + fee >= 5 * (parent.vsize() as u64 + child.vsize() as u64 + 28));
+        assert!(cpfp_transaction(&parent, 210, 5, fee - 1, script.clone()).is_err());
+        parent.output[2].value = Amount::from_sat(fee + 100);
+        assert!(cpfp_transaction(&parent, 210, 5, 5_000, script).is_err());
+    }
+
+    #[test]
     fn bitcoin_amounts_preserve_satoshis_and_reject_fractional_sats() {
         assert_eq!(btc_amount(&json!(0.00000001)).unwrap(), 1);
         assert_eq!(btc_amount(&json!(0.00001234)).unwrap(), 1234);
@@ -969,6 +1182,13 @@ pub(crate) mod tests {
         assert_eq!(
             db.coop_reserved_inputs().await.unwrap(),
             HashSet::from([
+                OutPoint::new(
+                    deserialize::<Transaction>(&hex::decode(&record.raw_exit).unwrap())
+                        .unwrap()
+                        .compute_txid(),
+                    2
+                )
+                .to_string(),
                 "coin:0".into(),
                 OutPoint::new(
                     deserialize::<Transaction>(&hex::decode(&record.raw_exit).unwrap())

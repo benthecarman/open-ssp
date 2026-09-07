@@ -4,3 +4,6 @@
 [submodule "vendor/ldk-server"]
 	path = vendor/ldk-server
 	url = https://github.com/lightningdevkit/ldk-server.git
+[submodule "vendor/breez-sdk"]
+	path = vendor/breez-sdk
+	url = https://github.com/benthecarman/spark-sdk

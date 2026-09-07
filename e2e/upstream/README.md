@@ -10,6 +10,7 @@ Both acceptance suites use the Git submodules recorded by this repository:
 | Path | Source | Use |
 |---|---|---|
 | `vendor/spark` | [Spark fork](https://github.com/benthecarman/spark) | Three Spark Operators and the supplemental JavaScript SDK |
+| `vendor/breez-sdk` | [SSP SDK fork](https://github.com/benthecarman/spark-sdk) | Embedded SSP wallet and private operator RPC client |
 | `vendor/ldk-server` | [ldk-server](https://github.com/lightningdevkit/ldk-server) | Two Lightning nodes and their CLI |
 
 The gitlinks store the exact commits. Inspect them with `git submodule status`.
@@ -32,8 +33,8 @@ only when the JavaScript SDK checkout differs from `SPARK_REF`.
 The Lightning acceptance test runs `cargo regtest test`. It uses the Spark
 submodule only to build three local operators. The Rust Breez SDK wallet dependency is
 pinned in `e2e/breez/Cargo.toml` and `e2e/breez/Cargo.lock`; Cargo fetches it.
-The SSP's Rust Spark dependencies are pinned separately in the root Cargo
-files. Neither Rust dependency needs another submodule.
+The SSP's Rust Spark dependencies use `vendor/breez-sdk`. The end client
+continues to use its separate upstream Cargo pin.
 
 The runner builds the operators from a clean detached worktree at the Spark
 checkout's `HEAD`. It does not include uncommitted operator changes. Set

@@ -16,6 +16,11 @@ serde_json = "1"
 uuid = { version = "1", features = ["v4", "v7", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 sha2 = "0.10"
+hmac = "0.12"
+prost = "0.13"
+prost-types = "0.13"
+utils = { path = "vendor/breez-sdk/crates/utils" }
+spark-token-primitives = { path = "vendor/spark/signer/spark-token-primitives" }
 base64 = "0.22"
 secp256k1 = { version = "0.29", features = ["global-context", "recovery"] }
 hex = "0.4"
@@ -31,8 +36,8 @@ bip39 = { version = "2", features = ["rand"] }
 bitcoin = "0.32"
 lightning-invoice = "0.33"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
-spark-wallet = { git = "https://github.com/benthecarman/spark-sdk", rev = "4345469d40c665c0968fcba0af5797830e7a86a4" }
-spark = { git = "https://github.com/benthecarman/spark-sdk", rev = "4345469d40c665c0968fcba0af5797830e7a86a4" }
+spark-wallet = { path = "vendor/breez-sdk/crates/spark-wallet" }
+spark = { path = "vendor/breez-sdk/crates/spark" }
 subtle = "2"
 ldk-server-client = { git = "https://github.com/lightningdevkit/ldk-server", package = "ldk-server-client" }
 

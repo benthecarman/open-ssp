@@ -4,6 +4,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       libprotobuf-dev protobuf-compiler \
  && rm -rf /var/lib/apt/lists/*
 COPY Cargo.toml Cargo.lock* ./
+COPY vendor/breez-sdk ./vendor/breez-sdk
+COPY vendor/spark/signer ./vendor/spark/signer
+COPY vendor/spark/protos ./vendor/spark/protos
 RUN mkdir src \
  && echo 'fn main() {}' > src/main.rs \
  && cargo build --release \

@@ -151,6 +151,12 @@ pub fn index_request(
     let text = |name: &str| p[name].as_str().unwrap_or("");
     let payment_kind = p["payment_kind"].as_str().unwrap_or("BOLT11");
     if kind == "LIGHTNING_RECEIVE" {
+        if let Some(quote_id) = p["quote_transfer_id"].as_str() {
+            conn.execute(
+                "INSERT INTO receive_quote_uses(quote_id,payment_hash) VALUES(?1,?2)",
+                (quote_id, text("payment_hash")),
+            )?;
+        }
         let expiry = chrono::DateTime::parse_from_rfc3339(created)
             .map(|t| t.timestamp())
             .unwrap_or(i64::MAX)

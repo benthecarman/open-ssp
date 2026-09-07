@@ -8,12 +8,10 @@ this setup are for local regtest use only.
 Use `cargo regtest up` to start a funded development stack, then connect your
 own Breez wallet. Use `cargo regtest test` for the separate acceptance suite.
 
-This guide funds client wallets through Lightning. Breez static on-chain
-deposits are not implemented end to end: the SSP still has test-only quote
-and placeholder claim paths. A Breez API key does not enable those operations.
-The acceptance suite checks authentication, BOLT11 payments, and real
-cooperative Bitcoin withdrawals. It does not establish compatibility with
-every flow in an application that uses Breez.
+Client wallets can receive Lightning payments and confirmed static on-chain
+deposits. The acceptance suite checks standard Breez clients with private leaf
+queries enabled. It covers same-SSP and cross-SSP BOLT11 payments, deposits,
+cooperative Bitcoin withdrawals, fee bumps, and restart recovery.
 
 ## 1. Install the tools
 
@@ -58,17 +56,17 @@ cargo regtest init
 `e2e/breez`. Run it from the repository root. The first invocation compiles
 that program and its pinned Breez SDK dependency.
 
-The submodules `vendor/spark` and `vendor/ldk-server` record the operator and
-Lightning node revisions. `cargo regtest init` runs
+The submodules `vendor/spark`, `vendor/ldk-server`, and `vendor/breez-sdk`
+record the operator, Lightning node, and SSP wallet source revisions. `cargo regtest init` runs
 `git submodule update --init --recursive`; run it again after pulling changes
 that update those pins. Use `git submodule status` to inspect the revisions.
 See [the source dependency notes](../e2e/upstream/README.md) for updates.
 
 The end-client test uses upstream
 [Breez SDK at `c7eecfe670798a8b8332ce412044cbd49123687a`](https://github.com/breez/spark-sdk/tree/c7eecfe670798a8b8332ce412044cbd49123687a).
-Cargo fetches this dependency. The SSP uses the separate Spark crate pins in
-its root `Cargo.toml`. The client does not need the SSP's SDK fork for the
-BOLT11 flows in this guide.
+Cargo fetches this dependency. The SSP uses the `vendor/breez-sdk` fork for
+private operator calls. End clients keep the upstream SDK pin; they do not
+need the SSP fork.
 
 ## 3. Start the development stack
 
@@ -117,6 +115,9 @@ Use these commands to manage the stack:
 | `cargo regtest reset` | **Delete this project's containers and volumes** |
 | `cargo regtest logs ssp ldk-server` | Show recent logs for selected services |
 | `cargo regtest fund a 1000` | Add one 1,000-sat Spark leaf to SSP A |
+| `cargo regtest settlements a` | List unresolved SSP A settlements |
+| `cargo regtest reconcile a REQUEST_ID` | Reconcile one Lightning send |
+| `cargo regtest bump a REQUEST_ID 5 5000` | Spend at most 5,000 sats on a 5 sat/vB withdrawal fee bump |
 | `cargo regtest ldk b list-channels` | Inspect LDK B's channel |
 | `cargo regtest certs` | Refresh and print the local operator certificate directory |
 | `cargo regtest --help` | Show all commands |
@@ -225,7 +226,7 @@ async fn connect_regtest(seed: Seed, storage_dir: String) -> Result<BreezSdk> {
     config.real_time_sync_server_url = None;
     config.use_default_external_input_parsers = false;
     config.prefer_spark_over_lightning = false;
-    config.private_enabled_default = false;
+    config.private_enabled_default = true;
     config.sync_interval_secs = 2;
     config.leaf_optimization_config.auto_enabled = false;
     config.token_optimization_config.auto_enabled = false;
@@ -351,7 +352,7 @@ and settlement checks.
 | Operators never become ready | Use `cargo regtest logs spark-operator-0 postgres` and check the submodule pin. |
 | SSP startup or connection fails | Use `cargo regtest logs ssp ldk-server` and `cargo regtest status`. A live LDK backend is required. |
 | Chain data requests fail | Check `cargo regtest status`. Set the SDK builder's local Esplora service explicitly. |
-| Invoice is rejected as an internal payment | Pay through the opposite SSP/LDK node. Same-SSP Lightning payments are rejected. |
+| Same-SSP payment fails | Check SSP Spark liquidity and use the pinned operator and SSP sources. The current flow does not use an LDK payment. |
 | Receive fails or `spark.needs_topup` is true | Use `cargo regtest fund a 1000` for Spark liquidity and inspect `cargo regtest ldk a list-channels` for inbound capacity. |
 | A slow machine times out during payment checks | Set `BREEZ_E2E_TIMEOUT_SECS=600` for `cargo regtest test`. Service startup has separate timeouts. |
 
@@ -372,3 +373,38 @@ chain and operator synchronization after funding. Test BOLT11 first: the
 pinned Breez SDK cannot parse the project's BOLT12 extension history, so the
 acceptance client runs those extension checks last. See
 [API coverage](SSP_API_COVERAGE.md) for other flow limits.
+
+## Confirmed static deposits
+
+Use Breez `receive_payment` with `ReceivePaymentMethod::BitcoinAddress {
+new_address: Some(false) }`. Send regtest Bitcoin to the returned address.
+After three confirmations, sync the wallet. The SSP verifies the unspent
+output and its owner, then quotes its actual value minus the recovery miner
+fee. At the local fallback rate of 1 sat/vB, a 10,000-sat deposit credits
+9,901 sats. The address can receive more than one deposit.
+
+The SSP needs enough Spark liquidity for the credit. For example, run
+`cargo regtest fund a 20000` before a 10,000-sat deposit to SSP A. The
+recovered Bitcoin does not automatically become new Spark leaves. Instant
+unconfirmed deposits remain unsupported.
+
+The claim plan, signing nonce, transfer ID, and signed recovery transaction
+are saved before their dependent network calls. Pending claims resume after
+an SSP restart. Keep both the SSP database and operator databases.
+
+## Settlement operations
+
+`settlements` lists pending Lightning sends, deposit claims, and other pending
+settlement records. `reconcile` performs the same checks as the background
+Lightning worker. Missing BOLT11 submissions can retry with the pinned LDK
+payment hash as the stable ID. A missing BOLT12 payment still needs backend
+investigation; a timeout does not authorize a refund.
+
+`bump` applies to an unconfirmed broadcast withdrawal with available SSP
+change. It creates a child transaction that pays for the parent and child.
+It preserves the payout and connector transaction IDs. One child is supported
+per withdrawal; retry with the same rate to rebroadcast it. The SSP pays this
+extra fee within `MAX_FEE`, in sats.
+
+See [API coverage](SSP_API_COVERAGE.md) for receive quotes, history filters,
+webhook signatures, and production operator authorization.

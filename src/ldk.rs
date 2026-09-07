@@ -146,6 +146,37 @@ async fn recover_submission<L: SendLdk + ?Sized>(
     Ok(payment)
 }
 
+/// The pinned LDK Node derives BOLT11 PaymentId from the invoice hash and
+/// rejects duplicates in both its store and channel manager. Reuse that ID
+/// only after an authoritative lookup reports no record. Offers use random
+/// IDs and must never pass this retry path.
+async fn retry_missing_bolt11<L: SendLdk + ?Sized>(
+    db: &Db,
+    ldk: &L,
+    send: &LightningSend,
+) -> Result<(), String> {
+    if send.kind != SendKind::Bolt11
+        || send.status != SendStatus::Submitting
+        || send.payment_id.is_some()
+    {
+        return Err(
+            "payment needs backend reconciliation; automatic resubmission is unavailable".into(),
+        );
+    }
+    match ldk.submit(send).await {
+        Ok(id) => db.bind_lightning_payment(&send.request_id, &id).await,
+        Err(error) => {
+            // A duplicate error can mean the original call committed while
+            // this retry was in flight. Keep the same intent and look it up.
+            if recover_submission(db, ldk, send).await?.is_none() {
+                db.lightning_submission_error(&send.request_id, &error)
+                    .await?;
+            }
+            Ok(())
+        }
+    }
+}
+
 async fn submit_durable_send<L: SendLdk + ?Sized>(
     db: &Db,
     ldk: &L,
@@ -485,6 +516,12 @@ where
     L: ReceiveLdk + ?Sized,
 {
     let _guard = receive_lock.lock().await;
+    if db.internal_send(payment_hash).await?.is_some() {
+        // Do not change the receive's local settlement state when rejecting
+        // an external HTLC for an invoice reserved by a local payer.
+        retry_bounded(|| ldk.fail_receive(payment_hash), delays).await?;
+        return Ok(true);
+    }
     let Some(mut receive) = db.lightning_receive_for_hash(payment_hash).await? else {
         return Ok(false);
     };
@@ -564,6 +601,80 @@ where
     .await?;
     db.mark_receive_claim_submitted(payment_hash).await?;
     Ok(true)
+}
+
+#[async_trait::async_trait]
+trait InternalSpark: ReceiveSpark {
+    async fn verify_sender(&self, send: &LightningSend) -> Result<(), String>;
+    async fn settle_sender(&self, send: &LightningSend, preimage: &str) -> Result<(), String>;
+}
+#[async_trait::async_trait]
+impl InternalSpark for SparkService {
+    async fn verify_sender(&self, send: &LightningSend) -> Result<(), String> {
+        self.verify_lightning_send(
+            &send.owner,
+            &send.outbound_transfer_id,
+            &send.expected_id,
+            send.amount_sats,
+        )
+        .await
+    }
+    async fn settle_sender(&self, send: &LightningSend, preimage: &str) -> Result<(), String> {
+        self.settle_lightning_send(&send.outbound_transfer_id, &send.expected_id, preimage)
+            .await
+    }
+}
+
+async fn process_internal_send<S: InternalSpark + ?Sized>(
+    db: &Db,
+    lock: &tokio::sync::Mutex<()>,
+    spark: &S,
+    send: &LightningSend,
+) -> Result<(), String> {
+    let _guard = lock.lock().await;
+    if matches!(
+        db.payment_status(&send.request_id).await?.as_str(),
+        "SUCCEEDED" | "FAILED"
+    ) {
+        return Ok(());
+    }
+    if let Err(error) = db.reserve_internal_send(send).await {
+        // No operator call was made. The sender's conditional transfer can
+        // return through the standard preimage-swap expiry path.
+        db.set_payment(&send.request_id, "FAILED").await?;
+        return Err(error);
+    }
+    let receive = db
+        .lightning_receive_for_hash(&send.expected_id)
+        .await?
+        .ok_or("local receive missing")?;
+    let preimage = match receive.preimage {
+        Some(preimage) => preimage,
+        None => {
+            spark.verify_sender(send).await?;
+            let swap = spark
+                .swap_receive(
+                    &receive.receiver,
+                    &send.expected_id,
+                    &receive.invoice,
+                    receive.amount_sats,
+                )
+                .await?;
+            validate_preimage(&send.expected_id, &swap.preimage)?;
+            db.commit_lightning_receive_swap(
+                &send.expected_id,
+                &swap.transfer_id,
+                &swap.preimage,
+                &receive.request_id,
+                &receive.owner,
+            )
+            .await?;
+            swap.preimage
+        }
+    };
+    validate_preimage(&send.expected_id, &preimage)?;
+    spark.settle_sender(send, &preimage).await?;
+    db.finish_internal_send(send).await
 }
 
 #[derive(Clone)]
@@ -677,6 +788,15 @@ impl LdkGrpcBackend {
     }
 
     pub async fn submit_send(&self, send: &LightningSend) -> Result<(), String> {
+        if self
+            .db
+            .lightning_receive_hash_for_invoice(&send.invoice)
+            .await?
+            .is_some()
+        {
+            return process_internal_send(&self.db, &self.receive_lock, self.spark.as_ref(), send)
+                .await;
+        }
         if send.status != SendStatus::Prepared {
             return Ok(());
         }
@@ -696,11 +816,34 @@ impl LdkGrpcBackend {
         if matches!(send.status, SendStatus::Succeeded | SendStatus::Failed) {
             return Ok(());
         }
+        if self
+            .db
+            .lightning_receive_hash_for_invoice(&send.invoice)
+            .await?
+            .is_some()
+        {
+            return process_internal_send(&self.db, &self.receive_lock, self.spark.as_ref(), send)
+                .await;
+        }
         if send.status == SendStatus::Prepared {
             return self.submit_send(send).await;
         }
         if let Some(payment) = recover_submission(&self.db, &self.client, send).await? {
             self.observe_payment(&payment.id).await;
+        } else if send.kind == SendKind::Bolt11
+            && send.status == SendStatus::Submitting
+            && send.payment_id.is_none()
+        {
+            self.verify_lightning_send_funding(
+                &send.owner,
+                &send.outbound_transfer_id,
+                &send.invoice,
+                send.amount_override,
+            )
+            .await?;
+            retry_missing_bolt11(&self.db, &self.client, send).await?;
+        } else {
+            self.db.lightning_submission_error(&send.request_id,"LDK has no matching payment; inspect the backend and its event log. This intent will not be resubmitted without an idempotent backend contract.").await?;
         }
         Ok(())
     }
@@ -807,6 +950,9 @@ impl LdkGrpcBackend {
 
     async fn finish_received_payment(&self, payment_hash: &str) -> Result<bool, String> {
         let _guard = self.receive_lock.lock().await;
+        if self.db.internal_send(payment_hash).await?.is_some() {
+            return Ok(true);
+        }
         let Some(receive) = self.db.lightning_receive_for_hash(payment_hash).await? else {
             return Ok(false);
         };
@@ -853,6 +999,9 @@ impl LdkGrpcBackend {
     async fn reconcile_payments(&self) -> Result<(), String> {
         for send in self.db.unresolved_lightning_sends().await? {
             if let Err(error) = self.recover_send(&send).await {
+                self.db
+                    .lightning_submission_error(&send.request_id, &error)
+                    .await?;
                 tracing::debug!(
                     request_id = send.request_id,
                     "send recovery pending: {error}"
@@ -958,7 +1107,8 @@ impl LdkGrpcBackend {
             let Some(receive) = self.db.lightning_receive_for_hash(&payment_hash).await? else {
                 continue;
             };
-            if receive.transfer_id.is_some()
+            if self.db.internal_send(&payment_hash).await?.is_some()
+                || receive.transfer_id.is_some()
                 || matches!(
                     receive.status.as_str(),
                     "TRANSFER_COMPLETED" | "HTLC_FAILED"
@@ -1096,6 +1246,16 @@ impl LdkGrpcBackend {
                 total_sats,
             )
             .await
+    }
+
+    pub async fn reconcile_request(&self, id: &str) -> Result<String, String> {
+        let send = self
+            .db
+            .lightning_send_for_payment(id)
+            .await?
+            .ok_or("Lightning send request not found")?;
+        self.recover_send(&send).await?;
+        self.db.payment_status(&send.request_id).await
     }
 
     pub async fn payment_status(&self, payment_id: &str) -> String {
@@ -1461,7 +1621,7 @@ mod tests {
         }
     }
     #[tokio::test(flavor = "multi_thread")]
-    async fn crash_before_network_call_remains_uncertain() {
+    async fn missing_bolt11_retries_but_bolt12_and_bound_payments_do_not() {
         let dir = std::env::temp_dir().join(format!("open-ssp-send-{}", uuid::Uuid::new_v4()));
         let db = Db::open(dir.to_str().unwrap()).unwrap();
         let send = send_intent(SendKind::Bolt11);
@@ -1489,6 +1649,28 @@ mod tests {
             db.payment_status(&send.request_id).await.unwrap(),
             "SUBMITTING"
         );
+        let mut stored = db
+            .lightning_send_for_payment(&send.request_id)
+            .await
+            .unwrap()
+            .unwrap();
+        stored.kind = SendKind::Bolt12;
+        assert!(retry_missing_bolt11(&db, &ldk, &stored).await.is_err());
+        assert_eq!(ldk.calls.load(Ordering::SeqCst), 0);
+        stored.kind = SendKind::Bolt11;
+        retry_missing_bolt11(&db, &ldk, &stored).await.unwrap();
+        assert_eq!(ldk.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            db.payment_status(&send.request_id).await.unwrap(),
+            "PENDING"
+        );
+        let bound = db
+            .lightning_send_for_payment(&send.request_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(retry_missing_bolt11(&db, &ldk, &bound).await.is_err());
+        assert_eq!(ldk.calls.load(Ordering::SeqCst), 1);
         std::fs::remove_dir_all(dir).unwrap();
     }
     #[test]
@@ -1622,6 +1804,91 @@ mod tests {
             log,
             ..Default::default()
         }
+    }
+
+    #[async_trait::async_trait]
+    impl InternalSpark for MockSpark {
+        async fn verify_sender(&self, _: &LightningSend) -> Result<(), String> {
+            Ok(())
+        }
+        async fn settle_sender(&self, _: &LightningSend, _: &str) -> Result<(), String> {
+            self.log.lock().push("settle_sender");
+            Ok(())
+        }
+    }
+    #[tokio::test(flavor = "multi_thread")]
+    async fn internal_payment_resumes_after_payout_and_rejects_external_htlcs() {
+        let (db, dir, hash, preimage) = receive_fixture().await;
+        let mut send = send_intent(SendKind::Bolt11);
+        send.expected_id = hash.clone();
+        send.invoice = "ln-invoice".into();
+        send.amount_sats = 5_000;
+        db.prepare_lightning_send(&send, "internal", "REGTEST")
+            .await
+            .unwrap();
+        db.reserve_internal_send(&send).await.unwrap();
+        // Crash after an operator reply was durably checkpointed.
+        db.commit_lightning_receive_swap(
+            &hash,
+            "00000000-0000-4000-8000-000000000001",
+            &preimage,
+            "request",
+            "request-owner",
+        )
+        .await
+        .unwrap();
+        drop(db);
+        let db = Db::open(dir.to_str().unwrap()).unwrap();
+        let lock = tokio::sync::Mutex::new(());
+        let spark = mock_spark(preimage, Arc::new(SyncMutex::new(Vec::new())));
+        let ldk = MockLdk::default();
+        process_standard_receive(&db, &lock, &spark, &ldk, &hash, Some(5_000_000), &[])
+            .await
+            .unwrap();
+        db.fail_external_receive(&hash).await.unwrap();
+        process_internal_send(&db, &lock, &spark, &send)
+            .await
+            .unwrap();
+        process_internal_send(&db, &lock, &spark, &send)
+            .await
+            .unwrap();
+        assert_eq!(spark.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(ldk.claims.load(Ordering::SeqCst), 0);
+        assert_eq!(ldk.failed_holds.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            db.payment_status(&send.request_id).await.unwrap(),
+            "SUCCEEDED"
+        );
+        assert_eq!(
+            db.receive_status(&hash).await.unwrap(),
+            "TRANSFER_COMPLETED"
+        );
+        assert_eq!(*spark.log.lock(), vec!["settle_sender"]);
+        drop(db);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[tokio::test(flavor = "multi_thread")]
+    async fn external_htlc_wins_before_internal_reservation() {
+        let (db, dir, hash, preimage) = receive_fixture().await;
+        let mut send = send_intent(SendKind::Bolt11);
+        send.expected_id = hash.clone();
+        send.invoice = "ln-invoice".into();
+        send.amount_sats = 5_000;
+        db.prepare_lightning_send(&send, "internal", "REGTEST")
+            .await
+            .unwrap();
+        db.mark_receive_claimable(&hash, 5_000_000).await.unwrap();
+        let spark = mock_spark(preimage, Arc::new(SyncMutex::new(Vec::new())));
+        assert!(
+            process_internal_send(&db, &tokio::sync::Mutex::new(()), &spark, &send)
+                .await
+                .is_err()
+        );
+        assert_eq!(spark.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(db.payment_status(&send.request_id).await.unwrap(), "FAILED");
+        assert_eq!(db.receive_status(&hash).await.unwrap(), "HTLC_RECEIVED");
+        drop(db);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

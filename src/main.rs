@@ -18,9 +18,14 @@ mod coop_exit;
 mod db;
 mod fs;
 mod graphql;
+mod history;
+mod internal_payments;
 mod ldk;
 mod lightning_store;
+mod quotes;
 mod spark;
+mod static_deposits;
+mod webhooks;
 
 use config::Config;
 use db::Db;
@@ -34,6 +39,7 @@ pub struct AppState {
     pub ldk: Arc<LdkGrpcBackend>,
     pub spark: Arc<SparkService>,
     pub coop_exit: Option<Arc<coop_exit::CoopExitService>>,
+    pub static_deposit: Option<Arc<static_deposits::StaticDepositService>>,
     /// Serializes the check-and-pay section for idempotent Lightning sends.
     pub send_lock: Arc<tokio::sync::Mutex<()>>,
 }
@@ -154,6 +160,85 @@ async fn spark_claim_deposit(
         Err(error) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": error})),
+        ),
+    }
+}
+
+async fn settlements(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
+    if !admin_authorized(&state.config, &headers) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({"error":"unauthorized"})),
+        );
+    }
+    let result=state.db.with(|c| {
+        let mut stmt=c.prepare("SELECT request_id,kind,status,payment_id,last_error FROM lightning_sends WHERE status NOT IN ('SUCCEEDED','FAILED') UNION ALL SELECT id,'STATIC_DEPOSIT',status,NULL,last_error FROM deposit_claims WHERE status!='SUCCEEDED' UNION ALL SELECT l.request_id,'LIGHTNING_RECEIVE',COALESCE(p.status,'INVOICE_CREATED'),NULL,NULL FROM lightning_receives l LEFT JOIN receive_payments p ON p.hash=l.hash WHERE COALESCE(p.status,'INVOICE_CREATED') NOT IN ('TRANSFER_COMPLETED','HTLC_FAILED') UNION ALL SELECT id,'COOP_EXIT',status,NULL,NULL FROM coop_exits WHERE status NOT IN ('SUCCEEDED','EXPIRED') LIMIT 1000")?;
+        let rows=stmt.query_map([],|r|Ok(serde_json::json!({"request_id":r.get::<_,String>(0)?,"kind":r.get::<_,String>(1)?,"state":r.get::<_,String>(2)?,"backend_payment_id":r.get::<_,Option<String>>(3)?,"last_error":r.get::<_,Option<String>>(4)?})))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+    }).await;
+    match result {
+        Ok(rows) => (StatusCode::OK, Json(serde_json::json!({"unresolved":rows}))),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error":error})),
+        ),
+    }
+}
+#[derive(Deserialize)]
+struct ReconcileRequest {
+    request_id: String,
+}
+async fn reconcile_settlement(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<ReconcileRequest>,
+) -> impl IntoResponse {
+    if !admin_authorized(&state.config, &headers) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({"error":"unauthorized"})),
+        );
+    }
+    match state.ldk.reconcile_request(&request.request_id).await {
+        Ok(status) => (StatusCode::OK, Json(serde_json::json!({"state":status}))),
+        Err(error) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error":error})),
+        ),
+    }
+}
+
+#[derive(Deserialize)]
+struct BumpWithdrawalRequest {
+    request_id: String,
+    fee_rate: u64,
+    max_fee_sats: u64,
+}
+
+async fn bump_withdrawal(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<BumpWithdrawalRequest>,
+) -> impl IntoResponse {
+    if !admin_authorized(&state.config, &headers) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({"error":"unauthorized"})),
+        );
+    }
+    let result = match &state.coop_exit {
+        Some(service) => {
+            service
+                .bump_fee(&request.request_id, request.fee_rate, request.max_fee_sats)
+                .await
+        }
+        None => Err("cooperative withdrawals are not configured".into()),
+    };
+    match result {
+        Ok(value) => (StatusCode::OK, Json(value)),
+        Err(error) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error":error})),
         ),
     }
 }
@@ -301,6 +386,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
     let config = Config::from_env();
+    if config.fee_flat_sats_swap != 0 {
+        return Err(
+            "SSP_SWAP_FEE_SATS must be zero: fee-bearing Swap V3 fills are not supported".into(),
+        );
+    }
     if config.spark_admin_token.is_empty()
         && std::env::var("SPARK_ADMIN_ALLOW_NO_AUTH").unwrap_or_default() != "1"
     {
@@ -313,6 +403,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     info!(identity = %spark.identity(), "embedded Spark wallet connected");
     let coop_exit =
         coop_exit::CoopExitService::from_env(db.clone(), spark.clone(), &config.network).await?;
+    let static_deposit = coop_exit.as_ref().map(|bitcoin| {
+        static_deposits::StaticDepositService::new(
+            db.clone(),
+            spark.clone(),
+            bitcoin.clone(),
+            config.network.clone(),
+        )
+    });
+    if let Some(service) = &static_deposit {
+        tokio::spawn(service.clone().run());
+    }
     let backend = Arc::new(LdkGrpcBackend::connect(&config, db.clone(), spark.clone()).await?);
     tokio::spawn(LdkGrpcBackend::run_event_pump(backend.clone()));
     tokio::spawn(LdkGrpcBackend::run_reconciler(backend.clone()));
@@ -333,6 +434,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             }
         });
     }
+    tokio::spawn(spark.clone().run_swap_history());
+    tokio::spawn(webhooks::run(
+        db.clone(),
+        webhooks::allow_local(&config.network),
+    ));
     let addr: SocketAddr = config.listen_addr.parse()?;
     if let Some(service) = coop_exit.clone() {
         tokio::spawn(service.run());
@@ -343,6 +449,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         ldk: backend,
         spark: spark.clone(),
         coop_exit,
+        static_deposit,
         send_lock: Arc::new(tokio::sync::Mutex::new(())),
     };
     info!("SSP listening on {} (network={})", addr, config.network);
@@ -351,8 +458,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .route("/", get(health))
         .route("/identity", get(identity_handler))
         .route("/status", get(status))
+        .route("/admin/settlements", get(settlements))
+        .route("/admin/settlements/reconcile", post(reconcile_settlement))
         .route("/admin/spark/deposit-address", post(spark_deposit_address))
         .route("/admin/spark/claim-deposit", post(spark_claim_deposit))
+        .route("/admin/withdrawals/bump-fee", post(bump_withdrawal))
         // Both schema endpoints the SDK uses:
         // default "graphql/spark/2025-03-19", LOCAL override "graphql/spark/rc".
         .route("/graphql/spark/2025-03-19", post(graphql_handler))

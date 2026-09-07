@@ -16,9 +16,11 @@ On success, the SSP gives the Lightning preimage to the Spark transfer.
 Retries with the same wallet, invoice, transfer ID, and idempotency key return
 the stored request. A funding transfer can belong to only one send intent.
 
-All BOLT11 invoices created by the same SSP are rejected during fee estimation
-and send validation. They can be paid from an external Lightning wallet.
-The SSP-owned preimage and internal settlement extensions have been removed.
+BOLT11 payments between wallets on the same SSP use the wallet-held operator
+preimage shares. The SSP reserves the receive, commits its Spark payout, and
+claims the sender transfer with the recovered preimage. No LDK payment is
+submitted. A concurrent external HTLC is rejected after that reservation.
+The retired SSP-owned preimage extension remains removed.
 
 ### Submission recovery
 
@@ -36,8 +38,10 @@ Only a confirmed final Lightning failure can start a BOLT12 refund.
 
 LDK does not accept a caller-defined submission key. A crash after the
 `SUBMITTING` checkpoint but before the RPC is indistinguishable from an
-accepted payment whose record is unavailable. The SSP therefore never
-resubmits a `SUBMITTING` intent or refunds it on a timeout. The public status
+accepted payment whose record is unavailable. For BOLT11, the pinned LDK implementation uses the invoice hash as its
+payment ID and rejects a duplicate pending or successful payment. After an
+authoritative lookup finds no payment, the SSP can retry that same invoice.
+For BOLT12, the SSP does not resubmit a `SUBMITTING` intent or refund it on a timeout. The public status
 stays `LIGHTNING_PAYMENT_INITIATED`. Keep the SSP and LDK data intact and
 restore their connection so reconciliation can find the original payment.
 If no record appears, operator investigation is required; do not delete the
@@ -133,9 +137,8 @@ this does not require a change to the SSP protocol.
 
 These limitations are in the SSP and must not be attributed to `ldk-server`:
 
-- `lightning_receive_quote` does not emit the protobuf `TransferManifest`
-  required by the SDK quote flow.
-- Wallet webhook handlers do not persist subscriptions or deliver events.
+- Fee-bearing receive quotes and automatic Spark liquidity replenishment
+  are not implemented.
 - Instant static deposits return compatibility data but do not complete their
   financial operations.
 

@@ -67,9 +67,12 @@ pub struct LightningReceiveSwap {
 
 pub struct SparkService {
     wallet: Arc<SparkWallet>,
+    identity_secret: bitcoin::secp256k1::SecretKey,
+    raw_signer: Arc<DefaultSigner>,
     network: Network,
     identity: spark_wallet::PublicKey,
     operator_pool: Arc<OperatorPool>,
+    private_pool: Option<Arc<OperatorPool>>,
     transfer_service: Arc<TransferService>,
     split_service: Option<Arc<LeafSplitService>>,
     db: Arc<Db>,
@@ -87,19 +90,23 @@ impl SparkService {
         use ::spark::operator::rpc::spark::{
             query_nodes_request::Source, QueryNodesRequest, TreeNodeIds,
         };
-        let response = self
-            .operator_pool
-            .get_coordinator()
-            .client
-            .query_nodes(QueryNodesRequest {
-                source: Some(Source::NodeIds(TreeNodeIds {
-                    node_ids: ids.to_vec(),
-                })),
-                network: self.network.to_proto_network() as i32,
-                ..Default::default()
-            })
-            .await
-            .map_err(|error| error.to_string())?;
+        let request = QueryNodesRequest {
+            source: Some(Source::NodeIds(TreeNodeIds {
+                node_ids: ids.to_vec(),
+            })),
+            network: self.network.to_proto_network() as i32,
+            ..Default::default()
+        };
+        let response = if let Some(pool) = &self.private_pool {
+            pool.get_coordinator().client.query_ssp_nodes(request).await
+        } else {
+            self.operator_pool
+                .get_coordinator()
+                .client
+                .query_nodes(request)
+                .await
+        }
+        .map_err(|error| error.to_string())?;
         let owner = spark_wallet::PublicKey::from_str(owner).map_err(|error| error.to_string())?;
         ids.iter().map(|id| {
             let node = response.nodes.get(id).ok_or("withdrawal leaf unavailable; the operator must permit this SSP to read the leaf")?;
@@ -178,6 +185,10 @@ impl SparkService {
             load_or_create_mnemonic(&config.spark_mnemonic_file, config.spark_mnemonic_required)?;
         let seed = mnemonic.to_seed("");
         let signer = Arc::new(DefaultSigner::new(&seed, network).map_err(|e| e.to_string())?);
+        let raw_signer = signer.clone();
+        let identity_secret = ::spark::signer::identity_master_key(&seed, network, None)
+            .map_err(|e| e.to_string())?
+            .private_key;
         let signer: Arc<dyn CoreSparkSigner> =
             Arc::new(SparkSignerAdapter::new(signer).with_leaf_key_override_store(db.clone()));
         let identity = signer
@@ -268,6 +279,7 @@ impl SparkService {
 
         let ssp_hosts = csv(&config.ssp_operator_hosts);
         let ssp_cert_files = csv(&config.ssp_operator_cert_files);
+        let mut private_pool_for_service = None;
         let split_service = if ssp_hosts.is_empty() {
             None
         } else {
@@ -323,6 +335,7 @@ impl SparkService {
                 .await
                 .map_err(|e| format!("connect SSP operator clients: {e}"))?,
             );
+            private_pool_for_service = Some(private_pool.clone());
             Some(Arc::new(
                 LeafSplitService::new(network, operator_pool.clone(), private_pool, signer.clone())
                     .await
@@ -337,9 +350,12 @@ impl SparkService {
         );
         let service = Arc::new(Self {
             wallet,
+            identity_secret,
+            raw_signer,
             network,
             identity,
             operator_pool,
+            private_pool: private_pool_for_service,
             transfer_service,
             split_service,
             db,
@@ -360,6 +376,8 @@ impl SparkService {
     }
 
     pub async fn health(&self) -> Result<SparkHealth, String> {
+        let _guard = self.liquidity_lock.lock().await;
+        self.wallet.sync().await.map_err(|e| e.to_string())?;
         let leaves = self.wallet.list_leaves().await.map_err(|e| e.to_string())?;
         let available_sats = leaves.available.iter().map(|leaf| leaf.value).sum();
         let owned_sats = available_sats
@@ -406,6 +424,279 @@ impl SparkService {
             .await
             .map(|leaves| leaves.into_iter().map(|leaf| leaf.value).collect())
             .map_err(|e| e.to_string())
+    }
+
+    pub async fn static_deposit_address(
+        &self,
+        owner: &str,
+        address: &str,
+    ) -> Result<::spark::operator::rpc::spark::DepositAddressQueryResult, String> {
+        use ::spark::operator::rpc::spark::QueryStaticDepositAddressesRequest;
+        let owner = spark_wallet::PublicKey::from_str(owner).map_err(|e| e.to_string())?;
+        let response = self
+            .private_pool
+            .as_ref()
+            .ok_or("private SSP operator endpoints are required")?
+            .get_coordinator()
+            .client
+            .query_ssp_static_deposit_addresses(QueryStaticDepositAddressesRequest {
+                identity_public_key: owner.serialize().to_vec(),
+                network: self.network.to_proto_network() as i32,
+                limit: 2,
+                offset: 0,
+                deposit_address: Some(address.into()),
+                hash_variant: 0,
+            })
+            .await
+            .map_err(|e| e.to_string())?;
+        let mut addresses = response.deposit_addresses;
+        if addresses.len() != 1 || addresses[0].deposit_address != address {
+            return Err("static deposit address does not belong to the session wallet".into());
+        }
+        Ok(addresses.remove(0))
+    }
+
+    pub fn validate_static_authorization(
+        &self,
+        quote: &crate::static_deposits::DepositQuote,
+        encrypted: &str,
+        signature: &str,
+    ) -> Result<(), String> {
+        use bitcoin::secp256k1::{ecdsa::Signature, Message, PublicKey, Secp256k1, SecretKey};
+        let encrypted = hex::decode(encrypted).map_err(|_| "invalid encrypted deposit key")?;
+        if encrypted.len() != 129 {
+            return Err("invalid encrypted deposit key length".into());
+        }
+        let plaintext = utils::ecies::decrypt(&self.identity_secret.secret_bytes(), &encrypted)
+            .map_err(|_| "cannot decrypt static deposit key")?;
+        let key = SecretKey::from_slice(&plaintext).map_err(|_| "invalid static deposit key")?;
+        if hex::encode(PublicKey::from_secret_key(&Secp256k1::new(), &key).serialize())
+            != quote.signing_key
+        {
+            return Err("static deposit key does not match the address".into());
+        }
+        let mut statement = b"claim_static_deposit".to_vec();
+        statement.extend(self.network.to_string().as_bytes());
+        statement.extend(quote.txid.as_bytes());
+        statement.extend(quote.vout.to_le_bytes());
+        statement.push(::spark::operator::rpc::spark::UtxoSwapRequestType::Fixed as u8);
+        statement.extend(quote.credit.to_le_bytes());
+        statement.extend(hex::decode(&quote.signature).map_err(|_| "invalid quote signature")?);
+        let digest: [u8; 32] = Sha256::digest(&statement).into();
+        let signature =
+            Signature::from_der(&hex::decode(signature).map_err(|_| "invalid user signature")?)
+                .map_err(|_| "invalid DER user signature")?;
+        let owner =
+            PublicKey::from_str(&quote.owner).map_err(|_| "invalid static deposit owner")?;
+        Secp256k1::verification_only()
+            .verify_ecdsa(&Message::from_digest(digest), &signature, &owner)
+            .map_err(|_| "invalid static deposit authorization".into())
+    }
+
+    pub async fn prepare_static_claim(
+        &self,
+        quote: &crate::static_deposits::DepositQuote,
+        encrypted: &str,
+        signature: &str,
+        transfer_id: &str,
+        spend: &Transaction,
+    ) -> Result<crate::static_deposits::StaticPlan, String> {
+        use ::spark::{
+            operator::rpc::{
+                spark::{SigningJob, Utxo},
+                spark_ssp_internal::StaticDepositSwapRequest,
+            },
+            signer::Signer,
+        };
+        use prost::Message;
+        let _guard = self.liquidity_lock.lock().await;
+        self.wallet.sync().await.map_err(|e| e.to_string())?;
+        self.ensure_exact_liquidity(quote.credit).await?;
+        let leaves = self
+            .wallet
+            .list_leaves()
+            .await
+            .map_err(|e| e.to_string())?
+            .available
+            .into_iter()
+            .map(wallet_leaf_to_tree_node)
+            .collect::<Result<Vec<_>, _>>()?;
+        let selected =
+            select_leaves_by_exact_amounts(&leaves, &[quote.credit]).map_err(|e| e.to_string())?;
+        let tweaks = selected
+            .into_iter()
+            .map(|node| LeafKeyTweak {
+                node,
+                incoming_key: None,
+            })
+            .collect::<Vec<_>>();
+        let owner = spark_wallet::PublicKey::from_str(&quote.owner).map_err(|e| e.to_string())?;
+        let id = TransferId::from_str(transfer_id)?;
+        let prepared = self
+            .transfer_service
+            .prepare_transfer_request(
+                &id,
+                &tweaks,
+                &owner,
+                None,
+                Some(std::time::SystemTime::now() + Duration::from_secs(24 * 3600)),
+                None,
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+        let nonce = self
+            .raw_signer
+            .generate_random_signing_commitment()
+            .await
+            .map_err(|e| e.to_string())?;
+        let req = StaticDepositSwapRequest {
+            on_chain_utxo: Some(Utxo {
+                txid: hex::decode(&quote.txid).map_err(|e| e.to_string())?,
+                vout: quote.vout,
+                network: self.network.to_proto_network() as i32,
+                ..Default::default()
+            }),
+            ssp_signature: hex::decode(&quote.signature).map_err(|e| e.to_string())?,
+            user_signature: hex::decode(signature).map_err(|e| e.to_string())?,
+            transfer: Some(prepared.transfer_request),
+            spend_tx_signing_job: Some(SigningJob {
+                signing_public_key: hex::decode(&quote.signing_key).map_err(|e| e.to_string())?,
+                raw_tx: bitcoin::consensus::serialize(spend),
+                signing_nonce_commitment: Some(
+                    nonce
+                        .commitments
+                        .try_into()
+                        .map_err(|e: ::spark::services::ServiceError| e.to_string())?,
+                ),
+            }),
+            hash_variant: 0,
+            confirmation_threshold: Some(3),
+        };
+        Ok(crate::static_deposits::StaticPlan {
+            request: req.encode_to_vec(),
+            nonce_ciphertext: nonce.nonces_ciphertext,
+            encrypted_key: hex::decode(encrypted).map_err(|e| e.to_string())?,
+            prev_output: quote.prev_output.clone(),
+        })
+    }
+
+    pub async fn submit_static_claim(
+        &self,
+        quote: &crate::static_deposits::DepositQuote,
+        transfer_id: &str,
+        plan: &crate::static_deposits::StaticPlan,
+    ) -> Result<Transaction, String> {
+        use ::spark::{
+            operator::rpc::spark_ssp_internal::StaticDepositSwapRequest,
+            services::SigningResult,
+            signer::{
+                AggregateFrostRequest, FrostSigningCommitmentsWithNonces, SecretSource,
+                SignFrostRequest, Signer,
+            },
+        };
+        use prost::Message;
+        let _guard = self.liquidity_lock.lock().await;
+        let req =
+            StaticDepositSwapRequest::decode(plan.request.as_slice()).map_err(|e| e.to_string())?;
+        let job = req
+            .spend_tx_signing_job
+            .clone()
+            .ok_or("deposit plan lacks signing job")?;
+        let response = self
+            .private_pool
+            .as_ref()
+            .ok_or("private SSP operator endpoints required")?
+            .get_coordinator()
+            .client
+            .initiate_static_deposit_swap(req)
+            .await
+            .map_err(|e| e.to_string())?;
+        let transfer = response
+            .transfer
+            .ok_or("operator returned no static deposit transfer")?;
+        if transfer.id != transfer_id
+            || transfer.receiver_identity_public_key
+                != hex::decode(&quote.owner).map_err(|e| e.to_string())?
+            || transfer.sender_identity_public_key != self.identity.serialize()
+        {
+            return Err("operator returned a different deposit transfer".into());
+        }
+        let result: SigningResult = response
+            .spend_tx_signing_result
+            .as_ref()
+            .ok_or("operator returned no deposit signing result")?
+            .try_into()
+            .map_err(|e: ::spark::services::ServiceError| e.to_string())?;
+        let verifying_key =
+            spark_wallet::PublicKey::from_str(&quote.verifying_key).map_err(|e| e.to_string())?;
+        let signing_key =
+            spark_wallet::PublicKey::from_str(&quote.signing_key).map_err(|e| e.to_string())?;
+        let prev: bitcoin::TxOut =
+            deserialize(&hex::decode(&plan.prev_output).map_err(|e| e.to_string())?)
+                .map_err(|e| e.to_string())?;
+        let mut spend: Transaction = deserialize(&job.raw_tx).map_err(|e| e.to_string())?;
+        let sighash =
+            ::spark::bitcoin::sighash_from_tx(&spend, 0, &prev).map_err(|e| e.to_string())?;
+        let nonce = FrostSigningCommitmentsWithNonces {
+            commitments: job
+                .signing_nonce_commitment
+                .ok_or("missing deposit nonce")?
+                .try_into()
+                .map_err(|e: ::spark::services::ServiceError| e.to_string())?,
+            nonces_ciphertext: plan.nonce_ciphertext.clone(),
+        };
+        let key = SecretSource::new_encrypted(plan.encrypted_key.clone());
+        let user_share = self
+            .raw_signer
+            .sign_frost(SignFrostRequest {
+                message: sighash.as_byte_array(),
+                public_key: &signing_key,
+                private_key: &key,
+                verifying_key: &verifying_key,
+                self_nonce_commitment: &nonce,
+                statechain_commitments: result.signing_commitments.clone(),
+                adaptor_public_key: None,
+            })
+            .await
+            .map_err(|e| e.to_string())?;
+        let signature = ::spark::utils::frost::aggregate_frost(AggregateFrostRequest {
+            message: sighash.as_byte_array(),
+            statechain_signatures: result.signature_shares,
+            statechain_public_keys: result.public_keys,
+            verifying_key: &verifying_key,
+            statechain_commitments: result.signing_commitments,
+            self_commitment: &nonce.commitments,
+            public_key: &signing_key,
+            self_signature: &user_share,
+            adaptor_public_key: None,
+        })
+        .map_err(|e| e.to_string())?;
+        let bytes = signature.serialize().map_err(|e| e.to_string())?;
+        // Validate against the actual output script, not operator metadata.
+        if !prev.script_pubkey.is_p2tr() {
+            return Err("static deposit is not Taproot".into());
+        }
+        let output_key =
+            bitcoin::secp256k1::XOnlyPublicKey::from_slice(&prev.script_pubkey.as_bytes()[2..])
+                .map_err(|e| e.to_string())?;
+        bitcoin::secp256k1::Secp256k1::verification_only()
+            .verify_schnorr(
+                &bitcoin::secp256k1::schnorr::Signature::from_slice(&bytes)
+                    .map_err(|e| e.to_string())?,
+                &bitcoin::secp256k1::Message::from_digest(*sighash.as_byte_array()),
+                &output_key,
+            )
+            .map_err(|_| "deposit recovery signature is invalid")?;
+        spend.input[0].witness.push(bytes);
+        Ok(spend)
+    }
+
+    pub fn sign_digest(&self, digest: [u8; 32]) -> String {
+        let signature = bitcoin::secp256k1::Secp256k1::new().sign_ecdsa(
+            &bitcoin::secp256k1::Message::from_digest(digest),
+            &self.identity_secret,
+        );
+        hex::encode(signature.serialize_der())
     }
 
     pub async fn sign_message(&self, message: &str) -> Result<String, String> {
@@ -534,6 +825,27 @@ impl SparkService {
         Ok(())
     }
 
+    async fn receive_transfer_id(&self, hash: &str) -> Result<TransferId, String> {
+        let quoted: Option<String> = self
+            .db
+            .with(|c| {
+                use rusqlite::OptionalExtension;
+                c.query_row(
+                    "SELECT quote_id FROM receive_quote_uses WHERE payment_hash=?1",
+                    [hash],
+                    |r| r.get(0),
+                )
+                .optional()
+            })
+            .await?;
+        match quoted {
+            Some(id) => id
+                .parse()
+                .map_err(|e| format!("invalid quoted transfer ID: {e}")),
+            None => payment_transfer_id(hash),
+        }
+    }
+
     pub async fn settle_lightning_receive(
         &self,
         owner: &str,
@@ -542,7 +854,7 @@ impl SparkService {
     ) -> Result<String, String> {
         let _guard = self.liquidity_lock.lock().await;
         self.wallet.sync().await.map_err(|e| e.to_string())?;
-        let transfer_id = payment_transfer_id(payment_hash)?;
+        let transfer_id = self.receive_transfer_id(payment_hash).await?;
         let owner_key = spark_wallet::PublicKey::from_str(owner).map_err(|e| e.to_string())?;
         let receiver = SparkAddress::new(owner_key, self.network, None);
         let transfer = match self.find_transfer(&transfer_id).await? {
@@ -578,7 +890,7 @@ impl SparkService {
         let payment_hash = sha256::Hash::from_slice(&payment_hash_bytes)
             .map_err(|e| format!("Lightning payment hash: {e}"))?;
         let owner_key = spark_wallet::PublicKey::from_str(owner).map_err(|e| e.to_string())?;
-        let transfer_id = payment_transfer_id(&payment_hash.to_string())?;
+        let transfer_id = self.receive_transfer_id(&payment_hash.to_string()).await?;
 
         let _guard = self.liquidity_lock.lock().await;
         self.wallet.sync().await.map_err(|e| e.to_string())?;
@@ -1099,6 +1411,39 @@ impl SparkService {
             .get_transfer(id)
             .await
             .map_err(|e| e.to_string())
+    }
+
+    pub async fn run_swap_history(self: Arc<Self>) {
+        loop {
+            let pending = self.db.with(|c| {
+                let mut statement = c.prepare("SELECT id,json_extract(payload,'$.outbound_transfer_spark_id') FROM requests WHERE kind='LEAVES_SWAP' AND json_extract(payload,'$.outbound_transfer_spark_id') IS NOT NULL AND COALESCE(json_extract(payload,'$.status'),'')!='SUCCEEDED' LIMIT 1000")?;
+                let rows = statement.query_map([],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?)))?.collect::<rusqlite::Result<Vec<_>>>();
+                rows
+            }).await;
+            match pending {
+                Ok(pending) => {
+                    for (id, primary) in pending {
+                        let Ok(primary) = primary.parse() else {
+                            continue;
+                        };
+                        match self.find_transfer(&primary).await {
+                        Ok(Some(transfer)) if transfer.status == TransferStatus::Completed => {
+                            if let Err(error) = self.db.with(|c|c.execute("UPDATE requests SET payload=json_set(payload,'$.status','SUCCEEDED') WHERE id=?1",[&id]).map(|_|())).await {
+                                tracing::warn!(%id,%error,"swap history persistence failed");
+                            }
+                        },
+                        Ok(Some(transfer)) if matches!(transfer.status,TransferStatus::SenderKeyTweaked | TransferStatus::ReceiverKeyTweaked | TransferStatus::ReceiverRefundSigned) => {
+                            if let Err(error) = self.wallet.process_transfer(&transfer).await { tracing::debug!(%id,%error,"swap claim will retry"); }
+                        },
+                        Ok(_) => {},
+                        Err(error) => tracing::debug!(%id,%error,"swap history lookup will retry"),
+                    }
+                    }
+                }
+                Err(error) => tracing::warn!(%error,"swap history query failed"),
+            }
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        }
     }
 
     async fn reconcile_swap_claim(self: Arc<Self>, primary_id: TransferId) {

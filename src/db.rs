@@ -86,6 +86,8 @@ impl Db {
              CREATE TABLE IF NOT EXISTS transfers(spark_id TEXT PRIMARY KEY, request_id TEXT NOT NULL, kind TEXT NOT NULL, status TEXT NOT NULL);
              CREATE TABLE IF NOT EXISTS payments(id TEXT PRIMARY KEY, status TEXT NOT NULL);
              CREATE TABLE IF NOT EXISTS receive_payments(hash TEXT PRIMARY KEY, status TEXT NOT NULL, transfer_id TEXT, preimage TEXT, claimable_amount_msat INTEGER, claim_submitted INTEGER NOT NULL DEFAULT 0);
+             CREATE TABLE IF NOT EXISTS receive_quote_uses(quote_id TEXT PRIMARY KEY, payment_hash TEXT NOT NULL UNIQUE);
+             CREATE TABLE IF NOT EXISTS receive_quotes(id TEXT PRIMARY KEY,owner TEXT NOT NULL,manifest BLOB NOT NULL,expires_at INTEGER NOT NULL);
              CREATE TABLE IF NOT EXISTS static_quotes(txid TEXT NOT NULL, vout INTEGER NOT NULL, credit INTEGER NOT NULL, signature TEXT NOT NULL, created_at TEXT NOT NULL, claimed INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(txid, vout));
              CREATE TABLE IF NOT EXISTS spark_split_operations(
                operation_id TEXT PRIMARY KEY,
@@ -165,6 +167,10 @@ impl Db {
         )
         .map_err(|e| e.to_string())?;
         crate::lightning_store::migrate(&conn)?;
+        crate::static_deposits::migrate(&conn).map_err(|e| e.to_string())?;
+        crate::internal_payments::migrate(&conn).map_err(|e| e.to_string())?;
+        crate::history::migrate(&conn).map_err(|e| e.to_string())?;
+        crate::webhooks::migrate(&conn).map_err(|e| e.to_string())?;
         Ok(Self {
             inner: Arc::new(Mutex::new(conn)),
         })
@@ -354,7 +360,7 @@ impl Db {
             c.execute(
                 &format!(
                     "DELETE FROM requests
-                     WHERE created_at<?1 AND kind IN ('{kinds}')"
+                     WHERE created_at<?1 AND kind IN ('{kinds}') AND id NOT IN (SELECT id FROM deposit_claims)"
                 ),
                 (older_than_rfc3339,),
             )
@@ -676,6 +682,7 @@ impl Db {
                 let total_amount_sats = payload
                     .get("total_amount_sats")
                     .or_else(|| payload.get("amount_sats"))
+                    .or_else(|| payload.get("credit_amount_sats"))
                     .and_then(Value::as_u64)
                     .unwrap_or(0);
                 Ok(serde_json::json!({
@@ -829,7 +836,7 @@ impl Db {
         self.with(|c| {
             c.execute(
                 "UPDATE receive_payments SET status='HTLC_FAILED'
-                 WHERE hash=?1 AND status != 'TRANSFER_COMPLETED'",
+                 WHERE hash=?1 AND status != 'TRANSFER_COMPLETED' AND NOT EXISTS(SELECT 1 FROM internal_payments WHERE hash=?1)",
                 (hash,),
             )
             .map(|_| ())

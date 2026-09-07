@@ -24,10 +24,14 @@ operator build must expose the authenticated counter-swap RPC used by the SSP.
 - Cooperative Bitcoin withdrawals through a dedicated Bitcoin Core wallet,
   with durable input reservations and recovery after restart.
 
-Static-deposit quotes are test-only on regtest. Instant static deposits,
-receive quotes, request history pagination, and wallet
-webhooks are not production-complete. See
-[SSP API coverage](docs/SSP_API_COVERAGE.md) for the exact operation status.
+- Confirmed static deposits with real UTXO quotes and durable recovery transactions.
+- BOLT11 payments between wallets on the same SSP, without an LDK payment.
+- Signed protobuf receive quotes, owner-scoped history, and signed webhook delivery.
+- Private-wallet withdrawals and admin fee bumps that spend SSP change.
+
+Instant deposits, fee-bearing receive quotes, withdrawal batching, and automatic
+liquidity management remain unsupported. See
+[SSP API coverage](docs/SSP_API_COVERAGE.md) for limits and configuration.
 
 ## HTTP endpoints
 
@@ -127,13 +131,13 @@ split a previous change leaf again using persisted keys.
 
 The wallets send BOLT11 payments in both directions. The runner checks Spark
 balances, Breez records, Lightning payment records, and preimage hashes.
-It also checks send replay, same-SSP rejection before funding, authentication,
+It also checks send replay, same-SSP settlement without an LDK payment, authentication,
 malformed hashes, missing or unknown funding, invoice expiry, and a payment
 that arrives while the SSP is stopped. Recovery must complete that payment
 after restart without a second Spark payout.
 
 The test then withdraws a wallet's balance to Bitcoin. It restarts the SSP
-after broadcast, mines the payout, and checks the Bitcoin amount, Breez
+after broadcast and a fee bump, retries the same bump, mines the payout, and checks the Bitcoin amount, Breez
 withdrawal record, and Spark leaves recovered by the SSP. Repeated completion
 calls must keep the same payout. Separate BOLT12 send and receive checks run
 last because the pinned Breez SDK cannot parse the extension's history.

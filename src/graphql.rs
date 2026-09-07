@@ -1,5 +1,4 @@
 use axum::http::HeaderMap;
-use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use serde_json::{json, Value};
 use std::str::FromStr;
 use uuid::Uuid;
@@ -65,7 +64,6 @@ pub async fn dispatch(
         }
         "LightningSendFeeEstimate" | "lightning_send_fee_estimate" => {
             let inv = str_of(&input, "encoded_invoice");
-            validate_internal_send_support(&state.db, &inv).await?;
             let amt = opt_num(&input, "amount_sats");
             let msat = state.ldk.fee_estimate_msat(&inv, amt).await;
             Ok(json!({ "lightning_send_fee_estimate": {
@@ -102,53 +100,36 @@ pub async fn dispatch(
         // Paginated user-request history for the session wallet.
         "FetchCurrentUserToUserRequestsConnection"
         | "fetch_current_user_to_user_requests_connection" => {
-            let _ = auth::require_session(&state, headers).await?;
-            Ok(json!({ "current_user": {
-                "user_requests": {
-                    "__typename": "SparkWalletUserToUserRequestsConnection",
-                    "count": 0,
-                    "page_info": {
-                        "__typename": "PageInfo",
-                        "has_next_page": false,
-                        "has_previous_page": false,
-                        "start_cursor": null,
-                        "end_cursor": null,
-                    },
-                    "entities": [],
-                }
-            }}))
+            let owner = auth::require_session(&state, headers).await?;
+            let page = state
+                .db
+                .request_history(&owner, v, &state.config.network)
+                .await?;
+            let mut entities = Vec::with_capacity(page.records.len());
+            for record in &page.records {
+                entities.push(user_request_union(&state, record).await);
+            }
+            Ok(json!({ "current_user": { "user_requests": {
+                "__typename": "SparkWalletUserToUserRequestsConnection",
+                "count": page.count,
+                "page_info": { "__typename": "PageInfo",
+                    "has_next_page": page.has_next, "has_previous_page": page.has_previous,
+                    "start_cursor": page.start, "end_cursor": page.end },
+                "entities": entities,
+            }}}))
         }
         // ---- lightning receive (quote is stateless+signed; receive persists request) ----
         "LightningReceiveQuote" | "lightning_receive_quote" => {
-            let _ = auth::require_session(&state, headers).await?;
+            let owner = auth::require_session(&state, headers).await?;
             let amount = num_of(&input, "amount_sats");
             validate_sats(amount)?;
-            let network = str_of(&input, "network");
-            let network = if network.is_empty() {
-                state.config.network.clone()
-            } else {
-                network
-            };
-            validate_network(&state, &network)?;
-            let transfer_id = Uuid::new_v4().to_string();
-            // The SDK quote flow needs a protobuf TransferManifest. This JSON
-            // manifest keeps the GraphQL response shape but is not accepted as
-            // a production receive quote.
-            let manifest = json!({
-                "transfer_id": transfer_id,
-                "amount_sats": amount,
-                "network": network,
-                "ssp_identity_pubkey": crate::ssp_identity(&state).await?,
-            });
-            let serialized = B64.encode(serde_json::to_vec(&manifest).unwrap());
-            let sig = sign_with_ssp(&state, &serialized).await?;
-            Ok(json!({ "lightning_receive_quote": {
-                "issued_quote": {
-                    "serialized_manifest": serialized,
-                    "issuer_signature": sig,
-                },
-                "attribution_status": "NO_PARTNER_JWT",
-            }}))
+            let requested_network = str_of(&input, "network");
+            if !requested_network.is_empty() {
+                validate_network(&state, &requested_network)?;
+            }
+            Ok(
+                json!({"lightning_receive_quote":crate::quotes::issue(&state,&owner,amount,&input).await?}),
+            )
         }
         "RequestBolt12Receive" | "request_bolt12_receive" => {
             let owner = auth::require_session(&state, headers).await?;
@@ -243,6 +224,8 @@ pub async fn dispatch(
                     })?
                     .to_string()
             };
+            let quote_transfer_id =
+                crate::quotes::validate(&state, &owner, &receiver, &hash, amount, &input).await?;
             let memo = str_of(&input, "memo");
             let expiry = u32::try_from(opt_num(&input, "expiry_secs").unwrap_or(86_400))
                 .map_err(|_| "expiry_secs is out of range".to_string())?;
@@ -265,7 +248,8 @@ pub async fn dispatch(
                        "invoice": inv.invoice, "network": state.config.network,
                        "expiry_secs": expiry,
                        "receiver_identity_pubkey": receiver.clone(),
-                       "invoice_expires_at": invoice_expires_at}),
+                       "invoice_expires_at": invoice_expires_at,
+                       "quote_transfer_id": quote_transfer_id}),
                 None,
             )
             .await?;
@@ -331,7 +315,6 @@ pub async fn dispatch(
                 }
                 return send_response_from_record(&state, &rec, &now).await;
             }
-            validate_internal_send_support(&state.db, &inv).await?;
             let send = state.ldk.prepare_send(&owner, &ext_id, &inv, amt).await?;
             let rec = state
                 .db
@@ -425,7 +408,8 @@ pub async fn dispatch(
                 &now,
                 json!({"total_amount_sats": total, "target_amount_sats": target,
                        "fee_sats": fee,
-                       "inbound_transfer_spark_id": inbound_id}),
+                       "inbound_transfer_spark_id": inbound_id, "outbound_transfer_spark_id": ext_id,
+                       "network": network,"status":"OUTBOUND_TRANSFER_SENT","swap_leaves":swap_leaves}),
                 None,
             )
             .await?;
@@ -464,80 +448,19 @@ pub async fn dispatch(
         }
         // ---- static deposits (SDK uses static_deposit_quote only) ----
         "StaticDepositQuote" | "static_deposit_quote" => {
-            let _ = auth::require_session(&state, headers).await?;
-            // Quote signing without a UTXO lookup is only acceptable where
-            // coins are worthless. Refuse elsewhere rather than signing blind.
-            let network = str_of(&input, "network");
-            let network = if network.is_empty() {
-                state.config.network.clone()
-            } else {
-                network
-            };
-            validate_network(&state, &network)?;
-            if state.config.network != "REGTEST" && state.config.network != "LOCAL" {
-                return Err("static deposit quotes are regtest-only".to_string());
-            }
-            let txid = str_of(&input, "transaction_id").to_lowercase();
-            if txid.len() != 64 || !txid.bytes().all(|b| b.is_ascii_hexdigit()) {
-                return Err("transaction_id must be 64 hex chars".to_string());
-            }
-            let vout = num_of(&input, "output_index");
-            if vout > u32::MAX as u64 {
-                return Err("output_index out of range".to_string());
-            }
-            // FAKE credit: fixed amount, must stay <= the real UTXO value or
-            // the SO rejects the claim (totalAmount > utxo.Amount check).
-            // TODO(live): look up the UTXO via bitcoind/esplora and apply fees.
-            let credit: u64 = 100_000;
-            let payload = format!("{txid}:{vout}:{credit}");
-            let proposed_signature = sign_with_ssp(&state, &payload).await?;
-            let sig = state
-                .db
-                .record_static_quote(&txid, vout as u32, credit, &proposed_signature, &now)
-                .await?
-                .ok_or_else(|| "static deposit output was already claimed".to_string())?;
-            let quote = json!({
-                "__typename": "StaticDepositQuoteOutput",
-                "transaction_id": txid, "output_index": vout,
-                "network": network,
-                "credit_amount_sats": credit, "signature": sig,
-            });
-            Ok(json!({ "static_deposit_quote": quote }))
+            let owner = auth::require_session(&state, headers).await?;
+            let service=state.static_deposit.as_ref().ok_or("confirmed static deposits require the Bitcoin wallet and private operator endpoints")?;
+            Ok(json!({"static_deposit_quote":service.quote(&owner,&input).await?}))
         }
-        // SDK ClaimStaticDeposit mutation only (no fixed-amount variant in SspClient).
         "ClaimStaticDeposit" | "claim_static_deposit" => {
             let owner = auth::require_session(&state, headers).await?;
-            let txid = str_of(&input, "transaction_id").to_lowercase();
-            let vout = num_of(&input, "output_index");
-            let quote_signature = str_of(&input, "quote_signature");
-            if txid.len() != 64 || !txid.bytes().all(|b| b.is_ascii_hexdigit()) {
-                return Err("transaction_id must be 64 hex chars".to_string());
-            }
-            if vout > u32::MAX as u64 {
-                return Err("output_index out of range".to_string());
-            }
-            if !state
-                .db
-                .consume_static_quote(&txid, vout as u32, &quote_signature)
-                .await?
-            {
-                return Err("unknown, mismatched, or already claimed quote".to_string());
-            }
-            enforce_compat_quota(&state, &owner).await?;
-            store_request(
-                &state,
-                "CLAIM_STATIC_DEPOSIT",
-                &owner,
-                &now,
-                static_deposit_payload(&input),
-                None,
+            let service = state
+                .static_deposit
+                .as_ref()
+                .ok_or("confirmed static deposits are not configured")?;
+            Ok(
+                json!({"claim_static_deposit":{"__typename":"ClaimStaticDepositOutput","transfer_id":service.claim(&owner,&input).await?}}),
             )
-            .await?;
-            // ClaimStaticDepositOutputFragment selects only transfer_id.
-            Ok(json!({ "claim_static_deposit": {
-                "__typename": "ClaimStaticDepositOutput",
-                "transfer_id": Uuid::new_v4().to_string(),
-            }}))
         }
         "CreateInstantStaticDepositQuote" | "create_instant_static_deposit_quote" => {
             let _ = auth::require_session(&state, headers).await?;
@@ -611,14 +534,29 @@ pub async fn dispatch(
             }
         }
         "WalletWebhooks" | "wallet_webhooks" | "ListSparkWalletWebhooks" => {
-            Ok(json!({ "wallet_webhooks": { "webhooks": [] } }))
+            let owner = auth::require_session(&state, headers).await?;
+            Ok(json!({ "wallet_webhooks": { "webhooks": state.db.list_webhooks(&owner).await? } }))
         }
-        "RegisterWalletWebhook" | "register_wallet_webhook" => Ok(json!({
-            "register_wallet_webhook": { "webhook_id": Uuid::new_v4().to_string() }
-        })),
-        "DeleteWalletWebhook" | "delete_wallet_webhook" => Ok(json!({
-            "delete_wallet_webhook": { "success": true }
-        })),
+        "RegisterWalletWebhook" | "register_wallet_webhook" => {
+            let owner = auth::require_session(&state, headers).await?;
+            let id = state
+                .db
+                .register_webhook(
+                    &owner,
+                    &input,
+                    crate::webhooks::allow_local(&state.config.network),
+                )
+                .await?;
+            Ok(json!({ "register_wallet_webhook": { "webhook_id": id } }))
+        }
+        "DeleteWalletWebhook" | "delete_wallet_webhook" => {
+            let owner = auth::require_session(&state, headers).await?;
+            let deleted = state
+                .db
+                .delete_webhook(&owner, &str_of(&input, "webhook_id"))
+                .await?;
+            Ok(json!({ "delete_wallet_webhook": { "success": deleted } }))
+        }
         _ => Err(format!("unsupported SSP operation: {op}")),
     }
 }
@@ -877,7 +815,7 @@ async fn user_request_union(state: &AppState, rec: &Value) -> Value {
             json!({
                 "__typename": "LeavesSwapRequest",
                 "id": id, "created_at": created, "updated_at": created,
-                "network": net, "status": "CREATED",
+                "network": net, "status": p.get("status").cloned().unwrap_or(json!("CREATED")),
                 "total_amount": sats(total), "target_amount": sats(target),
                 "fee": sats(fee),
                 "inbound_transfer": {
@@ -886,7 +824,7 @@ async fn user_request_union(state: &AppState, rec: &Value) -> Value {
                     "spark_id": inbound,
                     "user_request": {"id": id},
                 },
-                "swap_leaves": [], "expires_at": null,
+                "swap_leaves": p.get("swap_leaves").cloned().unwrap_or(json!([])), "expires_at": null,
             })
         }
         "COOP_EXIT" => json!({
@@ -906,10 +844,12 @@ async fn user_request_union(state: &AppState, rec: &Value) -> Value {
             "id": id, "created_at": created, "updated_at": created,
             "network": net,
             "credit_amount": sats(p.get("credit_amount_sats").and_then(|v| v.as_u64()).unwrap_or(0)),
-            "max_fee": null, "status": "CREATED",
+            "deposit_amount": sats(p.get("deposit_amount_sats").and_then(Value::as_u64).unwrap_or(0)),
+            "max_fee": sats(p.get("max_fee_sats").and_then(Value::as_u64).unwrap_or(0)),
+            "status": if p["status"]=="SUCCEEDED" {"SPEND_TX_BROADCAST"} else {"CREATED"},
             "transaction_id": p.get("transaction_id").cloned().unwrap_or(Value::Null),
             "output_index": p.get("output_index").cloned().unwrap_or(Value::Null),
-            "bitcoin_network": net, "transfer_spark_id": null,
+            "bitcoin_network": net, "transfer_spark_id": p.get("transfer_spark_id").cloned().unwrap_or(Value::Null),
         }),
         _ => Value::Null,
     }
@@ -926,20 +866,6 @@ fn transfer_response(row: &Value, user_request: Value) -> Value {
         "spark_id": row.get("spark_id").cloned().unwrap_or(Value::Null),
         "user_request": user_request,
     })
-}
-
-/// Reject unsupported local invoices before the wallet locks sender funding.
-async fn validate_internal_send_support(db: &crate::db::Db, invoice: &str) -> Result<(), String> {
-    if db
-        .lightning_receive_hash_for_invoice(invoice)
-        .await?
-        .is_some()
-    {
-        return Err(
-            "this invoice cannot be paid internally; use an external Lightning wallet".into(),
-        );
-    }
-    Ok(())
 }
 
 /// Build the request_lightning_send response from a stored LIGHTNING_SEND
@@ -1100,11 +1026,6 @@ fn ids_of(input: &Value, root: &Value) -> Vec<String> {
         }
     }
     vec![]
-}
-
-/// SSP signature with the identity key of the embedded Spark wallet.
-async fn sign_with_ssp(state: &AppState, message: &str) -> Result<String, String> {
-    state.spark.sign_message(message).await
 }
 
 #[cfg(test)]

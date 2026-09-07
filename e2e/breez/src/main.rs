@@ -361,7 +361,7 @@ fn local_config(
     sdk_config.real_time_sync_server_url = None;
     sdk_config.prefer_spark_over_lightning = false;
     sdk_config.use_default_external_input_parsers = false;
-    sdk_config.private_enabled_default = false;
+    sdk_config.private_enabled_default = true;
     sdk_config.leaf_optimization_config.auto_enabled = false;
     sdk_config.token_optimization_config.auto_enabled = false;
 
@@ -1164,7 +1164,63 @@ async fn pay_between(
     Ok(payment_hash)
 }
 
-async fn reject_unsafe_internal_payment(
+async fn static_deposit(client: &Client, config: &TestConfig, wallet: &Wallet) -> Result<()> {
+    let ssp_before = ssp_available_balance(client, config, wallet.ssp_url).await?;
+    let before = wallet_balance(wallet).await?;
+    let address = wallet
+        .sdk
+        .receive_payment(ReceivePaymentRequest {
+            payment_method: ReceivePaymentMethod::BitcoinAddress {
+                new_address: Some(false),
+            },
+        })
+        .await?
+        .payment_request;
+    let txid = bitcoin_rpc(client, config, "sendtoaddress", json!([address, 0.0001])).await?;
+    let miner = bitcoin_rpc(client, config, "getnewaddress", json!([])).await?;
+    bitcoin_rpc(client, config, "generatetoaddress", json!([3, miner])).await?;
+    // The unmodified SDK observes the confirmed output and requests its claim.
+    poll("static on-chain deposit credited", config.timeout, || {
+        exact_balance(wallet, before + 10_000 - 99)
+    })
+    .await?;
+    let tx = bitcoin_rpc(client, config, "getrawtransaction", json!([txid, true])).await?;
+    let vout = tx["vout"]
+        .as_array()
+        .context("deposit tx outputs missing")?
+        .iter()
+        .find(|v| v["scriptPubKey"]["address"] == address)
+        .context("deposit output missing")?["n"]
+        .as_u64()
+        .context("deposit output index missing")?;
+    let coin = bitcoin_rpc(client, config, "gettxout", json!([txid, vout, true])).await?;
+    ensure!(
+        coin.is_null(),
+        "static deposit was credited but the recovery transaction did not spend it"
+    );
+    poll("static deposit SSP liquidity", config.timeout, || async {
+        let balance = ssp_available_balance(client, config, wallet.ssp_url).await?;
+        ensure!(
+            balance == ssp_before - 9901,
+            "SSP balance {balance}; expected {}",
+            ssp_before - 9901
+        );
+        Ok(())
+    })
+    .await?;
+    poll("Breez deposit history",config.timeout,||async {
+        wallet.sdk.sync_wallet(SyncWalletRequest {}).await?;
+        let payments=wallet.sdk.list_payments(ListPaymentsRequest::default()).await?;
+        let deposit=payments.payments.iter().find(|payment|matches!(&payment.details,Some(PaymentDetails::Deposit{tx_id,..}) if tx_id==&txid)).context("deposit history missing")?;
+        ensure!(deposit.status==PaymentStatus::Completed,"deposit status is {}",deposit.status);
+        ensure!(deposit.amount==9901,"deposit history amount is {}",deposit.amount);
+        Ok(())
+    }).await?;
+    println!("PASS static deposit: 10000 sats funded, 9901 sats credited, recovery broadcast");
+    Ok(())
+}
+
+async fn pay_internal(
     client: &Client,
     config: &TestConfig,
     sender: &Wallet,
@@ -1196,7 +1252,7 @@ async fn reject_unsafe_internal_payment(
         "LDK already has a payment for the internal invoice"
     );
 
-    let error = sender
+    let prepared = sender
         .sdk
         .prepare_send_payment(PrepareSendPaymentRequest {
             payment_request: PaymentRequest::Input {
@@ -1207,23 +1263,45 @@ async fn reject_unsafe_internal_payment(
             conversion_options: None,
             fee_policy: None,
         })
-        .await
-        .expect_err("unsafe internal invoice was accepted for funding");
-    ensure!(
-        error.to_string().contains("cannot be paid internally"),
-        "unexpected internal payment error: {error}"
-    );
-    exact_balance(sender, sender_before).await?;
-    exact_balance(receiver, receiver_before).await?;
-    ensure!(
-        ssp_available_balance(client, config, sender.ssp_url).await? == ssp_before,
-        "rejected internal payment changed SSP balance"
-    );
+        .await?;
+    let sent = sender
+        .sdk
+        .send_payment(SendPaymentRequest {
+            prepare_response: prepared,
+            options: None,
+            idempotency_key: None,
+        })
+        .await?;
+    poll("internal sender completion", config.timeout, || {
+        completed_payment(sender, &sent.payment.id)
+    })
+    .await?;
+    poll("internal receiver completion", config.timeout, || {
+        received_payment(receiver, &invoice)
+    })
+    .await?;
+    poll("internal sender balance", config.timeout, || {
+        exact_balance(sender, sender_before - amount_sats)
+    })
+    .await?;
+    poll("internal receiver balance", config.timeout, || {
+        exact_balance(receiver, receiver_before + amount_sats)
+    })
+    .await?;
+    poll("internal SSP balance", config.timeout, || async {
+        let balance = ssp_available_balance(client, config, sender.ssp_url).await?;
+        ensure!(
+            balance == ssp_before,
+            "internal SSP balance {balance}; expected {ssp_before}"
+        );
+        Ok(())
+    })
+    .await?;
     ensure!(
         bolt11_payment_count(&sender.ldk, &payment_hash).await? == 0,
-        "rejected internal payment created an LDK payment"
+        "internal payment entered the Lightning backend"
     );
-    println!("PASS unsafe internal invoice rejected before funding: {payment_hash}");
+    println!("PASS same-SSP payment: {payment_hash}");
     Ok(())
 }
 
@@ -1672,10 +1750,14 @@ async fn run(
     )
     .await
     .context("wallet A send-liquidity bootstrap failed")?;
-    println!("reject unsafe internal payment before funding");
-    reject_unsafe_internal_payment(client, config, wallet_a, wallet_c, config.send_amount_sats)
+    fund_ssp(client, config, wallet_c.ssp_url, 20_000).await?;
+    static_deposit(client, config, wallet_c)
         .await
-        .context("unsafe internal payment rejection failed")?;
+        .context("static deposit failed")?;
+    println!("pay between two wallets on one SSP");
+    pay_internal(client, config, wallet_a, wallet_c, config.send_amount_sats)
+        .await
+        .context("same-SSP payment failed")?;
 
     println!("send from wallet B to wallet A over Lightning");
     let first_hash = pay_between(
@@ -1777,6 +1859,31 @@ async fn withdraw_bitcoin(client: &Client, config: &TestConfig, wallet: &Wallet)
     };
     let fee = fee_quote.speed_fast.total_fee_sat();
     ensure!(before > fee, "wallet cannot cover the withdrawal fee");
+    let project = command_output(
+        "docker",
+        &[
+            "inspect",
+            "--format",
+            "{{ index .Config.Labels \"com.docker.compose.project\" }}",
+            &config.ssp_container,
+        ],
+    )
+    .await?;
+    let project_filter = format!("label=com.docker.compose.project={}", project.trim());
+    let miner = command_output(
+        "docker",
+        &[
+            "ps",
+            "-q",
+            "--filter",
+            &project_filter,
+            "--filter",
+            "label=com.docker.compose.service=bitcoin-miner",
+        ],
+    )
+    .await?;
+    ensure!(miner.lines().count() == 1, "test needs exactly one miner");
+    command_output("docker", &["stop", miner.trim()]).await?;
     let sent = wallet
         .sdk
         .send_payment(SendPaymentRequest {
@@ -1788,7 +1895,48 @@ async fn withdraw_bitcoin(client: &Client, config: &TestConfig, wallet: &Wallet)
         })
         .await
         .context("send Bitcoin withdrawal")?;
+    let session = authenticate_wallet(client, wallet).await?;
+    let pending = graphql_json(
+        client,
+        wallet,
+        Some(&session),
+        "CompleteCoopExit",
+        json!({"input":{"user_outbound_transfer_external_id":sent.payment.id}}),
+    )
+    .await?;
+    let request_id = pending["complete_coop_exit"]["request"]["id"]
+        .as_str()
+        .context("withdrawal request ID missing")?;
+    let bump = admin_json(
+        client,
+        config,
+        wallet.ssp_url,
+        "/admin/withdrawals/bump-fee",
+        Some(json!({"request_id":request_id,"fee_rate":5,"max_fee_sats":5000})),
+    )
+    .await?;
+    let child_id = bump["txid"]
+        .as_str()
+        .context("fee bump transaction missing")?;
+    let child = bitcoin_rpc(client, config, "getrawtransaction", json!([child_id, true])).await?;
+    ensure!(
+        child["vin"][0]["txid"] == bump["parent_txid"] && child["vin"][0]["vout"] == 2,
+        "fee bump spent something other than SSP change"
+    );
     restart_ssp(client, config, wallet.ssp_url).await?;
+    let replay = admin_json(
+        client,
+        config,
+        wallet.ssp_url,
+        "/admin/withdrawals/bump-fee",
+        Some(json!({"request_id":request_id,"fee_rate":5,"max_fee_sats":5000})),
+    )
+    .await?;
+    ensure!(
+        replay["txid"] == bump["txid"],
+        "fee bump retry changed the transaction"
+    );
+    command_output("docker", &["start", miner.trim()]).await?;
     let mining_address = bitcoin_rpc(client, config, "getnewaddress", json!([])).await?;
     bitcoin_rpc(
         client,
@@ -1877,7 +2025,7 @@ async fn acceptance(config: TestConfig, ldk_a: LdkClient, ldk_b: LdkClient) -> R
     breez_sdk_spark::init_logging(
         None,
         Some(Box::new(SdkLogger)),
-        Some("off,spark=warn,spark_wallet=warn".into()),
+        Some("off,spark=warn,spark_wallet=warn,breez_sdk_spark=warn".into()),
     )?;
     let started = Instant::now();
     for id in 0..3 {

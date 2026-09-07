@@ -49,8 +49,9 @@ for its health check before starting the SSP.
 
 ## Upgrade from the retired preimage extension
 
-`mint_invoice_preimage`, `reveal_preimage`, and same-SSP internal settlement
-have been removed. Standard receives still use preimages and shares created
+`mint_invoice_preimage`, `reveal_preimage`, and the old SSP-owned internal
+settlement flow have been removed. The current same-SSP flow and standard
+receives use preimages and shares created
 by the wallet. Remove `SSP_FROST_OPERATORS` and `SSP_ALLOW_FAKE_LN` from old
 deployment configuration. Keep `SSP_FROST_THRESHOLD` for wallet signing.
 
@@ -224,8 +225,11 @@ default deployment split minimum remains 330 sats.
 The SSP signs only after the operators report the matching conditional Spark
 transfer. A background task retries pending payouts and Spark recovery after
 restart. Do not remove reservations or replace payout transactions manually.
-A Bitcoin conflict keeps the reservation in place. Automatic fee bumping is
-not implemented. The operator's confirmation rules control when the SSP can
+A Bitcoin conflict keeps the reservation in place. An admin can use
+`POST /admin/withdrawals/bump-fee` with `request_id`, `fee_rate` in sat/vB,
+and `max_fee_sats`. It spends SSP change in one child transaction and leaves
+the payout and connector IDs intact. Repeated calls must use the same rate.
+Automatic fee selection and repeated child replacements are not implemented. The operator's confirmation rules control when the SSP can
 recover the Spark leaves.
 
 Back up the Core wallet, Spark mnemonic, and complete SSP SQLite data. Keep the
@@ -251,3 +255,29 @@ data volume during an image rollback.
 - Stop the SSP or use a SQLite-aware backup before copying its data directory.
 - Back up `spark.mnemonic` and the complete SQLite data together.
 - Test restore procedures with a wallet identity check before adding funds.
+
+## Private wallets and confirmed deposits
+
+Use the pinned operator source and configure `SSP_OPERATOR_HOSTS` plus its
+certificates. On each operator with authorization enabled, set
+`SSP_INTERNAL_ALLOWED_IDENTITIES` to the comma-separated compressed identity
+keys of trusted SSPs. An ordinary wallet session cannot use the private read
+methods. Keep the SSP listener restricted to the SSP network.
+
+The dedicated Bitcoin Core wallet also receives static-deposit recovery
+outputs. Confirmed deposits require three confirmations, an unspent output,
+a matching operator-owned static address, the wallet's authorization, and
+enough SSP Spark liquidity for the quote. Quotes deduct the recovery miner
+fee from the Bitcoin value. The claim uses one durable transfer ID and saves
+its signing plan and transaction for retries. Back up all of these records.
+
+`GET /admin/settlements` lists unresolved work.
+`POST /admin/settlements/reconcile` accepts a Lightning `request_id` and runs
+the same guarded recovery as the background worker. A pending BOLT12 send
+with no backend record still needs investigation; do not infer failure from
+elapsed time.
+
+Webhook delivery uses a persistent queue in the SSP database. Configure
+HTTPS URLs that resolve to public addresses. Keep `SSP_WEBHOOK_ALLOW_LOCAL`
+unset in deployments with real value. See [API coverage](SSP_API_COVERAGE.md)
+for event types, signature verification, and retry behavior.

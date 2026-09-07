@@ -21,6 +21,9 @@ const HELP: &str = "Usage: cargo regtest [--project NAME] COMMAND
   logs [SERVICE...]     Show the last 100 log lines
   certs [DIRECTORY]     Copy operator certificates (prints the destination)
   fund <a|b> SATS       Add one Spark liquidity leaf to the selected SSP
+  settlements <a|b>    List unresolved payment and deposit intents
+  reconcile <a|b> ID   Recheck one Lightning send against the backend
+  bump <a|b> ID RATE MAX_FEE  Fund a withdrawal CPFP at RATE sat/vB
   ldk <a|b> COMMAND...  Run ldk-server-cli with the node's local credentials
   test [--keep]         Reset a separate test project and run Breez acceptance
 
@@ -49,6 +52,11 @@ enum Action {
     Fund {
         url: &'static str,
         sats: u64,
+    },
+    Admin {
+        side: String,
+        path: &'static str,
+        body: Option<serde_json::Value>,
     },
     Ldk {
         service: &'static str,
@@ -98,6 +106,40 @@ impl Options {
                 let sats = sats.parse().context("SATS must be a positive integer")?;
                 ensure!(sats > 0, "SATS must be positive");
                 Action::Fund { url, sats }
+            }
+            ["settlements", side] => {
+                ensure!(matches!(*side, "a" | "b"), "select SSP a or b");
+                Action::Admin {
+                    side: side.to_string(),
+                    path: "/admin/settlements",
+                    body: None,
+                }
+            }
+            ["reconcile", side, id] => {
+                ensure!(matches!(*side, "a" | "b"), "select SSP a or b");
+                Action::Admin {
+                    side: side.to_string(),
+                    path: "/admin/settlements/reconcile",
+                    body: Some(serde_json::json!({"request_id":id})),
+                }
+            }
+            ["bump", side, id, rate, max_fee] => {
+                ensure!(matches!(*side, "a" | "b"), "select SSP a or b");
+                let rate: u64 = rate.parse().context("RATE must be a positive integer")?;
+                let max_fee: u64 = max_fee
+                    .parse()
+                    .context("MAX_FEE must be a positive integer")?;
+                ensure!(
+                    (1..=10_000).contains(&rate) && max_fee > 0,
+                    "invalid fee rate or budget"
+                );
+                Action::Admin {
+                    side: side.to_string(),
+                    path: "/admin/withdrawals/bump-fee",
+                    body: Some(
+                        serde_json::json!({"request_id":id,"fee_rate":rate,"max_fee_sats":max_fee}),
+                    ),
+                }
             }
             ["ldk", side, _, ..] => {
                 let service = match *side {
@@ -638,6 +680,25 @@ pub(super) async fn run() -> Result<()> {
             })
             .await?;
         }
+        Action::Admin { side, path, body } => {
+            stack
+                .container(if side == "a" { "ssp" } else { "ssp-2" })
+                .await?;
+            let url = format!(
+                "http://127.0.0.1:{}{path}",
+                if side == "a" { 5000 } else { 5001 }
+            );
+            let request = if let Some(body) = body {
+                stack.client.post(url).json(&body)
+            } else {
+                stack.client.get(url)
+            };
+            let response = request.bearer_auth(&stack.admin_token).send().await?;
+            let status = response.status();
+            let value: serde_json::Value = response.json().await?;
+            ensure!(status.is_success(), "SSP {status}: {value}");
+            println!("{}", serde_json::to_string_pretty(&value)?);
+        }
         Action::Ldk { service, args } => {
             let args: Vec<&str> = args.iter().map(String::as_str).collect();
             print!("{}", stack.node(service).await?.output(&args).await?);
@@ -652,6 +713,34 @@ mod tests {
 
     fn parse(args: &[&str]) -> Result<Options> {
         Options::parse(args.iter().map(|s| s.to_string()).collect())
+    }
+
+    #[test]
+    fn fee_bumps_require_explicit_rate_and_budget() {
+        assert!(matches!(
+            parse(&["settlements", "a"]).unwrap().action,
+            Action::Admin { body: None, .. }
+        ));
+        let Action::Admin {
+            body: Some(body), ..
+        } = parse(&["bump", "b", "request", "5", "5000"])
+            .unwrap()
+            .action
+        else {
+            panic!("expected admin command")
+        };
+        assert_eq!(
+            body,
+            serde_json::json!({"request_id":"request","fee_rate":5,"max_fee_sats":5000})
+        );
+        for args in [
+            vec!["bump", "a", "request", "5"],
+            vec!["bump", "a", "request", "0", "5000"],
+            vec!["bump", "a", "request", "5", "0"],
+            vec!["bump", "c", "request", "5", "5000"],
+        ] {
+            assert!(parse(&args).is_err());
+        }
     }
 
     #[test]
