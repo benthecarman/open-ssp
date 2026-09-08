@@ -39,6 +39,8 @@ The SSP calls existing operator consensus code through this RPC.
 | `LDK_API_KEY_FILE` | Mounted raw `ldk-server` API-key file |
 | `LDK_TLS_CERT_FILE` | Mounted `ldk-server` TLS certificate |
 | `SSP_SWAP_FEE_SATS` | Flat leaf-swap fee |
+| `SSP_INSTANT_MAX_OUTSTANDING_SATS` | Maximum pending instant credit; default `0` disables new advances |
+| `SSP_INSTANT_MAX_DEPOSIT_SATS` | Maximum Bitcoin value per instant deposit; default `0` disables new advances |
 | `MAX_SWAP_TOTAL_SATS` | Maximum value accepted by one swap; `0` removes the cap |
 | `SSP_CORS_ORIGINS` | Optional comma-separated browser origins |
 | `RUST_LOG` | Optional tracing filter; use `info` unless more detail is needed |
@@ -271,7 +273,23 @@ enough SSP Spark liquidity for the quote. Quotes deduct the recovery miner
 fee from the Bitcoin value. The claim uses one durable transfer ID and saves
 its signing plan and transaction for retries. Back up all of these records.
 
-`GET /admin/settlements` lists unresolved work.
+Instant deposits require both advance limits to be nonzero and enough Spark
+liquidity to pay the credit. Set limits according to the Bitcoin loss the SSP
+can accept from unconfirmed deposits. There is one pending advance per owner.
+The fee is deducted from the deposit, and the full quoted credit is sent
+before confirmation. The server reserves the budget until the Bitcoin
+recovery transaction has three confirmations.
+
+The worker resumes saved claims after a restart. A same-amount replacement
+deposit can satisfy the reservation. A lost deposit, a replacement with a
+different amount, or a reorganization after recovery signing can need manual
+investigation. The server does not refund, resend, or release the budget on
+a timeout. Setting the limits to zero stops new advances while recovery
+continues. Keep the SSP and operator databases with their saved signing data.
+
+`GET /status` reports instant credit exposure and configured limits.
+`GET /admin/settlements` lists unresolved work, including instant recovery
+phases and the last error.
 `POST /admin/settlements/reconcile` accepts a Lightning `request_id` and runs
 the same guarded recovery as the background worker. A pending BOLT12 send
 with no backend record still needs investigation; do not infer failure from

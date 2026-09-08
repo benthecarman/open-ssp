@@ -11,7 +11,7 @@ pub fn migrate(c: &Connection) -> rusqlite::Result<()> {
         CREATE INDEX IF NOT EXISTS requests_owner_order ON requests(owner,created_at DESC,id DESC);
         DROP VIEW IF EXISTS request_history;
         CREATE VIEW request_history AS SELECT r.*,
-          CASE WHEN r.kind='COOP_EXIT_V2' THEN 'COOP_EXIT' ELSE r.kind END AS request_type,
+          CASE WHEN r.kind='COOP_EXIT_V2' THEN 'COOP_EXIT' WHEN r.kind='CLAIM_INSTANT_STATIC_DEPOSIT_V2' THEN 'CLAIM_STATIC_DEPOSIT' ELSE r.kind END AS request_type,
           COALESCE(json_extract(r.payload,'$.network'),'') AS network,
           CASE
             WHEN s.status='SUCCEEDED' OR p.status='TRANSFER_COMPLETED' OR x.status='SUCCEEDED' OR json_extract(r.payload,'$.status') IN ('SUCCEEDED','COMPLETED') THEN 'SUCCEEDED'

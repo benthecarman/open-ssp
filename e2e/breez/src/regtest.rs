@@ -224,6 +224,14 @@ impl Stack {
             .env("SPARK_ADMIN_TOKEN", &self.admin_token)
             .env("SSP_NETWORK", "REGTEST")
             .env(
+                "SSP_INSTANT_MAX_OUTSTANDING_SATS",
+                optional_env("SSP_INSTANT_MAX_OUTSTANDING_SATS", "100000"),
+            )
+            .env(
+                "SSP_INSTANT_MAX_DEPOSIT_SATS",
+                optional_env("SSP_INSTANT_MAX_DEPOSIT_SATS", "10000"),
+            )
+            .env(
                 "COMPOSE_PROGRESS",
                 optional_env("COMPOSE_PROGRESS", "plain"),
             )

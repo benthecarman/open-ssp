@@ -22,7 +22,7 @@ financial operations return an explicit error before saving a request.
 | `transfers`, `user_request` | Supported for SSP-created records | Returns owner-scoped durable swap, Lightning, and withdrawal state |
 | `lightning_receive_quote` | Supported, zero fee | Issues a signed protobuf manifest and validates the wallet attestation, amount, recipient, network, expiry, and unique transfer ID |
 | `static_deposit_quote`, `claim_static_deposit` | Supported when configured | Values an owned unspent UTXO after three confirmations, commits the Spark payout through operator consensus, and broadcasts a signed Bitcoin recovery transaction |
-| Instant static-deposit operations | Unsupported | Returns `UNSUPPORTED_OPERATION`; no quote, claim, or payout is created |
+| Instant static-deposit operations | Implemented, opt-in | Signed quotes, immediate Spark credit, operator reservation, and confirmed Bitcoin recovery; bounded by configured limits |
 | Cooperative-exit operations and fee quotes | Supported when configured | Estimates Bitcoin fees, reserves a payout input, verifies the conditional Spark transfer, signs and broadcasts the payout, and recovers Spark leaves after confirmation |
 | `FetchCurrentUserToUserRequestsConnection` | Supported | Owner-scoped cursor pagination over durable requests, with type, status, and network filters |
 | Wallet webhook operations | Supported | Owner-scoped subscriptions and durable signed delivery with retries |
@@ -156,7 +156,33 @@ header is present, the quote reports `PARTNER_ATTRIBUTION_UNSUPPORTED` and
 still contains no partner fee. This SSP has no partner registry or token
 verification service; it does not claim to attribute a supplied token.
 
-Instant static deposits remain unimplemented. The pinned Breez schema defines
-their outputs as stubs. A full implementation needs a defined client API,
-operator reservation and later recovery, and a limit on funds advanced for
-unconfirmed deposits. Use the confirmed deposit flow above until then.
+Instant static deposits use `create_instant_static_deposit_quote` and
+`create_claim_instant_static_deposit`. The quote contains the real deposit
+value, recovery miner fee, signed credit amount, and one zero-confirmation
+fulfillment plan. A claim needs the wallet identity signature and the static
+address private key share. The server encrypts the share before storage.
+The operator reserves the static address and amount while it sends the Spark
+credit. This implementation pays the full quoted credit at once; it has no
+second payment after confirmation.
+
+Both `SSP_INSTANT_MAX_OUTSTANDING_SATS` and `SSP_INSTANT_MAX_DEPOSIT_SATS`
+must be nonzero. Both default to zero, which disables new advances. The
+outstanding limit counts Spark credit until the recovery transaction has
+three confirmations. Each owner can have one pending instant claim. An
+unconfirmed deposit must spend confirmed inputs. These limits bound the
+advance; they cannot prevent loss if the deposit is double-spent.
+
+Recovery starts after the deposit has one confirmation. A replacement with
+the same address and amount can satisfy the reservation. Missing deposits
+or replacements with a different amount keep the advance pending and keep
+its budget reserved. A timeout never creates another payout or releases the
+budget. Once a recovery signing plan is saved, retries use that exact plan.
+A reorganization after signing can therefore require operator investigation.
+The background worker continues recovery after restart, including when new
+advances have been disabled. Admin status reports outstanding credit and
+settlement history reports each pending recovery.
+
+The pinned Breez client has no high-level instant-deposit method. The Rust
+acceptance client uses the Spark wire contract to sign the claim; the
+unmodified Breez wallet receives the resulting Spark transfer and reads its
+standard static-deposit history. See [the acceptance test](../e2e/breez/src/instant.rs).

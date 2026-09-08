@@ -168,6 +168,7 @@ impl Db {
         .map_err(|e| e.to_string())?;
         crate::lightning_store::migrate(&conn)?;
         crate::static_deposits::migrate(&conn).map_err(|e| e.to_string())?;
+        crate::instant_deposits::migrate(&conn).map_err(|e| e.to_string())?;
         crate::internal_payments::migrate(&conn).map_err(|e| e.to_string())?;
         crate::history::migrate(&conn).map_err(|e| e.to_string())?;
         crate::webhooks::migrate(&conn).map_err(|e| e.to_string())?;

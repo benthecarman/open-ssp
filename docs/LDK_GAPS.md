@@ -139,8 +139,8 @@ These limitations are in the SSP and must not be attributed to `ldk-server`:
 
 - Fee-bearing receive quotes and automatic Spark liquidity replenishment
   are not implemented.
-- Instant static deposits return compatibility data but do not complete their
-  financial operations.
+- Instant static deposits require explicit advance limits and sufficient
+  Spark liquidity. Recovery does not replenish Spark liquidity automatically.
 
 Cooperative withdrawals use a dedicated Bitcoin Core wallet. The pinned
 `ldk-server` API can send Bitcoin, but it cannot prepare and sign a transaction

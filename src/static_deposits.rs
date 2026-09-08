@@ -47,17 +47,23 @@ pub struct DepositClaim {
     pub phase: String,
 }
 pub struct StaticDepositService {
-    db: Arc<Db>,
-    spark: Arc<SparkService>,
-    bitcoin: Arc<CoopExitService>,
-    network: String,
-    lock: tokio::sync::Mutex<()>,
+    pub(crate) db: Arc<Db>,
+    pub(crate) spark: Arc<SparkService>,
+    pub(crate) bitcoin: Arc<CoopExitService>,
+    pub(crate) network: String,
+    pub(crate) lock: tokio::sync::Mutex<()>,
+    pub(crate) instant_limit: u64,
+    pub(crate) instant_max_deposit: u64,
 }
 pub fn migrate(c: &rusqlite::Connection) -> rusqlite::Result<()> {
     c.execute_batch("CREATE TABLE IF NOT EXISTS deposit_quotes(txid TEXT NOT NULL,vout INTEGER NOT NULL,owner TEXT NOT NULL,expires INTEGER NOT NULL,data TEXT NOT NULL,PRIMARY KEY(txid,vout));
         CREATE TABLE IF NOT EXISTS deposit_claims(id TEXT PRIMARY KEY,txid TEXT NOT NULL,vout INTEGER NOT NULL,owner TEXT NOT NULL,status TEXT NOT NULL,data TEXT NOT NULL,last_error TEXT,UNIQUE(txid,vout));")
 }
-fn recovery_transaction(outpoint: OutPoint, credit: u64, destination: ScriptBuf) -> Transaction {
+pub(crate) fn recovery_transaction(
+    outpoint: OutPoint,
+    credit: u64,
+    destination: ScriptBuf,
+) -> Transaction {
     Transaction {
         version: Version(3),
         lock_time: LockTime::ZERO,
@@ -77,7 +83,7 @@ fn recovery_transaction(outpoint: OutPoint, credit: u64, destination: ScriptBuf)
 fn quote_response(quote: &DepositQuote) -> Value {
     json!({"__typename":"StaticDepositQuoteOutput","transaction_id":quote.txid,"output_index":quote.vout,"network":quote.network,"credit_amount_sats":quote.credit,"signature":quote.signature})
 }
-fn outpoint(input: &Value) -> Result<(String, u32), String> {
+pub(crate) fn outpoint(input: &Value) -> Result<(String, u32), String> {
     let txid = bitcoin::Txid::from_str(
         input["transaction_id"]
             .as_str()
@@ -93,7 +99,7 @@ fn outpoint(input: &Value) -> Result<(String, u32), String> {
     .map_err(|_| "invalid output index")?;
     Ok((txid, vout))
 }
-fn row<T: serde::de::DeserializeOwned>(r: &rusqlite::Row<'_>) -> rusqlite::Result<T> {
+pub(crate) fn row<T: serde::de::DeserializeOwned>(r: &rusqlite::Row<'_>) -> rusqlite::Result<T> {
     let text: String = r.get(0)?;
     serde_json::from_str(&text).map_err(|e| {
         rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
@@ -105,22 +111,26 @@ impl StaticDepositService {
         spark: Arc<SparkService>,
         bitcoin: Arc<CoopExitService>,
         network: String,
+        instant_limit: u64,
+        instant_max_deposit: u64,
     ) -> Arc<Self> {
         Arc::new(Self {
             db,
             spark,
             bitcoin,
             network,
+            instant_limit,
+            instant_max_deposit,
             lock: tokio::sync::Mutex::new(()),
         })
     }
-    fn validate_network(&self, input: &Value) -> Result<(), String> {
+    pub(crate) fn validate_network(&self, input: &Value) -> Result<(), String> {
         if input["network"].as_str().is_some_and(|n| n != self.network) {
             return Err("static deposit network mismatch".into());
         }
         Ok(())
     }
-    fn bitcoin_network(&self) -> Network {
+    pub(crate) fn bitcoin_network(&self) -> Network {
         match self.network.as_str() {
             "MAINNET" => Network::Bitcoin,
             "TESTNET" => Network::Testnet,
@@ -238,6 +248,7 @@ impl StaticDepositService {
         self.validate_network(input)?;
         let (txid, vout) = outpoint(input)?;
         let _guard = self.lock.lock().await;
+        let _liquidity = self.spark.deposit_liquidity_lock().await;
         let mut existing: Option<DepositClaim> = self
             .db
             .with(|c| {
@@ -317,7 +328,7 @@ impl StaticDepositService {
         if record.signed_spend.is_none() {
             let raw = self
                 .spark
-                .submit_static_claim(&record.quote, &record.transfer_id, &record.plan)
+                .submit_static_claim(&record.quote, &record.transfer_id, &record.plan, false)
                 .await?;
             record.signed_spend = Some(hex::encode(serialize(&raw)));
             record.phase = "SPEND_TX_CREATED".into();
@@ -371,6 +382,7 @@ impl StaticDepositService {
                 match records {
                     Ok(records) => {
                         for mut record in records {
+                            let _liquidity = self.spark.deposit_liquidity_lock().await;
                             if let Err(error) = self.advance(&mut record).await {
                                 tracing::warn!(
                                     request_id = record.id,

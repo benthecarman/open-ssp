@@ -385,12 +385,36 @@ fee. At the local fallback rate of 1 sat/vB, a 10,000-sat deposit credits
 
 The SSP needs enough Spark liquidity for the credit. For example, run
 `cargo regtest fund a 20000` before a 10,000-sat deposit to SSP A. The
-recovered Bitcoin does not automatically become new Spark leaves. Instant
-unconfirmed deposits remain unsupported.
+recovered Bitcoin does not automatically become new Spark leaves.
 
 The claim plan, signing nonce, transfer ID, and signed recovery transaction
 are saved before their dependent network calls. Pending claims resume after
 an SSP restart. Keep both the SSP database and operator databases.
+
+## Instant static deposits
+
+The Rust runner sets `SSP_INSTANT_MAX_OUTSTANDING_SATS=100000` and
+`SSP_INSTANT_MAX_DEPOSIT_SATS=10000` for its local fixture. You can override
+these environment variables. Outside the runner, both limits default to zero
+and new instant advances are disabled.
+
+The acceptance test stops the miner, sends a 2,000-sat static deposit, and
+claims 1,901 sats of Spark credit before any confirmation. It checks an
+invalid signature, another owner's claim, repeated requests, and an SSP
+restart. It then mines the deposit and checks the signed Bitcoin recovery.
+The test repeats this flow with a fee-bumped replacement deposit.
+
+The pinned Breez client has no high-level instant claim method. The test in
+[`e2e/breez/src/instant.rs`](../e2e/breez/src/instant.rs) signs the Spark
+instant-deposit contract with deterministic test keys and sends GraphQL
+requests. The unmodified Breez wallet receives the credit and reads history.
+Applications that want to initiate instant claims need this signing and API
+flow; a normal Breez static deposit still waits for confirmations.
+
+A pending advance remains counted against the limit until its recovery
+transaction has three confirmations. Recovery supports a replacement with
+the same address and value. A missing deposit or a different-value
+replacement remains pending. Use admin status and settlements to inspect it.
 
 ## Settlement operations
 

@@ -19,6 +19,7 @@ mod db;
 mod fs;
 mod graphql;
 mod history;
+mod instant_deposits;
 mod internal_payments;
 mod ldk;
 mod lightning_store;
@@ -82,6 +83,10 @@ async fn status(State(state): State<AppState>, headers: HeaderMap) -> impl IntoR
     }
     let backend = &state.ldk;
     let spark = state.spark.health().await;
+    let instant_outstanding = match &state.static_deposit {
+        Some(service) => service.instant_outstanding().await,
+        None => Err("static deposit service unavailable".to_owned()),
+    };
     (
         StatusCode::OK,
         Json(serde_json::json!({
@@ -90,6 +95,12 @@ async fn status(State(state): State<AppState>, headers: HeaderMap) -> impl IntoR
         "identity_source": "spark-wallet",
         "spark": spark.as_ref().ok(),
         "spark_error": spark.as_ref().err(),
+        "instant_deposits": {
+            "max_outstanding_sats": state.config.instant_max_outstanding_sats,
+            "max_deposit_sats": state.config.instant_max_deposit_sats,
+            "outstanding_sats": instant_outstanding.as_ref().ok(),
+            "error": instant_outstanding.as_ref().err(),
+        },
         "ldk_mode": "live",
         "ldk_node_id": backend.node_id,
         })),
@@ -173,7 +184,7 @@ async fn settlements(State(state): State<AppState>, headers: HeaderMap) -> impl 
         );
     }
     let result=state.db.with(|c| {
-        let mut stmt=c.prepare("SELECT request_id,kind,status,payment_id,last_error FROM lightning_sends WHERE status NOT IN ('SUCCEEDED','FAILED') UNION ALL SELECT id,'STATIC_DEPOSIT',status,NULL,last_error FROM deposit_claims WHERE status!='SUCCEEDED' UNION ALL SELECT l.request_id,'LIGHTNING_RECEIVE',COALESCE(p.status,'INVOICE_CREATED'),NULL,NULL FROM lightning_receives l LEFT JOIN receive_payments p ON p.hash=l.hash WHERE COALESCE(p.status,'INVOICE_CREATED') NOT IN ('TRANSFER_COMPLETED','HTLC_FAILED') UNION ALL SELECT id,'COOP_EXIT',status,NULL,NULL FROM coop_exits WHERE status NOT IN ('SUCCEEDED','EXPIRED') LIMIT 1000")?;
+        let mut stmt=c.prepare("SELECT request_id,kind,status,payment_id,last_error FROM lightning_sends WHERE status NOT IN ('SUCCEEDED','FAILED') UNION ALL SELECT id,'STATIC_DEPOSIT',status,NULL,last_error FROM deposit_claims WHERE status!='SUCCEEDED' UNION ALL SELECT id,'INSTANT_STATIC_DEPOSIT',phase,NULL,last_error FROM instant_claims WHERE phase!='SPEND_TX_CONFIRMED' UNION ALL SELECT l.request_id,'LIGHTNING_RECEIVE',COALESCE(p.status,'INVOICE_CREATED'),NULL,NULL FROM lightning_receives l LEFT JOIN receive_payments p ON p.hash=l.hash WHERE COALESCE(p.status,'INVOICE_CREATED') NOT IN ('TRANSFER_COMPLETED','HTLC_FAILED') UNION ALL SELECT id,'COOP_EXIT',status,NULL,NULL FROM coop_exits WHERE status NOT IN ('SUCCEEDED','EXPIRED') LIMIT 1000")?;
         let rows=stmt.query_map([],|r|Ok(serde_json::json!({"request_id":r.get::<_,String>(0)?,"kind":r.get::<_,String>(1)?,"state":r.get::<_,String>(2)?,"backend_payment_id":r.get::<_,Option<String>>(3)?,"last_error":r.get::<_,Option<String>>(4)?})))?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
     }).await;
@@ -410,10 +421,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             spark.clone(),
             bitcoin.clone(),
             config.network.clone(),
+            config.instant_max_outstanding_sats,
+            config.instant_max_deposit_sats,
         )
     });
     if let Some(service) = &static_deposit {
         tokio::spawn(service.clone().run());
+        tokio::spawn(service.clone().run_instant());
     }
     let backend = Arc::new(LdkGrpcBackend::connect(&config, db.clone(), spark.clone()).await?);
     tokio::spawn(LdkGrpcBackend::run_event_pump(backend.clone()));

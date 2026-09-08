@@ -49,6 +49,9 @@ pub struct Config {
     /// primaries settle only via SO expiry-return, so a restored user wallet
     /// could resurrect spent leaves inside the return window. 0 = no cap.
     pub max_swap_total_sats: u64,
+    /// Zero disables new advances; pending recoveries still run.
+    pub instant_max_outstanding_sats: u64,
+    pub instant_max_deposit_sats: u64,
 }
 
 impl Config {
@@ -92,6 +95,12 @@ impl Config {
             max_swap_total_sats: get("MAX_SWAP_TOTAL_SATS", "1000000")
                 .parse()
                 .unwrap_or(1000000),
+            instant_max_outstanding_sats: get("SSP_INSTANT_MAX_OUTSTANDING_SATS", "0")
+                .parse()
+                .unwrap_or(0),
+            instant_max_deposit_sats: get("SSP_INSTANT_MAX_DEPOSIT_SATS", "0")
+                .parse()
+                .unwrap_or(0),
         }
     }
 }

@@ -450,12 +450,26 @@ pub async fn dispatch(
                 json!({"claim_static_deposit":{"__typename":"ClaimStaticDepositOutput","transfer_id":service.claim(&owner,&input).await?}}),
             )
         }
-        "CreateInstantStaticDepositQuote"
-        | "create_instant_static_deposit_quote"
+        "CreateInstantStaticDepositQuote" | "create_instant_static_deposit_quote" => {
+            let owner = auth::require_session(&state, headers).await?;
+            let service = state.static_deposit.as_ref().ok_or(
+                "instant deposits require the Bitcoin wallet and private operator endpoints",
+            )?;
+            Ok(
+                json!({"create_instant_static_deposit_quote":service.instant_quote(&owner,&input).await?}),
+            )
+        }
+        "ClaimInstantStaticDeposit"
         | "CreateClaimInstantStaticDeposit"
         | "create_claim_instant_static_deposit" => {
-            auth::require_session(&state, headers).await?;
-            Err("UNSUPPORTED_OPERATION: instant static deposits are not implemented; use static_deposit_quote after 3 confirmations".into())
+            let owner = auth::require_session(&state, headers).await?;
+            let service = state
+                .static_deposit
+                .as_ref()
+                .ok_or("instant deposits are not configured")?;
+            Ok(
+                json!({"create_claim_instant_static_deposit":service.instant_claim(&owner,&input).await?}),
+            )
         }
         // ---- cooperative withdrawals ----
         "RequestCoopExit" | "request_coop_exit" => {
@@ -827,7 +841,7 @@ async fn user_request_union(state: &AppState, rec: &Value) -> Result<Value, Stri
         "COOP_EXIT" | "CLAIM_INSTANT_STATIC_DEPOSIT" => return Err(format!(
             "legacy request {id} has no settlement record; its transaction and fee data are unavailable"
         )),
-        "CLAIM_STATIC_DEPOSIT" => {
+        "CLAIM_STATIC_DEPOSIT" | "CLAIM_INSTANT_STATIC_DEPOSIT_V2" => {
             let amounts_known = ["credit_amount_sats", "deposit_amount_sats", "max_fee_sats"]
                 .iter().all(|key| p[*key].as_u64().is_some());
             if !amounts_known {

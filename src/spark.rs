@@ -521,6 +521,85 @@ impl SparkService {
             .map_err(|_| "invalid static deposit authorization".into())
     }
 
+    pub(crate) async fn deposit_liquidity_lock(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.liquidity_lock.lock().await
+    }
+
+    pub(crate) fn instant_authorization(
+        &self,
+        quote: &crate::static_deposits::DepositQuote,
+        secret: &str,
+        signature: &str,
+    ) -> Result<String, String> {
+        use bitcoin::secp256k1::{ecdsa::Signature, Message, PublicKey, Secp256k1, SecretKey};
+        if secret.len() != 64 {
+            return Err("invalid deposit key length".into());
+        }
+        let key = SecretKey::from_slice(&hex::decode(secret).map_err(|_| "invalid deposit key")?)
+            .map_err(|_| "invalid deposit key")?;
+        if hex::encode(PublicKey::from_secret_key(&Secp256k1::new(), &key).serialize())
+            != quote.signing_key
+        {
+            return Err("deposit key does not match the quoted address".into());
+        }
+        let digest = crate::instant_deposits::authorization_digest(quote)?;
+        let signature = hex::decode(signature).map_err(|_| "invalid user signature")?;
+        let signature = Signature::from_der(&signature)
+            .or_else(|_| Signature::from_compact(&signature))
+            .map_err(|_| "invalid user signature")?;
+        let owner = PublicKey::from_str(&quote.owner).map_err(|_| "invalid deposit owner")?;
+        Secp256k1::verification_only()
+            .verify_ecdsa(&Message::from_digest(digest), &signature, &owner)
+            .map_err(|_| "invalid instant deposit authorization")?;
+        utils::ecies::encrypt(&self.identity.serialize(), &key.secret_bytes())
+            .map(hex::encode)
+            .map_err(|_| "cannot encrypt deposit key".into())
+    }
+
+    /// The caller holds the liquidity lock across preparation, persistence and submission.
+    pub(crate) async fn submit_instant_reserve(
+        &self,
+        quote: &crate::static_deposits::DepositQuote,
+        transfer_id: &str,
+        plan: &crate::static_deposits::StaticPlan,
+    ) -> Result<(), String> {
+        use ::spark::operator::rpc::spark_ssp_internal::{
+            ReserveInstantDepositRequest, StaticDepositSwapRequest,
+        };
+        use prost::Message;
+        let req =
+            StaticDepositSwapRequest::decode(plan.request.as_slice()).map_err(|e| e.to_string())?;
+        let response = self
+            .private_pool
+            .as_ref()
+            .ok_or("private SSP operator endpoints required")?
+            .get_coordinator()
+            .client
+            .reserve_instant_deposit(ReserveInstantDepositRequest {
+                on_chain_utxo: req.on_chain_utxo,
+                ssp_signature: req.ssp_signature,
+                user_signature: req.user_signature,
+                transfer: req.transfer,
+                destination_address: quote.address.clone(),
+                value_sats: (quote.credit + quote.fee) as i64,
+                credit_amount_sats: quote.credit as i64,
+            })
+            .await
+            .map_err(|e| e.to_string())?;
+        let transfer = response
+            .transfer
+            .ok_or("operator returned no instant deposit transfer")?;
+        if transfer.id != transfer_id
+            || transfer.total_value != quote.credit
+            || transfer.sender_identity_public_key != self.identity.serialize()
+            || transfer.receiver_identity_public_key
+                != hex::decode(&quote.owner).map_err(|e| e.to_string())?
+        {
+            return Err("operator returned a different instant deposit transfer".into());
+        }
+        Ok(())
+    }
+
     pub async fn prepare_static_claim(
         &self,
         quote: &crate::static_deposits::DepositQuote,
@@ -537,7 +616,6 @@ impl SparkService {
             signer::Signer,
         };
         use prost::Message;
-        let _guard = self.liquidity_lock.lock().await;
         self.wallet.sync().await.map_err(|e| e.to_string())?;
         self.ensure_exact_liquidity(quote.credit).await?;
         let leaves = self
@@ -613,6 +691,7 @@ impl SparkService {
         quote: &crate::static_deposits::DepositQuote,
         transfer_id: &str,
         plan: &crate::static_deposits::StaticPlan,
+        instant: bool,
     ) -> Result<Transaction, String> {
         use ::spark::{
             operator::rpc::spark_ssp_internal::StaticDepositSwapRequest,
@@ -623,22 +702,32 @@ impl SparkService {
             },
         };
         use prost::Message;
-        let _guard = self.liquidity_lock.lock().await;
         let req =
             StaticDepositSwapRequest::decode(plan.request.as_slice()).map_err(|e| e.to_string())?;
         let job = req
             .spend_tx_signing_job
             .clone()
             .ok_or("deposit plan lacks signing job")?;
-        let response = self
+        let client = &self
             .private_pool
             .as_ref()
             .ok_or("private SSP operator endpoints required")?
             .get_coordinator()
-            .client
-            .initiate_static_deposit_swap(req)
-            .await
-            .map_err(|e| e.to_string())?;
+            .client;
+        let response = if instant {
+            client
+                .recover_instant_deposit(
+                    ::spark::operator::rpc::spark_ssp_internal::RecoverInstantDepositRequest {
+                        on_chain_utxo: req.on_chain_utxo,
+                        spend_tx_signing_job: Some(job.clone()),
+                        transfer_id: transfer_id.into(),
+                    },
+                )
+                .await
+        } else {
+            client.initiate_static_deposit_swap(req).await
+        }
+        .map_err(|e| e.to_string())?;
         let transfer = response
             .transfer
             .ok_or("operator returned no static deposit transfer")?;

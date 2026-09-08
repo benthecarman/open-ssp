@@ -328,6 +328,8 @@ services:
       SSP_NETWORK: ${SSP_NETWORK:-REGTEST}
       SSP_DATA_DIR: /data
       SSP_PUBLIC_URL: http://ssp:5000
+      SSP_INSTANT_MAX_OUTSTANDING_SATS: ${SSP_INSTANT_MAX_OUTSTANDING_SATS:-0}
+      SSP_INSTANT_MAX_DEPOSIT_SATS: ${SSP_INSTANT_MAX_DEPOSIT_SATS:-0}
       COOP_BITCOIN_RPC_URL: http://bitcoind:8332/wallet/ssp-withdrawals
       COOP_BITCOIN_RPC_USER: testutil
       COOP_BITCOIN_RPC_PASSWORD: testutilpassword
@@ -381,6 +383,8 @@ services:
       SSP_NETWORK: REGTEST
       SSP_DATA_DIR: /data
       SSP_PUBLIC_URL: http://ssp-2:5000
+      SSP_INSTANT_MAX_OUTSTANDING_SATS: ${SSP_INSTANT_MAX_OUTSTANDING_SATS:-0}
+      SSP_INSTANT_MAX_DEPOSIT_SATS: ${SSP_INSTANT_MAX_DEPOSIT_SATS:-0}
       SPARK_MNEMONIC_FILE: /data/spark.mnemonic
       SO_HOSTS: spark-operator-0.minikube.local:8535,spark-operator-1.minikube.local:8535,spark-operator-2.minikube.local:8535
       SO_IDENTITY_PUBKEYS: 0322ca18fc489ae25418a0e768273c2c61cabb823edfb14feb891e9bec62016510,0341727a6c41b168f07eb50865ab8c397a53c7eef628ac1020956b705e43b6cb27,0305ab8d485cc752394de4981f8a5ae004f2becfea6f432c9a59d5022d8764f0a6

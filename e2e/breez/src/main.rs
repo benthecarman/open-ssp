@@ -1,3 +1,4 @@
+mod instant;
 mod regtest;
 
 use std::{env, path::PathBuf, time::Duration};
@@ -60,6 +61,7 @@ struct Wallet {
     _storage: TempDir,
     ssp_url: &'static str,
     ldk: LdkClient,
+    seed_byte: u8,
 }
 
 fn optional_env(name: &str, default: &str) -> String {
@@ -445,6 +447,7 @@ async fn connect_wallet(
         _storage: storage,
         ssp_url,
         ldk,
+        seed_byte,
     })
 }
 
@@ -1317,7 +1320,7 @@ async fn static_deposit(client: &Client, config: &TestConfig, wallet: &Wallet) -
             Some(&session),
             operation,
             json!({}),
-            "unsupported_operation",
+            "required",
         )
         .await?;
     }
@@ -1331,7 +1334,7 @@ async fn static_deposit(client: &Client, config: &TestConfig, wallet: &Wallet) -
         "partner header was ignored: {quote}"
     );
     println!(
-        "PASS static deposit: 9901 sats credited, recovery confirmed, stable metadata; instant stubs rejected"
+        "PASS static deposit: 9901 sats credited, recovery confirmed, stable metadata; malformed instant requests rejected"
     );
     command_output("docker", &["start", miner_container.trim()]).await?;
     Ok(())
@@ -1871,6 +1874,9 @@ async fn run(
     static_deposit(client, config, wallet_c)
         .await
         .context("static deposit failed")?;
+    instant::run(client, config, wallet_c, wallet_a)
+        .await
+        .context("instant deposit failed")?;
     println!("pay between two wallets on one SSP");
     pay_internal(client, config, wallet_a, wallet_c, config.send_amount_sats)
         .await
