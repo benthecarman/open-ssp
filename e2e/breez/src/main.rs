@@ -349,6 +349,8 @@ fn local_config(
     sdk_config.api_key = None;
     sdk_config.lnurl_domain = None;
     sdk_config.sync_interval_secs = 2;
+    // Tests submit deposit claims explicitly so background sync cannot race assertions.
+    sdk_config.max_deposit_claim_fee = None;
     sdk_config.real_time_sync_server_url = None;
     sdk_config.prefer_spark_over_lightning = false;
     sdk_config.use_default_external_input_parsers = false;
@@ -956,6 +958,7 @@ async fn bootstrap_wallet(
         .sdk
         .receive_payment(ReceivePaymentRequest {
             payment_method: ReceivePaymentMethod::Bolt11Invoice {
+                receiver_identity_public_key: None,
                 description: "breez-bootstrap-receive".to_string(),
                 amount_sats: Some(amount_sats),
                 expiry_secs: Some(300),
@@ -1009,6 +1012,7 @@ async fn pay_between(
         .sdk
         .receive_payment(ReceivePaymentRequest {
             payment_method: ReceivePaymentMethod::Bolt11Invoice {
+                receiver_identity_public_key: None,
                 description: format!("breez-{label}"),
                 amount_sats: Some(amount_sats),
                 expiry_secs: Some(300),
@@ -1193,11 +1197,6 @@ async fn static_deposit(client: &Client, config: &TestConfig, wallet: &Wallet) -
     let txid = bitcoin_rpc(client, config, "sendtoaddress", json!([address, 0.0001])).await?;
     let miner = bitcoin_rpc(client, config, "getnewaddress", json!([])).await?;
     bitcoin_rpc(client, config, "generatetoaddress", json!([3, miner])).await?;
-    // The unmodified SDK observes the confirmed output and requests its claim.
-    poll("static on-chain deposit credited", config.timeout, || {
-        exact_balance(wallet, before + 10_000 - 99)
-    })
-    .await?;
     let tx = bitcoin_rpc(client, config, "getrawtransaction", json!([txid, true])).await?;
     let vout = tx["vout"]
         .as_array()
@@ -1207,6 +1206,45 @@ async fn static_deposit(client: &Client, config: &TestConfig, wallet: &Wallet) -
         .context("deposit output missing")?["n"]
         .as_u64()
         .context("deposit output index missing")?;
+    poll(
+        "confirmed deposit visible to Breez",
+        config.timeout,
+        || async {
+            let quote = wallet
+                .sdk
+                .fetch_claim_deposit_quote(breez_sdk_spark::FetchClaimDepositQuoteRequest {
+                    txid: txid.as_str().context("missing txid")?.to_owned(),
+                    vout: vout as u32,
+                })
+                .await?;
+            ensure!(
+                quote.confirmations >= 3,
+                "Breez chain index has not caught up with mined blocks"
+            );
+            Ok(())
+        },
+    )
+    .await?;
+    poll("Breez confirmed deposit claim", config.timeout, || async {
+        let claimed = wallet
+            .sdk
+            .claim_deposit(breez_sdk_spark::ClaimDepositRequest {
+                txid: txid.as_str().context("missing txid")?.to_owned(),
+                vout: vout as u32,
+                max_fee: Some(breez_sdk_spark::MaxFee::Fixed { amount: 99 }),
+            })
+            .await?;
+        ensure!(
+            claimed.payment.is_some(),
+            "confirmed deposit used the instant claim path"
+        );
+        Ok(())
+    })
+    .await?;
+    poll("static on-chain deposit credited", config.timeout, || {
+        exact_balance(wallet, before + 10_000 - 99)
+    })
+    .await?;
     let coin = bitcoin_rpc(client, config, "gettxout", json!([txid, vout, true])).await?;
     ensure!(
         coin.is_null(),
@@ -1292,6 +1330,7 @@ async fn pay_internal(
         .sdk
         .receive_payment(ReceivePaymentRequest {
             payment_method: ReceivePaymentMethod::Bolt11Invoice {
+                receiver_identity_public_key: None,
                 description: "breez-internal-ssp-payment".to_string(),
                 amount_sats: Some(amount_sats),
                 expiry_secs: Some(300),
@@ -1614,6 +1653,7 @@ async fn missed_receive(
         .sdk
         .receive_payment(ReceivePaymentRequest {
             payment_method: ReceivePaymentMethod::Bolt11Invoice {
+                receiver_identity_public_key: None,
                 description: "missed-event".into(),
                 amount_sats: Some(amount),
                 expiry_secs: Some(300),

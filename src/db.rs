@@ -59,6 +59,23 @@ fn ensure_column(
     Ok(())
 }
 
+fn migrate_challenges(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
+    let primary_columns: u32 = conn.query_row(
+        "SELECT count(*) FROM pragma_table_info('challenges') WHERE pk>0",
+        [],
+        |r| r.get(0),
+    )?;
+    if primary_columns == 1 {
+        let tx = conn.unchecked_transaction()?;
+        tx.execute_batch("ALTER TABLE challenges RENAME TO legacy_challenges;
+            CREATE TABLE challenges(identity TEXT NOT NULL, protected TEXT NOT NULL, issued_at TEXT NOT NULL, PRIMARY KEY(identity,protected));
+            INSERT INTO challenges SELECT identity,protected,issued_at FROM legacy_challenges;
+            DROP TABLE legacy_challenges;")?;
+        tx.commit()?;
+    }
+    Ok(())
+}
+
 impl Db {
     pub fn open(data_dir: &str) -> Result<Self, String> {
         std::fs::create_dir_all(data_dir).map_err(|e| e.to_string())?;
@@ -80,7 +97,7 @@ impl Db {
         )
         .map_err(|e| e.to_string())?;
         conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS challenges(identity TEXT PRIMARY KEY, protected TEXT NOT NULL, issued_at TEXT NOT NULL);
+            "CREATE TABLE IF NOT EXISTS challenges(identity TEXT NOT NULL, protected TEXT NOT NULL, issued_at TEXT NOT NULL, PRIMARY KEY(identity,protected));
              CREATE TABLE IF NOT EXISTS sessions(token TEXT PRIMARY KEY, identity TEXT NOT NULL, valid_until TEXT NOT NULL);
              CREATE TABLE IF NOT EXISTS requests(id TEXT PRIMARY KEY, kind TEXT NOT NULL, owner TEXT NOT NULL, created_at TEXT NOT NULL, payload TEXT NOT NULL);
              CREATE TABLE IF NOT EXISTS transfers(spark_id TEXT PRIMARY KEY, request_id TEXT NOT NULL, kind TEXT NOT NULL, status TEXT NOT NULL);
@@ -166,6 +183,7 @@ impl Db {
             [],
         )
         .map_err(|e| e.to_string())?;
+        migrate_challenges(&conn).map_err(|e| e.to_string())?;
         crate::lightning_store::migrate(&conn)?;
         crate::static_deposits::migrate(&conn).map_err(|e| e.to_string())?;
         crate::instant_deposits::migrate(&conn).map_err(|e| e.to_string())?;
@@ -198,18 +216,22 @@ impl Db {
         now: &str,
     ) -> Result<(), String> {
         self.with(|c| {
-            c.execute(
+            let tx = c.unchecked_transaction()?;
+            tx.execute(
                 "INSERT INTO challenges(identity,protected,issued_at) VALUES(?1,?2,?3)
-                 ON CONFLICT(identity) DO UPDATE SET protected=excluded.protected, issued_at=excluded.issued_at",
+                 ON CONFLICT(identity,protected) DO NOTHING",
                 (identity, protected, now),
-            )
-            .map(|_| ())
+            )?;
+            // Bound outstanding challenges without disrupting normal parallel auth.
+            tx.execute("DELETE FROM challenges WHERE identity=?1 AND protected NOT IN
+                (SELECT protected FROM challenges WHERE identity=?1 ORDER BY issued_at DESC,rowid DESC LIMIT 100)", [identity])?;
+            tx.commit()
         })
         .await
     }
 
-    /// Atomically consume a challenge: returns true only if the stored
-    /// challenge matches and is younger than `max_age_secs`. Always deletes.
+    /// Atomically consume only the exact challenge for this identity.
+    /// Other concurrent challenges remain valid; each issued value is single-use.
     pub async fn consume_challenge(
         &self,
         identity: &str,
@@ -217,29 +239,20 @@ impl Db {
         now_epoch_secs: i64,
         max_age_secs: i64,
     ) -> Result<bool, String> {
-        let row: Option<(String, String)> = self
+        let issued_at: Option<String> = self
             .with(|conn| {
-                let row = conn
-                    .query_row(
-                        "SELECT protected, issued_at FROM challenges WHERE identity=?1",
-                        (identity,),
-                        |r| Ok((r.get(0)?, r.get(1)?)),
-                    )
-                    .map(Some)
-                    .or_else(|e| match e {
-                        rusqlite::Error::QueryReturnedNoRows => Ok(None),
-                        e => Err(e),
-                    })?;
-                conn.execute("DELETE FROM challenges WHERE identity=?1", (identity,))?;
-                Ok(row)
+                use rusqlite::OptionalExtension;
+                conn.query_row(
+                    "DELETE FROM challenges WHERE identity=?1 AND protected=?2 RETURNING issued_at",
+                    (identity, protected),
+                    |r| r.get(0),
+                )
+                .optional()
             })
             .await?;
-        let Some((stored, issued_at)) = row else {
+        let Some(issued_at) = issued_at else {
             return Ok(false);
         };
-        if stored != protected {
-            return Ok(false);
-        }
         let issued = chrono::DateTime::parse_from_rfc3339(&issued_at)
             .map(|d| d.timestamp())
             .unwrap_or(0);
@@ -1461,6 +1474,80 @@ mod tests {
     fn test_db() -> (Db, PathBuf) {
         let dir = std::env::temp_dir().join(format!("open-ssp-{}", uuid::Uuid::new_v4()));
         (Db::open(dir.to_str().unwrap()).unwrap(), dir)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn parallel_challenges_do_not_invalidate_each_other() {
+        let (db, dir) = test_db();
+        let now = chrono::Utc::now();
+        let issued = now.to_rfc3339();
+        let (a, b) = tokio::join!(
+            db.save_challenge("owner", "first", &issued),
+            db.save_challenge("owner", "second", &issued)
+        );
+        a.unwrap();
+        b.unwrap();
+        assert!(!db
+            .consume_challenge("owner", "wrong", now.timestamp(), 300)
+            .await
+            .unwrap());
+        assert!(!db
+            .consume_challenge("other", "first", now.timestamp(), 300)
+            .await
+            .unwrap());
+        let (a, b) = tokio::join!(
+            db.consume_challenge("owner", "first", now.timestamp(), 300),
+            db.consume_challenge("owner", "second", now.timestamp(), 300)
+        );
+        assert!(a.unwrap());
+        assert!(b.unwrap());
+        assert!(!db
+            .consume_challenge("owner", "first", now.timestamp(), 300)
+            .await
+            .unwrap());
+        db.save_challenge("owner", "third", &issued).await.unwrap();
+        let (a, b) = tokio::join!(
+            db.consume_challenge("owner", "third", now.timestamp(), 300),
+            db.consume_challenge("owner", "third", now.timestamp(), 300)
+        );
+        assert_ne!(
+            a.unwrap(),
+            b.unwrap(),
+            "only one parallel verification may succeed"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn challenge_migration_preserves_issued_values_without_restoring_replays() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE challenges(identity TEXT PRIMARY KEY,protected TEXT NOT NULL,issued_at TEXT NOT NULL);").unwrap();
+        let now = chrono::Utc::now();
+        conn.execute(
+            "INSERT INTO challenges VALUES('owner','old',?1)",
+            [now.to_rfc3339()],
+        )
+        .unwrap();
+        migrate_challenges(&conn).unwrap();
+        let db = Db {
+            inner: Arc::new(Mutex::new(conn)),
+        };
+        db.save_challenge("owner", "new", &now.to_rfc3339())
+            .await
+            .unwrap();
+        assert!(db
+            .consume_challenge("owner", "old", now.timestamp(), 300)
+            .await
+            .unwrap());
+        db.with(migrate_challenges).await.unwrap();
+        assert!(!db
+            .consume_challenge("owner", "old", now.timestamp(), 300)
+            .await
+            .unwrap());
+        assert!(db
+            .consume_challenge("owner", "new", now.timestamp(), 300)
+            .await
+            .unwrap());
     }
 
     #[tokio::test(flavor = "multi_thread")]

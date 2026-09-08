@@ -13,8 +13,8 @@ or call the JavaScript Spark SDK.
 | Leaf swaps | `prepare_send_payment`, `send_payment` | Partial sends, split after restart, preserved balances, actual refund transactions and signatures |
 | BOLT11 | `receive_payment`, `send_payment` | Both SSP directions, same-SSP settlement, preimages, exact credit, send replay, invalid and unfunded requests, invoice expiry |
 | Missed receive | SDK invoice and sync | Pay while SSP is stopped; recover after restart without another payout |
-| Confirmed static deposits | `receive_payment`, SDK request history | Credit, Bitcoin recovery, real fees, phase changes, stable timestamps |
-| Instant static deposits | `get_instant_deposit_quote`, `claim_instant_deposit` | Zero-confirmation credit, wrong owner, changed quote, restart replay, same-amount replacement recovery |
+| Confirmed static deposits | `receive_payment`, `claim_deposit`, SDK request history | Credit, Bitcoin recovery, real fees, phase changes, stable timestamps |
+| Instant static deposits | Upstream `fetch_claim_deposit_quote`, `claim_deposit`; lower-level SDK wrappers for negative/replay checks | Zero-confirmation credit, wrong owner, changed quote, restart replay, same-amount replacement recovery |
 | Cooperative withdrawals | `prepare_send_payment`, `send_payment`, SDK completion | Real payout, recovery, restart, completion replay |
 | Withdrawal fee bump | SDK withdrawal plus admin fee bump | One CPFP child, bounded fee, retry keeps child ID, original payout preserved |
 | BOLT12 | SDK Spark payment plus `ServiceProvider` offer methods | Prepayment, send, receive, request status, Spark balances, LDK settlement |

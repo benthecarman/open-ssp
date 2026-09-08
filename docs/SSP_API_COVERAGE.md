@@ -12,7 +12,7 @@ financial operations return an explicit error before saving a request.
 
 | Operation | Status | Current behavior |
 |---|---|---|
-| `get_challenge`, `verify_challenge` | Supported | Single-use five-minute challenge and durable 24-hour session |
+| `get_challenge`, `verify_challenge` | Supported | Wallet-bound protobuf challenges, concurrent authentication, single-use five-minute expiry, and durable 24-hour sessions |
 | `leaves_swap_fee_estimate` | Supported | Returns zero; startup rejects a nonzero `SSP_SWAP_FEE_SATS` |
 | `request_swap` | Supported and tested | Verifies the funded outbound transfer and completes an atomic Swap V3 counter transfer from exact SSP leaves |
 | `request_lightning_send` | BOLT11 and BOLT12 supported and tested | BOLT11 uses a preimage swap. BOLT12 verifies a completed Spark prepayment, tracks the LDK payment, and returns the prepayment after a final failure. |
@@ -182,8 +182,9 @@ The background worker continues recovery after restart, including when new
 advances have been disabled. Admin status reports outstanding credit and
 settlement history reports each pending recovery.
 
-The pinned Breez fork exposes `get_instant_deposit_quote` and
-`claim_instant_deposit`. The SDK authenticates and signs with the wallet's
-configured signer. The Rust acceptance client calls these public methods.
+The pinned Breez fork includes upstream instant deposits from PR #1012.
+The Rust acceptance client calls `fetch_claim_deposit_quote` and `claim_deposit`.
+Upstream authenticates, signs, and encrypts the deposit key. Thin lower-level
+wrappers support changed-quote and replay checks.
 It also uses `service_provider()` for typed SSP history, BOLT12, and replay
 operations. See [E2E coverage](E2E_COVERAGE.md) for the remaining coverage gaps.

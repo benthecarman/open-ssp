@@ -303,13 +303,14 @@ impl StaticDepositService {
             self.instant_max_deposit,
             self.instant_limit,
         )?;
-        let secret = input["static_deposit_address_private_key_share"]
-            .as_str()
-            .ok_or("deposit key share required")?;
+        let secret = input["static_deposit_address_private_key_share"].as_str();
+        let encrypted = input["encrypted_static_deposit_address_private_key_share"].as_str();
         let signature = input["signature"]
             .as_str()
             .ok_or("instant deposit signature required")?;
-        let encrypted = self.spark.instant_authorization(q, secret, signature)?;
+        let encrypted = self
+            .spark
+            .instant_authorization(q, secret, encrypted, signature)?;
         // Recheck the exact output before the first advance. Later RBF changes
         // are handled by recovery; they never authorize another advance.
         let coin = self

@@ -63,12 +63,19 @@ that update those pins. Use `git submodule status` to inspect the revisions.
 See [the source dependency notes](../e2e/upstream/README.md) for updates.
 
 Both the end-client test and the SSP use the `vendor/breez-sdk` submodule.
-It is based on upstream `c7eecfe670798a8b8332ce412044cbd49123687a` and adds
-private SSP operator calls, public Rust instant-deposit methods, and typed
-SSP request-history and BOLT12 methods. The test consumes this source through
-a Cargo path dependency; the parent repository's gitlink pins its revision.
-Clients need this fork for the added methods. Standard BOLT11 and confirmed
-static-deposit clients can continue using the upstream revision.
+It is based on Breez `main` at
+`a3fac0e8f1f38e7e3dca110a22f37dd3264e2bde`, which includes upstream
+instant-deposit support from PR #1012. The fork retains the SSP counter-transfer,
+leaf-splitting, and private operator APIs, plus Rust request-history and BOLT12
+extensions. The test consumes this source through a Cargo path dependency;
+the parent repository's gitlink pins its revision. The SSP issues the protobuf
+authentication challenge required by current Breez clients.
+
+The earlier `c7eecfe` pin was itself a fork commit, with four SSP patches. All
+nine fork commits were included in the rebase. Standard clients can use
+upstream's `fetch_claim_deposit_quote` and `claim_deposit`; the test also uses
+fork wrappers around upstream's lower-level quote/claim methods for negative
+and replay checks.
 
 ## 3. Start the development stack
 
@@ -406,11 +413,16 @@ invalid signature, another owner's claim, repeated requests, and an SSP
 restart. It then mines the deposit and checks the signed Bitcoin recovery.
 The test repeats this flow with a fee-bumped replacement deposit.
 
-The fork provides `BreezSdk::get_instant_deposit_quote` and
-`BreezSdk::claim_instant_deposit`. Authentication, key derivation, and signing
-remain inside the SDK. The test in
-[`e2e/breez/src/instant.rs`](../e2e/breez/src/instant.rs) calls those methods.
-A normal Breez static deposit still waits for confirmations.
+The test uses upstream `BreezSdk::fetch_claim_deposit_quote` and
+`BreezSdk::claim_deposit` for the normal instant-claim flow. Thin fork wrappers
+around upstream's lower-level deposit service let the test change a quote and
+replay a saved claim. Upstream owns authentication, quote validation, signing,
+and deposit-key encryption. The SSP accepts that encrypted key share and
+retains support for the older raw-key field.
+
+The fixture disables automatic deposit claims and supplies an explicit fee cap
+when it calls `claim_deposit`. This keeps background sync from racing the
+negative checks. See [the acceptance test](../e2e/breez/src/instant.rs).
 
 A pending advance remains counted against the limit until its recovery
 transaction has three confirmations. Recovery supports a replacement with

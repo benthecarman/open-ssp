@@ -63,10 +63,11 @@ pub async fn run(
             .find(|v| v["scriptPubKey"]["address"] == address)
             .context("deposit output missing")?["n"]
             .clone();
+        let transaction_hex = tx["hex"].as_str().context("missing transaction hex")?;
         let quote = wallet
             .sdk
             .get_instant_deposit_quote(
-                txid.as_str().context("missing txid")?,
+                transaction_hex,
                 vout.as_u64().context("missing vout")? as u32,
             )
             .await?;
@@ -77,7 +78,11 @@ pub async fn run(
         ensure!(
             other
                 .sdk
-                .claim_instant_deposit(quote.quote.clone())
+                .claim_instant_deposit(
+                    transaction_hex,
+                    quote.quote.clone(),
+                    quote.fulfillment_plans[0].clone()
+                )
                 .await
                 .is_err(),
             "another wallet claimed the quote"
@@ -85,14 +90,52 @@ pub async fn run(
         let mut changed = quote.quote.clone();
         changed.credit_amount.original_value += 1;
         ensure!(
-            wallet.sdk.claim_instant_deposit(changed).await.is_err(),
+            wallet
+                .sdk
+                .claim_instant_deposit(transaction_hex, changed, quote.fulfillment_plans[0].clone())
+                .await
+                .is_err(),
             "changed quote was accepted"
+        );
+        let display = poll("upstream instant deposit quote", config.timeout, || async {
+            Ok(wallet
+                .sdk
+                .fetch_claim_deposit_quote(breez_sdk_spark::FetchClaimDepositQuoteRequest {
+                    txid: txid.as_str().context("missing txid")?.to_owned(),
+                    vout: vout.as_u64().context("missing vout")? as u32,
+                })
+                .await?)
+        })
+        .await?;
+        ensure!(
+            display.confirmations == 0
+                && display
+                    .instant
+                    .as_ref()
+                    .is_some_and(|q| q.credit_amount_sats == 1901),
+            "upstream quote missing zero-confirmation credit"
+        );
+        let submitted = wallet
+            .sdk
+            .claim_deposit(breez_sdk_spark::ClaimDepositRequest {
+                txid: txid.as_str().context("missing txid")?.to_owned(),
+                vout: vout.as_u64().context("missing vout")? as u32,
+                max_fee: Some(breez_sdk_spark::MaxFee::Fixed { amount: 99 }),
+            })
+            .await?;
+        ensure!(
+            submitted.payment.is_none(),
+            "instant claim should settle asynchronously"
         );
         let claim = wallet
             .sdk
-            .claim_instant_deposit(quote.quote.clone())
+            .claim_instant_deposit(
+                transaction_hex,
+                quote.quote.clone(),
+                quote.fulfillment_plans[0].clone(),
+            )
             .await?;
-        let id = claim.claim_id.clone();
+        let id = claim.clone();
         poll("instant Spark advance", config.timeout, || {
             exact_balance(wallet, before + 1901)
         })
@@ -104,7 +147,11 @@ pub async fn run(
         );
         let replay = wallet
             .sdk
-            .claim_instant_deposit(quote.quote.clone())
+            .claim_instant_deposit(
+                transaction_hex,
+                quote.quote.clone(),
+                quote.fulfillment_plans[0].clone(),
+            )
             .await?;
         ensure!(claim == replay, "instant replay changed the claim ID");
         if replace {
@@ -131,7 +178,11 @@ pub async fn run(
         .await?;
         let replay = wallet
             .sdk
-            .claim_instant_deposit(quote.quote.clone())
+            .claim_instant_deposit(
+                transaction_hex,
+                quote.quote.clone(),
+                quote.fulfillment_plans[0].clone(),
+            )
             .await?;
         ensure!(claim == replay, "restart created a different instant claim");
         exact_balance(wallet, before + 1901).await?;

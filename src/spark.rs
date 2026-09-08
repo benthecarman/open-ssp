@@ -191,7 +191,7 @@ impl SparkService {
         }
         if transfer.status != TransferStatus::Completed {
             self.wallet
-                .process_transfer(&transfer)
+                .process_transfer(transfer)
                 .await
                 .map_err(|error| error.to_string())?;
         }
@@ -528,15 +528,12 @@ impl SparkService {
     pub(crate) fn instant_authorization(
         &self,
         quote: &crate::static_deposits::DepositQuote,
-        secret: &str,
+        secret: Option<&str>,
+        encrypted: Option<&str>,
         signature: &str,
     ) -> Result<String, String> {
-        use bitcoin::secp256k1::{ecdsa::Signature, Message, PublicKey, Secp256k1, SecretKey};
-        if secret.len() != 64 {
-            return Err("invalid deposit key length".into());
-        }
-        let key = SecretKey::from_slice(&hex::decode(secret).map_err(|_| "invalid deposit key")?)
-            .map_err(|_| "invalid deposit key")?;
+        use bitcoin::secp256k1::{ecdsa::Signature, Message, PublicKey, Secp256k1};
+        let key = decode_instant_deposit_key(&self.identity_secret, secret, encrypted)?;
         if hex::encode(PublicKey::from_secret_key(&Secp256k1::new(), &key).serialize())
             != quote.signing_key
         {
@@ -806,6 +803,15 @@ impl SparkService {
             .map_err(|_| "deposit recovery signature is invalid")?;
         spend.input[0].witness.push(bytes);
         Ok(spend)
+    }
+
+    pub(crate) fn authentication_challenge_mac(&self, challenge: &[u8]) -> Vec<u8> {
+        use hmac::{Hmac, Mac};
+        let mut mac = Hmac::<Sha256>::new_from_slice(&self.identity_secret.secret_bytes())
+            .expect("HMAC accepts a 32-byte key");
+        mac.update(b"open-ssp-auth-challenge-v1");
+        mac.update(challenge);
+        mac.finalize().into_bytes().to_vec()
     }
 
     pub fn sign_digest(&self, digest: [u8; 32]) -> String {
@@ -1576,7 +1582,7 @@ impl SparkService {
                             }
                         },
                         Ok(Some(transfer)) if matches!(transfer.status,TransferStatus::SenderKeyTweaked | TransferStatus::ReceiverKeyTweaked | TransferStatus::ReceiverRefundSigned) => {
-                            if let Err(error) = self.wallet.process_transfer(&transfer).await { tracing::debug!(%id,%error,"swap claim will retry"); }
+                            if let Err(error) = self.wallet.process_transfer(transfer).await { tracing::debug!(%id,%error,"swap claim will retry"); }
                         },
                         Ok(_) => {},
                         Err(error) => tracing::debug!(%id,%error,"swap history lookup will retry"),
@@ -1603,7 +1609,7 @@ impl SparkService {
                             | TransferStatus::ReceiverRefundSigned
                     ) =>
                 {
-                    match self.wallet.process_transfer(&transfer).await {
+                    match self.wallet.process_transfer(transfer).await {
                         Ok(_) => return,
                         Err(error) => tracing::warn!(%error, %primary_id, "swap claim retry"),
                     }
@@ -2041,8 +2047,65 @@ fn deterministic_transfer_id(source: &[u8]) -> Result<TransferId, String> {
     Ok(TransferId::from_bytes(bytes))
 }
 
+// Both fields are accepted for older clients, but they cannot be combined.
+fn decode_instant_deposit_key(
+    identity: &bitcoin::secp256k1::SecretKey,
+    raw: Option<&str>,
+    encrypted: Option<&str>,
+) -> Result<bitcoin::secp256k1::SecretKey, String> {
+    let bytes = match (raw, encrypted) {
+        (Some(raw), None) if raw.len() == 64 => {
+            hex::decode(raw).map_err(|_| "invalid deposit key")?
+        }
+        (None, Some(encrypted)) if encrypted.len() == 258 => {
+            let ciphertext = hex::decode(encrypted).map_err(|_| "invalid encrypted deposit key")?;
+            utils::ecies::decrypt(&identity.secret_bytes(), &ciphertext)
+                .map_err(|_| "cannot decrypt instant deposit key")?
+        }
+        _ => return Err("exactly one valid deposit key share required".into()),
+    };
+    bitcoin::secp256k1::SecretKey::from_slice(&bytes).map_err(|_| "invalid deposit key".into())
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn instant_key_accepts_legacy_and_upstream_encryption() {
+        use bitcoin::secp256k1::{PublicKey, Secp256k1, SecretKey};
+        let identity = SecretKey::from_slice(&[1; 32]).unwrap();
+        let key = SecretKey::from_slice(&[2; 32]).unwrap();
+        let raw = hex::encode(key.secret_bytes());
+        let ciphertext = hex::encode(
+            utils::ecies::encrypt(
+                &PublicKey::from_secret_key(&Secp256k1::new(), &identity).serialize(),
+                &key.secret_bytes(),
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            super::decode_instant_deposit_key(&identity, Some(&raw), None).unwrap(),
+            key
+        );
+        assert_eq!(
+            super::decode_instant_deposit_key(&identity, None, Some(&ciphertext)).unwrap(),
+            key
+        );
+        assert!(
+            super::decode_instant_deposit_key(&identity, Some(&raw), Some(&ciphertext)).is_err()
+        );
+        assert!(super::decode_instant_deposit_key(&identity, None, None).is_err());
+        let wrong_identity = SecretKey::from_slice(&[3; 32]).unwrap();
+        assert!(
+            super::decode_instant_deposit_key(&wrong_identity, None, Some(&ciphertext)).is_err()
+        );
+        let mut corrupted = hex::decode(&ciphertext).unwrap();
+        *corrupted.last_mut().unwrap() ^= 1;
+        assert!(
+            super::decode_instant_deposit_key(&identity, None, Some(&hex::encode(corrupted)))
+                .is_err()
+        );
+    }
+
     use super::*;
 
     #[test]

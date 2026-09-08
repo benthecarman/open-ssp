@@ -91,7 +91,9 @@ async fn exercise(client: &Client, config: &TestConfig, a: &Wallet, b: &Wallet) 
         exact_balance(a, 100_000)
     })
     .await?;
-    send(a, b, 50_000).await?;
+    send(a, b, 50_000)
+        .await
+        .context("first partial Spark payment")?;
     poll("first swap receiver", config.timeout, || {
         exact_balance(b, 50_000)
     })
@@ -109,7 +111,9 @@ async fn exercise(client: &Client, config: &TestConfig, a: &Wallet, b: &Wallet) 
     })
     .await?;
     restart_ssp(client, config, a.ssp_url).await?;
-    send(b, a, 13_000).await?;
+    send(b, a, 13_000)
+        .await
+        .context("partial Spark payment after restart")?;
     poll("repeated swap receiver", config.timeout, || {
         exact_balance(a, 63_000)
     })
