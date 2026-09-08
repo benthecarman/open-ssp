@@ -833,7 +833,7 @@ async fn user_request_union(state: &AppState, rec: &Value) -> Result<Value, Stri
                     "__typename": "Transfer",
                     "total_amount": sats(total),
                     "spark_id": inbound,
-                    "user_request": {"id": id},
+                    "user_request": {"__typename":"LeavesSwapRequest", "id": id},
                 },
                 "swap_leaves": p.get("swap_leaves").cloned().unwrap_or(json!([])), "expires_at": p.get("expires_at"),
             })

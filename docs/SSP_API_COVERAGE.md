@@ -42,7 +42,7 @@ The removed SSP preimage extension is not required. Receive quotes use the share
 current receive and swap fee policy is zero; fee-bearing quotes remain unsupported.
 
 `cargo regtest test` runs this flow on a fresh local regtest network through the
-Rust Breez SDK at revision `c7eecfe`. It uses local Electrs for Breez chain
+Rust Breez SDK fork pinned in `vendor/breez-sdk`. It uses local Electrs for Breez chain
 data, two SSP instances, and two `ldk-server` nodes. The wallets send and
 receive BOLT11 payments between SSPs. Two wallets on the same SSP settle an internal BOLT11 invoice through Spark
 without an LDK payment. A durable reservation prevents a concurrent external
@@ -123,7 +123,7 @@ backoff up to one day between attempts. Only successful HTTP status codes
 complete a delivery; redirects are not followed.
 
 Callback URLs must use HTTPS and resolve to public addresses. For a local
-regtest callback, `SSP_WEBHOOK_ALLOW_LOCAL=1` permits HTTP loopback endpoints.
+regtest callback, `SSP_WEBHOOK_ALLOW_LOCAL=1` permits HTTP loopback and private test-network endpoints.
 This exception is disabled outside REGTEST/LOCAL. Secrets are omitted from
 subscription-list responses. A wallet can have at most ten subscriptions.
 
@@ -182,7 +182,8 @@ The background worker continues recovery after restart, including when new
 advances have been disabled. Admin status reports outstanding credit and
 settlement history reports each pending recovery.
 
-The pinned Breez client has no high-level instant-deposit method. The Rust
-acceptance client uses the Spark wire contract to sign the claim; the
-unmodified Breez wallet receives the resulting Spark transfer and reads its
-standard static-deposit history. See [the acceptance test](../e2e/breez/src/instant.rs).
+The pinned Breez fork exposes `get_instant_deposit_quote` and
+`claim_instant_deposit`. The SDK authenticates and signs with the wallet's
+configured signer. The Rust acceptance client calls these public methods.
+It also uses `service_provider()` for typed SSP history, BOLT12, and replay
+operations. See [E2E coverage](E2E_COVERAGE.md) for the remaining coverage gaps.

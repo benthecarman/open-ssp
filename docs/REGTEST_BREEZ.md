@@ -62,11 +62,13 @@ record the operator, Lightning node, and SSP wallet source revisions. `cargo reg
 that update those pins. Use `git submodule status` to inspect the revisions.
 See [the source dependency notes](../e2e/upstream/README.md) for updates.
 
-The end-client test uses upstream
-[Breez SDK at `c7eecfe670798a8b8332ce412044cbd49123687a`](https://github.com/breez/spark-sdk/tree/c7eecfe670798a8b8332ce412044cbd49123687a).
-Cargo fetches this dependency. The SSP uses the `vendor/breez-sdk` fork for
-private operator calls. End clients keep the upstream SDK pin; they do not
-need the SSP fork.
+Both the end-client test and the SSP use the `vendor/breez-sdk` submodule.
+It is based on upstream `c7eecfe670798a8b8332ce412044cbd49123687a` and adds
+private SSP operator calls, public Rust instant-deposit methods, and typed
+SSP request-history and BOLT12 methods. The test consumes this source through
+a Cargo path dependency; the parent repository's gitlink pins its revision.
+Clients need this fork for the added methods. Standard BOLT11 and confirmed
+static-deposit clients can continue using the upstream revision.
 
 ## 3. Start the development stack
 
@@ -171,7 +173,7 @@ Add these dependencies to your Rust application's `Cargo.toml`:
 ```toml
 [dependencies]
 anyhow = "1"
-breez-sdk-spark = { git = "https://github.com/breez/spark-sdk.git", rev = "c7eecfe670798a8b8332ce412044cbd49123687a", features = ["sqlite"] }
+breez-sdk-spark = { path = "vendor/breez-sdk/crates/breez-sdk/core", features = ["sqlite"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde_json = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
@@ -404,12 +406,11 @@ invalid signature, another owner's claim, repeated requests, and an SSP
 restart. It then mines the deposit and checks the signed Bitcoin recovery.
 The test repeats this flow with a fee-bumped replacement deposit.
 
-The pinned Breez client has no high-level instant claim method. The test in
-[`e2e/breez/src/instant.rs`](../e2e/breez/src/instant.rs) signs the Spark
-instant-deposit contract with deterministic test keys and sends GraphQL
-requests. The unmodified Breez wallet receives the credit and reads history.
-Applications that want to initiate instant claims need this signing and API
-flow; a normal Breez static deposit still waits for confirmations.
+The fork provides `BreezSdk::get_instant_deposit_quote` and
+`BreezSdk::claim_instant_deposit`. Authentication, key derivation, and signing
+remain inside the SDK. The test in
+[`e2e/breez/src/instant.rs`](../e2e/breez/src/instant.rs) calls those methods.
+A normal Breez static deposit still waits for confirmations.
 
 A pending advance remains counted against the limit until its recovery
 transaction has three confirmations. Recovery supports a replacement with

@@ -313,6 +313,8 @@ services:
         condition: service_healthy
     ports:
       - "127.0.0.1:5000:5000"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     healthcheck:
       test: ["CMD", "open-ssp", "healthcheck"]
       interval: 10s
@@ -328,6 +330,7 @@ services:
       SSP_NETWORK: ${SSP_NETWORK:-REGTEST}
       SSP_DATA_DIR: /data
       SSP_PUBLIC_URL: http://ssp:5000
+      SSP_WEBHOOK_ALLOW_LOCAL: ${SSP_WEBHOOK_ALLOW_LOCAL:-0}
       SSP_INSTANT_MAX_OUTSTANDING_SATS: ${SSP_INSTANT_MAX_OUTSTANDING_SATS:-0}
       SSP_INSTANT_MAX_DEPOSIT_SATS: ${SSP_INSTANT_MAX_DEPOSIT_SATS:-0}
       COOP_BITCOIN_RPC_URL: http://bitcoind:8332/wallet/ssp-withdrawals
@@ -369,6 +372,8 @@ services:
         condition: service_healthy
     ports:
       - "127.0.0.1:5001:5000"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     healthcheck:
       test: ["CMD", "open-ssp", "healthcheck"]
       interval: 10s
@@ -383,6 +388,7 @@ services:
       SSP_NETWORK: REGTEST
       SSP_DATA_DIR: /data
       SSP_PUBLIC_URL: http://ssp-2:5000
+      SSP_WEBHOOK_ALLOW_LOCAL: ${SSP_WEBHOOK_ALLOW_LOCAL:-0}
       SSP_INSTANT_MAX_OUTSTANDING_SATS: ${SSP_INSTANT_MAX_OUTSTANDING_SATS:-0}
       SSP_INSTANT_MAX_DEPOSIT_SATS: ${SSP_INSTANT_MAX_DEPOSIT_SATS:-0}
       SPARK_MNEMONIC_FILE: /data/spark.mnemonic

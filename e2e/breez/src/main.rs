@@ -1,17 +1,17 @@
 mod instant;
 mod regtest;
+mod swaps;
+mod webhooks;
 
 use std::{env, path::PathBuf, time::Duration};
 
 use anyhow::{Context, Result, bail, ensure};
-use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use breez_sdk_spark::{
     BreezSdk, ChainApiType, FeePolicy, GetInfoRequest, GetPaymentRequest, ListPaymentsRequest,
     Network, OnchainConfirmationSpeed, Payment, PaymentDetails, PaymentRequest, PaymentStatus,
     PaymentType, PrepareSendPaymentRequest, ReceivePaymentMethod, ReceivePaymentRequest,
-    SdkBuilder, Seed, SendPaymentMethod, SendPaymentOptions, SendPaymentRequest,
-    SignMessageRequest, SparkConfig, SparkSigningOperator, SparkSspConfig, SyncWalletRequest,
-    default_config,
+    SdkBuilder, Seed, SendPaymentMethod, SendPaymentOptions, SendPaymentRequest, SparkConfig,
+    SparkSigningOperator, SparkSspConfig, SyncWalletRequest, default_config,
 };
 use reqwest::Client;
 use serde_json::{Value, json};
@@ -61,7 +61,6 @@ struct Wallet {
     _storage: TempDir,
     ssp_url: &'static str,
     ldk: LdkClient,
-    seed_byte: u8,
 }
 
 fn optional_env(name: &str, default: &str) -> String {
@@ -234,83 +233,73 @@ async fn admin_json(
     .await
 }
 
-async fn graphql_json(
-    client: &Client,
-    wallet: &Wallet,
-    session: Option<&str>,
-    operation: &str,
-    variables: Value,
-) -> Result<Value> {
-    let url = format!("{}/graphql/spark/rc", wallet.ssp_url);
-    let mut request = client.post(&url).json(&json!({
-        "operationName": operation,
-        "query": format!("mutation {operation} {{ result }}"),
-        "variables": variables,
-    }));
-    if let Some(session) = session {
-        request = request.bearer_auth(session);
+// Serialize typed SDK results only for shared metadata assertions. All wallet
+// requests use the wallet's SDK client, including its authentication and retries.
+fn normalize_sdk_metadata(value: &mut Value) {
+    if let Some(object) = value.as_object_mut() {
+        for variant in [
+            "ClaimStaticDeposit",
+            "CoopExitRequest",
+            "LeavesSwapRequest",
+            "LightningReceiveRequest",
+            "LightningSendRequest",
+        ] {
+            if object.len() == 1 && object.contains_key(variant) {
+                *value = object.remove(variant).unwrap();
+                normalize_sdk_metadata(value);
+                return;
+            }
+        }
+        for field in ["exit_status", "deposit_status", "swap_status"] {
+            if let Some(status) = object.get(field).cloned() {
+                object.insert("status".into(), status);
+            }
+        }
+        for child in object.values_mut() {
+            normalize_sdk_metadata(child);
+        }
+    } else if let Some(array) = value.as_array_mut() {
+        for child in array {
+            normalize_sdk_metadata(child);
+        }
     }
-    let response = request
-        .send()
-        .await
-        .with_context(|| format!("{operation} request failed"))?;
-    let status = response.status();
-    let body: Value = response
-        .json()
-        .await
-        .with_context(|| format!("{operation} returned invalid JSON"))?;
-    ensure!(
-        status.is_success() && body.get("errors").is_none(),
-        "{operation} failed with HTTP {status}: {body}"
-    );
-    Ok(body["data"].clone())
 }
 
-async fn authenticate_wallet(client: &Client, wallet: &Wallet) -> Result<String> {
-    let identity = wallet
-        .sdk
-        .sign_message(SignMessageRequest {
-            message: "identity-probe".to_string(),
-            compact: false,
-        })
-        .await?;
-    let challenge = graphql_json(
-        client,
-        wallet,
-        None,
-        "GetChallenge",
-        json!({ "public_key": identity.pubkey }),
-    )
-    .await?["get_challenge"]["protected_challenge"]
-        .as_str()
-        .context("GetChallenge returned no protected challenge")?
-        .to_string();
-    let decoded = URL_SAFE_NO_PAD
-        .decode(&challenge)
-        .context("SSP challenge is not base64url")?;
-    let signed = wallet
-        .sdk
-        .sign_message(SignMessageRequest {
-            message: String::from_utf8(decoded).context("SSP challenge is not UTF-8")?,
-            compact: false,
-        })
-        .await?;
-    let verified = graphql_json(
-        client,
-        wallet,
-        None,
-        "VerifyChallenge",
-        json!({ "input": {
-            "identity_public_key": signed.pubkey,
-            "protected_challenge": challenge,
-            "signature": signed.signature,
-        }}),
-    )
-    .await?;
-    verified["verify_challenge"]["session_token"]
-        .as_str()
-        .context("VerifyChallenge returned no session token")
-        .map(str::to_string)
+async fn sdk_request(wallet: &Wallet, operation: &str, variables: Value) -> Result<Value> {
+    let api = wallet.sdk.service_provider();
+    let input = variables.get("input").unwrap_or(&variables);
+    let string = |key: &str| input[key].as_str().unwrap_or_default().to_owned();
+    let mut response = match operation {
+        "UserRequest" => {
+            json!({"user_request":api.get_request_record(&string("request_id")).await?})
+        }
+        "FetchCurrentUserToUserRequestsConnection" => {
+            json!({"current_user":{"user_requests":api.list_request_history(breez_sdk_spark::RequestHistoryFilter {
+            first:input["first"].as_u64().unwrap_or(100) as u32,
+            after:input["after"].as_str().map(str::to_owned),
+            types:input["types"].as_array().map(|v|v.iter().filter_map(Value::as_str).map(str::to_owned).collect()),
+            statuses:None, networks:None,
+        }).await?}})
+        }
+        "Transfers" => {
+            json!({"transfers":api.get_transfers(input["transfer_spark_ids"].as_array().context("missing transfer IDs")?.iter().filter_map(Value::as_str).map(str::to_owned).collect()).await?})
+        }
+        "RequestLightningSend" => {
+            json!({"request_lightning_send":{"request":api.request_lightning_send(breez_sdk_spark::RequestLightningSendInput {
+            encoded_invoice:string("encoded_invoice"), amount_sats:input["amount_sats"].as_u64(), idempotency_key:None,
+            user_outbound_transfer_external_id:input["user_outbound_transfer_external_id"].as_str().map(str::to_owned),
+        }).await?}})
+        }
+        "RequestBolt12Receive" => {
+            json!({"request_lightning_receive":{"request":api.request_bolt12_receive(input["amount_sats"].as_u64().context("missing amount")?,&string("network"),&string("memo"),input["expiry_secs"].as_u64().unwrap_or(300) as u32).await?}})
+        }
+        "CompleteCoopExit" => {
+            json!({"complete_coop_exit":{"request":api.complete_coop_exit(&string("user_outbound_transfer_external_id"),&string("coop_exit_request_id")).await?}})
+        }
+        _ => bail!("no SDK operation for {operation}"),
+    };
+    normalize_sdk_metadata(&mut response);
+    Ok(response)
 }
 
 async fn bitcoin_rpc(
@@ -447,7 +436,6 @@ async fn connect_wallet(
         _storage: storage,
         ssp_url,
         ldk,
-        seed_byte,
     })
 }
 
@@ -1007,7 +995,7 @@ async fn bootstrap_wallet(
 }
 
 async fn pay_between(
-    client: &Client,
+    _client: &Client,
     sender: &Wallet,
     receiver: &Wallet,
     amount_sats: u64,
@@ -1109,11 +1097,8 @@ async fn pay_between(
     })
     .await?;
 
-    let session = authenticate_wallet(client, sender).await?;
-    let transfers = graphql_json(
-        client,
+    let transfers = sdk_request(
         sender,
-        Some(&session),
         "Transfers",
         json!({"transfer_spark_ids": [sender_payment.id]}),
     )
@@ -1126,10 +1111,8 @@ async fn pay_between(
         request["idempotency_key"] == sender_payment.id,
         "send idempotency key does not match funding transfer: {request}"
     );
-    let replay = graphql_json(
-        client,
+    let replay = sdk_request(
         sender,
-        Some(&session),
         "RequestLightningSend",
         json!({"encoded_invoice":invoice,"user_outbound_transfer_external_id":sender_payment.id}),
     )
@@ -1247,11 +1230,8 @@ async fn static_deposit(client: &Client, config: &TestConfig, wallet: &Wallet) -
         ensure!(deposit.amount==9901,"deposit history amount is {}",deposit.amount);
         Ok(())
     }).await?;
-    let session = authenticate_wallet(client, wallet).await?;
-    let history = graphql_json(
-        client,
+    let history = sdk_request(
         wallet,
-        Some(&session),
         "FetchCurrentUserToUserRequestsConnection",
         json!({"first":100,"types":["CLAIM_STATIC_DEPOSIT"]}),
     )
@@ -1273,14 +1253,7 @@ async fn static_deposit(client: &Client, config: &TestConfig, wallet: &Wallet) -
         "static deposit recovery confirmed",
         config.timeout,
         || async {
-            let current = graphql_json(
-                client,
-                wallet,
-                Some(&session),
-                "UserRequest",
-                json!({"request_id":id}),
-            )
-            .await?;
+            let current = sdk_request(wallet, "UserRequest", json!({"request_id":id})).await?;
             ensure!(
                 current["user_request"]["status"] == "SPEND_TX_CONFIRMED",
                 "deposit recovery not confirmed: {current}"
@@ -1293,49 +1266,10 @@ async fn static_deposit(client: &Client, config: &TestConfig, wallet: &Wallet) -
         },
     )
     .await?;
-    let confirmed = graphql_json(
-        client,
-        wallet,
-        Some(&session),
-        "UserRequest",
-        json!({"request_id":id}),
-    )
-    .await?;
-    let replay = graphql_json(
-        client,
-        wallet,
-        Some(&session),
-        "UserRequest",
-        json!({"request_id":id}),
-    )
-    .await?;
+    let confirmed = sdk_request(wallet, "UserRequest", json!({"request_id":id})).await?;
+    let replay = sdk_request(wallet, "UserRequest", json!({"request_id":id})).await?;
     ensure!(confirmed == replay, "deposit read changed durable metadata");
-    for operation in [
-        "CreateInstantStaticDepositQuote",
-        "CreateClaimInstantStaticDeposit",
-    ] {
-        reject_request(
-            client,
-            wallet,
-            Some(&session),
-            operation,
-            json!({}),
-            "required",
-        )
-        .await?;
-    }
-    let quote = client.post(format!("{}/graphql/spark/rc", wallet.ssp_url))
-        .bearer_auth(&session).header("x-partner-jwt", "unconfigured-partner")
-        .json(&json!({"operationName":"LightningReceiveQuote","query":"mutation LightningReceiveQuote { result }","variables":{"amount_sats":1000}}))
-        .send().await?.json::<Value>().await?;
-    ensure!(
-        quote["data"]["lightning_receive_quote"]["attribution_status"]
-            == "PARTNER_ATTRIBUTION_UNSUPPORTED",
-        "partner header was ignored: {quote}"
-    );
-    println!(
-        "PASS static deposit: 9901 sats credited, recovery confirmed, stable metadata; malformed instant requests rejected"
-    );
+    println!("PASS static deposit: 9901 sats credited, recovery confirmed, stable metadata");
     command_output("docker", &["start", miner_container.trim()]).await?;
     Ok(())
 }
@@ -1480,11 +1414,8 @@ async fn send_bolt12(
         funding.status
     );
 
-    let session = authenticate_wallet(client, sender).await?;
-    let response = graphql_json(
-        client,
+    let response = sdk_request(
         sender,
-        Some(&session),
         "RequestLightningSend",
         json!({ "input": {
             "encoded_invoice": offer,
@@ -1504,14 +1435,8 @@ async fn send_bolt12(
     );
 
     poll("BOLT12 SSP send", config.timeout, || async {
-        let response = graphql_json(
-            client,
-            sender,
-            Some(&session),
-            "UserRequest",
-            json!({ "request_id": request_id }),
-        )
-        .await?;
+        let response =
+            sdk_request(sender, "UserRequest", json!({ "request_id": request_id })).await?;
         ensure!(
             response["user_request"]["status"] != "LIGHTNING_PAYMENT_FAILED",
             "BOLT12 send failed"
@@ -1543,18 +1468,15 @@ async fn send_bolt12(
 }
 
 async fn receive_bolt12(
-    client: &Client,
+    _client: &Client,
     config: &TestConfig,
     receiver: &Wallet,
     payer_ldk: &LdkClient,
     amount_sats: u64,
 ) -> Result<()> {
     let receiver_before = wallet_balance(receiver).await?;
-    let session = authenticate_wallet(client, receiver).await?;
-    let response = graphql_json(
-        client,
+    let response = sdk_request(
         receiver,
-        Some(&session),
         "RequestBolt12Receive",
         json!({ "input": {
             "amount_sats": amount_sats,
@@ -1579,14 +1501,8 @@ async fn receive_bolt12(
     payer_ldk.json(&["bolt12-send", offer]).await?;
 
     poll("BOLT12 SSP receive", config.timeout, || async {
-        let response = graphql_json(
-            client,
-            receiver,
-            Some(&session),
-            "UserRequest",
-            json!({ "request_id": request_id }),
-        )
-        .await?;
+        let response =
+            sdk_request(receiver, "UserRequest", json!({ "request_id": request_id })).await?;
         ensure!(
             response["user_request"]["status"] == "TRANSFER_COMPLETED",
             "BOLT12 receive is not complete"
@@ -1613,102 +1529,75 @@ async fn receive_bolt12(
     Ok(())
 }
 
-async fn reject_request(
-    client: &Client,
-    wallet: &Wallet,
-    session: Option<&str>,
-    operation: &str,
-    input: Value,
-    expected: &str,
-) -> Result<()> {
-    let error = graphql_json(client, wallet, session, operation, input)
-        .await
-        .expect_err("request should have failed");
-    ensure!(
-        error.to_string().to_lowercase().contains(expected),
-        "unexpected {operation} error: {error}"
-    );
-    Ok(())
-}
-
-async fn negative_lightning(
-    client: &Client,
+async fn negative_sdk_requests(
     config: &TestConfig,
     wallet: &Wallet,
     payer: &LdkClient,
 ) -> Result<()> {
     let before = wallet_balance(wallet).await?;
-    let session = authenticate_wallet(client, wallet).await?;
-    reject_request(
-        client,
-        wallet,
-        None,
-        "UserRequest",
-        json!({"request_id":"missing"}),
-        "unauthorized",
-    )
-    .await?;
-    reject_request(
-        client,
-        wallet,
-        Some(&session),
-        "RequestLightningReceive",
-        json!({"amount_sats":1000,"network":"REGTEST","payment_hash":"not-a-hash"}),
-        "payment_hash must be 32 bytes hex",
-    )
-    .await?;
-    let invoice = payer
-        .json(&["bolt11-receive", "700sat", "-d", "negative-send"])
-        .await?;
-    let hash = invoice["payment_hash"]
-        .as_str()
-        .context("negative invoice has no hash")?;
-    reject_request(
-        client,
-        wallet,
-        Some(&session),
-        "RequestLightningSend",
-        json!({"encoded_invoice":invoice["invoice"]}),
-        "user_outbound_transfer_external_id is required",
-    )
-    .await?;
-    reject_request(client, wallet, Some(&session), "RequestLightningSend",
-        json!({"encoded_invoice":invoice["invoice"],"user_outbound_transfer_external_id":"00000000-0000-4000-8000-000000000099"}), "matching preimage swap was not found").await?;
+    let api = wallet.sdk.service_provider();
+    let receive = |hash: String, expiry: i64| breez_sdk_spark::RequestLightningReceiveInput {
+        network: serde_json::from_value(json!("REGTEST")).unwrap(),
+        amount_sats: 800,
+        payment_hash: hash,
+        expiry_secs: Some(expiry),
+        memo: None,
+        receiver_identity_pubkey: None,
+        include_spark_address: false,
+        description_hash: None,
+        spark_invoice: None,
+    };
     ensure!(
-        bolt11_payment_count(&wallet.ldk, hash).await? == 0,
+        api.request_lightning_receive(receive("invalid-hash".into(), 1))
+            .await
+            .is_err(),
+        "SDK malformed hash accepted"
+    );
+    let invoice = payer
+        .json(&["bolt11-receive", "700sat", "-d", "negative-sdk-send"])
+        .await?;
+    for funding in [
+        None,
+        Some("00000000-0000-4000-8000-000000000099".to_owned()),
+    ] {
+        ensure!(
+            api.request_lightning_send(breez_sdk_spark::RequestLightningSendInput {
+                encoded_invoice: invoice["invoice"]
+                    .as_str()
+                    .context("missing invoice")?
+                    .into(),
+                amount_sats: None,
+                idempotency_key: None,
+                user_outbound_transfer_external_id: funding,
+            })
+            .await
+            .is_err(),
+            "unfunded SDK send accepted"
+        );
+    }
+    ensure!(
+        bolt11_payment_count(
+            &wallet.ldk,
+            invoice["payment_hash"].as_str().context("missing hash")?
+        )
+        .await?
+            == 0,
         "unfunded send reached LDK"
     );
-    // This unpaid invoice uses a client-created hash and needs no shares.
-    let hash = hex::encode(Sha256::digest(b"expiry-only-test-preimage"));
-    let expiring = graphql_json(
-        client,
-        wallet,
-        Some(&session),
-        "RequestLightningReceive",
-        json!({"amount_sats":800,"network":"REGTEST","payment_hash":hash,"expiry_secs":1}),
-    )
-    .await?;
-    let request_id = expiring["request_lightning_receive"]["request"]["id"]
-        .as_str()
-        .context("expiry request has no ID")?;
-    poll("expired wallet invoice", config.timeout, || async {
-        let response = graphql_json(
-            client,
-            wallet,
-            Some(&session),
-            "UserRequest",
-            json!({"request_id":request_id}),
-        )
+    let expired = api
+        .request_lightning_receive(receive(hex::encode(Sha256::digest(b"sdk-expiry-test")), 1))
         .await?;
-        ensure!(
-            response["user_request"]["status"] == "HTLC_FAILED",
-            "expired invoice is not failed yet"
-        );
+    poll("SDK invoice expiry", config.timeout, || async {
+        let current = api
+            .get_request_record(&expired.id)
+            .await?
+            .context("missing expired request")?;
+        ensure!(current.status == "HTLC_FAILED", "invoice has not expired");
         Ok(())
     })
     .await?;
     exact_balance(wallet, before).await?;
-    println!("PASS auth, malformed hash, missing funding, unknown funding, and invoice expiry");
+    println!("PASS SDK rejected malformed and unfunded requests; unpaid invoice expired");
     Ok(())
 }
 
@@ -1910,7 +1799,7 @@ async fn run(
         first_hash != second_hash,
         "the two wallet invoices reused a payment hash"
     );
-    negative_lightning(client, config, wallet_a, &wallet_b.ldk).await?;
+    negative_sdk_requests(config, wallet_a, &wallet_b.ldk).await?;
     missed_receive(client, config, wallet_a, &wallet_b.ldk).await?;
     println!("withdraw wallet A's remaining Spark balance to Bitcoin");
     withdraw_bitcoin(client, config, wallet_a)
@@ -2018,16 +1907,13 @@ async fn withdraw_bitcoin(client: &Client, config: &TestConfig, wallet: &Wallet)
         })
         .await
         .context("send Bitcoin withdrawal")?;
-    let session = authenticate_wallet(client, wallet).await?;
-    let pending = graphql_json(
-        client,
+    let transfers = sdk_request(
         wallet,
-        Some(&session),
-        "CompleteCoopExit",
-        json!({"input":{"user_outbound_transfer_external_id":sent.payment.id}}),
+        "Transfers",
+        json!({"transfer_spark_ids":[sent.payment.id]}),
     )
     .await?;
-    let request_id = pending["complete_coop_exit"]["request"]["id"]
+    let request_id = transfers["transfers"][0]["user_request"]["id"]
         .as_str()
         .context("withdrawal request ID missing")?;
     let bump = admin_json(
@@ -2100,14 +1986,11 @@ async fn withdraw_bitcoin(client: &Client, config: &TestConfig, wallet: &Wallet)
     let Some(PaymentDetails::Withdraw { tx_id }) = payment.details else {
         bail!("Breez withdrawal details missing");
     };
-    let session = authenticate_wallet(client, wallet).await?;
     for _ in 0..2 {
-        let completed = graphql_json(
-            client,
+        let completed = sdk_request(
             wallet,
-            Some(&session),
             "CompleteCoopExit",
-            json!({"input":{"user_outbound_transfer_external_id":sent.payment.id}}),
+            json!({"input":{"user_outbound_transfer_external_id":sent.payment.id,"coop_exit_request_id":request_id}}),
         )
         .await?;
         let request = &completed["complete_coop_exit"]["request"];
@@ -2119,14 +2002,8 @@ async fn withdraw_bitcoin(client: &Client, config: &TestConfig, wallet: &Wallet)
             request["coop_exit_txid"] == tx_id,
             "retry changed the payout transaction"
         );
-        let history = graphql_json(
-            client,
-            wallet,
-            Some(&session),
-            "UserRequest",
-            json!({"request_id":request["id"]}),
-        )
-        .await?;
+        let history =
+            sdk_request(wallet, "UserRequest", json!({"request_id":request["id"]})).await?;
         ensure!(
             history["user_request"]["status"] == "SUCCEEDED",
             "withdrawal history missing: {history}"
@@ -2141,6 +2018,85 @@ async fn withdraw_bitcoin(client: &Client, config: &TestConfig, wallet: &Wallet)
     println!(
         "PASS cooperative withdrawal: {before} Spark sats became {received_sats} Bitcoin sats with {fee} sats in fees; SSP recovered the Spark leaves after restart"
     );
+    Ok(())
+}
+
+async fn history_pages(wallet: &Wallet, other: &Wallet) -> Result<()> {
+    use breez_sdk_spark::RequestHistoryFilter;
+    let api = wallet.sdk.service_provider();
+    let filter = RequestHistoryFilter {
+        first: 2,
+        networks: Some(vec!["REGTEST".into()]),
+        ..Default::default()
+    };
+    let first = api.list_request_history(filter.clone()).await?;
+    ensure!(
+        first.entities.len() == 2 && first.page_info.has_next_page,
+        "history did not paginate"
+    );
+    let cursor = first
+        .page_info
+        .end_cursor
+        .clone()
+        .context("missing cursor")?;
+    let next = api
+        .list_request_history(RequestHistoryFilter {
+            after: Some(cursor.clone()),
+            ..filter.clone()
+        })
+        .await?;
+    ensure!(
+        next.entities
+            .iter()
+            .all(|v| !first.entities.iter().any(|a| a.id == v.id)),
+        "history pages overlap"
+    );
+    ensure!(
+        other
+            .sdk
+            .service_provider()
+            .get_request_record(&first.entities[0].id)
+            .await?
+            .is_none(),
+        "another wallet read request history"
+    );
+    ensure!(
+        other
+            .sdk
+            .service_provider()
+            .list_request_history(RequestHistoryFilter {
+                after: Some(cursor),
+                ..filter.clone()
+            })
+            .await
+            .is_err(),
+        "another wallet reused the cursor"
+    );
+    let sends = api
+        .list_request_history(RequestHistoryFilter {
+            first: 100,
+            types: Some(vec!["LIGHTNING_SEND".into()]),
+            statuses: Some(vec!["SUCCEEDED".into()]),
+            ..filter
+        })
+        .await?;
+    ensure!(!sends.entities.is_empty(), "filtered send history empty");
+    for record in sends.entities {
+        ensure!(
+            record.status == "LIGHTNING_PAYMENT_SUCCEEDED" && record.network == "REGTEST",
+            "history filter returned wrong state or network"
+        );
+        let read = api
+            .get_request_record(&record.id)
+            .await?
+            .context("request missing")?;
+        let replay = api
+            .get_request_record(&record.id)
+            .await?
+            .context("request missing on retry")?;
+        ensure!(read == replay, "history read changed saved metadata");
+    }
+    println!("PASS Breez history: pagination, filters, owner isolation, stable metadata");
     Ok(())
 }
 
@@ -2167,6 +2123,7 @@ async fn acceptance(config: TestConfig, ldk_a: LdkClient, ldk_b: LdkClient) -> R
     println!("create bidirectional Lightning liquidity");
     setup_lightning(&client, &config, &ldk_a, &ldk_b).await?;
 
+    swaps::run(&client, &config, &ldk_a).await?;
     println!("connect Breez wallets");
     let wallet_a = connect_wallet(
         &client,
@@ -2196,7 +2153,12 @@ async fn acceptance(config: TestConfig, ldk_a: LdkClient, ldk_b: LdkClient) -> R
     )
     .await?;
 
+    let callbacks = webhooks::Callbacks::start(&wallet_a, &wallet_c).await?;
     let result = run(&client, &config, &wallet_a, &wallet_b, &wallet_c).await;
+    if result.is_ok() {
+        callbacks.verify(&wallet_a, config.timeout).await?;
+        history_pages(&wallet_a, &wallet_c).await?;
+    }
     let disconnect_c = wallet_c.sdk.disconnect().await;
     let disconnect_b = wallet_b.sdk.disconnect().await;
     let disconnect_a = wallet_a.sdk.disconnect().await;

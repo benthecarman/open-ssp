@@ -6,9 +6,10 @@ publish = false
 
 [dependencies]
 anyhow = "1"
-base64 = "0.22"
+axum = "0.8"
+hmac = "0.12"
 bitcoin = "0.32"
-breez-sdk-spark = { git = "https://github.com/breez/spark-sdk.git", rev = "c7eecfe670798a8b8332ce412044cbd49123687a", features = ["sqlite"] }
+breez-sdk-spark = { path = "../../vendor/breez-sdk/crates/breez-sdk/core", features = ["sqlite"] }
 hex = "0.4"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde_json = "1"

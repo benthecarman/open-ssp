@@ -142,10 +142,12 @@ withdrawal record, and Spark leaves recovered by the SSP. Repeated completion
 calls must keep the same payout. Separate BOLT12 send and receive checks run
 last because the pinned Breez SDK cannot parse the extension's history.
 
-Run `./e2e/e2e.sh` for the separate JavaScript SDK checks of API responses,
-authentication, static deposits, and atomic Spark swaps. It verifies repeated
-splits on every operator. It does not run Lightning payment scenarios.
-Image publication waits for both acceptance suites and the Rust checks.
+`cargo regtest test` also checks single-use deposits, partial Spark transfers,
+repeated swaps after restart, instant deposits, signed webhook retries, and
+request-history pagination. All wallet actions use the pinned Breez SDK fork.
+Bitcoin Core, LDK, and admin APIs only prepare the fixture and check settlement.
+`./e2e/e2e.sh` forwards to the same Rust suite. Image publication waits for
+that suite and the Rust checks. See [coverage and remaining gaps](docs/E2E_COVERAGE.md).
 
 ## Deployment
 

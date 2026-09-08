@@ -838,14 +838,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "edca88bc138befd0323b20752846e6587272d3b03b0343c8ea28a6f819e6e71f"
 dependencies = [
  "async-trait",
- "axum-core",
+ "axum-core 0.4.5",
  "bytes",
  "futures-util",
  "http",
  "http-body",
  "http-body-util",
  "itoa",
- "matchit",
+ "matchit 0.7.3",
  "memchr",
  "mime",
  "percent-encoding",
@@ -856,6 +856,39 @@ dependencies = [
  "tower 0.5.3",
  "tower-layer",
  "tower-service",
+]
+
+[[package]]
+name = "axum"
+version = "0.8.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "31b698c5f9a010f6573133b09e0de5408834d0c82f8d7475a89fc1867a71cd90"
+dependencies = [
+ "axum-core 0.5.6",
+ "bytes",
+ "form_urlencoded",
+ "futures-util",
+ "http",
+ "http-body",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "itoa",
+ "matchit 0.8.4",
+ "memchr",
+ "mime",
+ "percent-encoding",
+ "pin-project-lite",
+ "serde_core",
+ "serde_json",
+ "serde_path_to_error",
+ "serde_urlencoded",
+ "sync_wrapper",
+ "tokio",
+ "tower 0.5.3",
+ "tower-layer",
+ "tower-service",
+ "tracing",
 ]
 
 [[package]]
@@ -876,6 +909,25 @@ dependencies = [
  "sync_wrapper",
  "tower-layer",
  "tower-service",
+]
+
+[[package]]
+name = "axum-core"
+version = "0.5.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "08c78f31d7b1291f7ee735c1c6780ccde7785daae9a9206026862dab7d8792d1"
+dependencies = [
+ "bytes",
+ "futures-core",
+ "http",
+ "http-body",
+ "http-body-util",
+ "mime",
+ "pin-project-lite",
+ "sync_wrapper",
+ "tower-layer",
+ "tower-service",
+ "tracing",
 ]
 
 [[package]]
@@ -1127,7 +1179,6 @@ dependencies = [
 [[package]]
 name = "breez-sdk-common"
 version = "0.1.0"
-source = "git+https://github.com/breez/spark-sdk.git?rev=c7eecfe670798a8b8332ce412044cbd49123687a#c7eecfe670798a8b8332ce412044cbd49123687a"
 dependencies = [
  "aes",
  "anyhow",
@@ -1141,8 +1192,8 @@ dependencies = [
  "hex",
  "http",
  "lightning",
- "macros 0.1.0 (git+https://github.com/breez/spark-sdk.git?rev=c7eecfe670798a8b8332ce412044cbd49123687a)",
- "platform-utils 0.1.0 (git+https://github.com/breez/spark-sdk.git?rev=c7eecfe670798a8b8332ce412044cbd49123687a)",
+ "macros 0.1.0",
+ "platform-utils 0.1.0",
  "prost",
  "regex-lite",
  "reqwest",
@@ -1163,7 +1214,6 @@ dependencies = [
 [[package]]
 name = "breez-sdk-spark"
 version = "0.1.0"
-source = "git+https://github.com/breez/spark-sdk.git?rev=c7eecfe670798a8b8332ce412044cbd49123687a#c7eecfe670798a8b8332ce412044cbd49123687a"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1181,8 +1231,8 @@ dependencies = [
  "hex",
  "k256",
  "lnurl-models",
- "macros 0.1.0 (git+https://github.com/breez/spark-sdk.git?rev=c7eecfe670798a8b8332ce412044cbd49123687a)",
- "platform-utils 0.1.0 (git+https://github.com/breez/spark-sdk.git?rev=c7eecfe670798a8b8332ce412044cbd49123687a)",
+ "macros 0.1.0",
+ "platform-utils 0.1.0",
  "rusqlite",
  "rusqlite_migration",
  "serde",
@@ -1977,15 +2027,14 @@ checksum = "b7ac824320a75a52197e8f2d787f6a38b6718bb6897a35142d749af3c0e8f4fe"
 [[package]]
 name = "flashnet"
 version = "0.1.0"
-source = "git+https://github.com/breez/spark-sdk.git?rev=c7eecfe670798a8b8332ce412044cbd49123687a#c7eecfe670798a8b8332ce412044cbd49123687a"
 dependencies = [
  "async-trait",
  "base64",
  "bitcoin",
  "getrandom 0.2.17",
  "hex",
- "macros 0.1.0 (git+https://github.com/breez/spark-sdk.git?rev=c7eecfe670798a8b8332ce412044cbd49123687a)",
- "platform-utils 0.1.0 (git+https://github.com/breez/spark-sdk.git?rev=c7eecfe670798a8b8332ce412044cbd49123687a)",
+ "macros 0.1.0",
+ "platform-utils 0.1.0",
  "rand 0.8.8",
  "serde",
  "serde_json",
@@ -3053,7 +3102,6 @@ checksum = "11d3d7f243d5c5a8b9bb5d6dd2b1602c0cb0b9db1621bafc7ed66e35ff9fe092"
 [[package]]
 name = "lnurl-models"
 version = "0.1.0"
-source = "git+https://github.com/breez/spark-sdk.git?rev=c7eecfe670798a8b8332ce412044cbd49123687a#c7eecfe670798a8b8332ce412044cbd49123687a"
 dependencies = [
  "serde",
 ]
@@ -3093,7 +3141,6 @@ dependencies = [
 [[package]]
 name = "macros"
 version = "0.1.0"
-source = "git+https://github.com/breez/boltz-client?rev=b5f4683aba10efd875d674f2bb9a5800b047a879#b5f4683aba10efd875d674f2bb9a5800b047a879"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -3103,7 +3150,7 @@ dependencies = [
 [[package]]
 name = "macros"
 version = "0.1.0"
-source = "git+https://github.com/breez/spark-sdk.git?rev=c7eecfe670798a8b8332ce412044cbd49123687a#c7eecfe670798a8b8332ce412044cbd49123687a"
+source = "git+https://github.com/breez/boltz-client?rev=b5f4683aba10efd875d674f2bb9a5800b047a879#b5f4683aba10efd875d674f2bb9a5800b047a879"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -3124,6 +3171,12 @@ name = "matchit"
 version = "0.7.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0e7465ac9959cc2b1404e8e2367b43684a6d13790fe23056cc8c6c5a6b7bcb94"
+
+[[package]]
+name = "matchit"
+version = "0.8.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "47e1ffaa40ddd1f3ed91f717a33c8c0ee23fff369e3aa8772b9605cc1d22f4c3"
 
 [[package]]
 name = "memchr"
@@ -3239,10 +3292,11 @@ name = "open-ssp-breez-e2e"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "base64",
+ "axum 0.8.9",
  "bitcoin",
  "breez-sdk-spark",
  "hex",
+ "hmac",
  "reqwest",
  "serde_json",
  "sha2",
@@ -3371,11 +3425,10 @@ checksum = "f6b464fbc74e149a392436b17d523f769e057cb6877f6a5c4618bc6f11800548"
 [[package]]
 name = "platform-utils"
 version = "0.1.0"
-source = "git+https://github.com/breez/boltz-client?rev=b5f4683aba10efd875d674f2bb9a5800b047a879#b5f4683aba10efd875d674f2bb9a5800b047a879"
 dependencies = [
  "async-trait",
  "base64",
- "macros 0.1.0 (git+https://github.com/breez/boltz-client?rev=b5f4683aba10efd875d674f2bb9a5800b047a879)",
+ "macros 0.1.0",
  "reqwest",
  "serde",
  "serde_json",
@@ -3389,11 +3442,11 @@ dependencies = [
 [[package]]
 name = "platform-utils"
 version = "0.1.0"
-source = "git+https://github.com/breez/spark-sdk.git?rev=c7eecfe670798a8b8332ce412044cbd49123687a#c7eecfe670798a8b8332ce412044cbd49123687a"
+source = "git+https://github.com/breez/boltz-client?rev=b5f4683aba10efd875d674f2bb9a5800b047a879#b5f4683aba10efd875d674f2bb9a5800b047a879"
 dependencies = [
  "async-trait",
  "base64",
- "macros 0.1.0 (git+https://github.com/breez/spark-sdk.git?rev=c7eecfe670798a8b8332ce412044cbd49123687a)",
+ "macros 0.1.0 (git+https://github.com/breez/boltz-client?rev=b5f4683aba10efd875d674f2bb9a5800b047a879)",
  "reqwest",
  "serde",
  "serde_json",
@@ -4320,6 +4373,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "serde_path_to_error"
+version = "0.1.20"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "10a9ff822e371bb5403e391ecd83e182e0e77ba7f6fe0160b795797109d1b457"
+dependencies = [
+ "itoa",
+ "serde",
+ "serde_core",
+]
+
+[[package]]
 name = "serde_urlencoded"
 version = "0.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4495,7 +4559,6 @@ dependencies = [
 [[package]]
 name = "spark"
 version = "0.1.0"
-source = "git+https://github.com/breez/spark-sdk.git?rev=c7eecfe670798a8b8332ce412044cbd49123687a#c7eecfe670798a8b8332ce412044cbd49123687a"
 dependencies = [
  "async-trait",
  "base64",
@@ -4513,8 +4576,8 @@ dependencies = [
  "http-body-util",
  "k256",
  "lightning-invoice 0.33.3",
- "macros 0.1.0 (git+https://github.com/breez/spark-sdk.git?rev=c7eecfe670798a8b8332ce412044cbd49123687a)",
- "platform-utils 0.1.0 (git+https://github.com/breez/spark-sdk.git?rev=c7eecfe670798a8b8332ce412044cbd49123687a)",
+ "macros 0.1.0",
+ "platform-utils 0.1.0",
  "prost",
  "prost-types",
  "rand 0.8.8",
@@ -4552,13 +4615,12 @@ dependencies = [
 [[package]]
 name = "spark-wallet"
 version = "0.1.0"
-source = "git+https://github.com/breez/spark-sdk.git?rev=c7eecfe670798a8b8332ce412044cbd49123687a#c7eecfe670798a8b8332ce412044cbd49123687a"
 dependencies = [
  "bitcoin",
  "frost-secp256k1-tr",
  "futures",
  "hex",
- "platform-utils 0.1.0 (git+https://github.com/breez/spark-sdk.git?rev=c7eecfe670798a8b8332ce412044cbd49123687a)",
+ "platform-utils 0.1.0",
  "serde",
  "spark",
  "thiserror 2.0.20",
@@ -5019,7 +5081,7 @@ checksum = "877c5b330756d856ffcc4553ab34a5684481ade925ecc54bcd1bf02b1d0d4d52"
 dependencies = [
  "async-stream",
  "async-trait",
- "axum",
+ "axum 0.7.9",
  "base64",
  "bytes",
  "h2",
@@ -5128,6 +5190,7 @@ dependencies = [
  "tokio",
  "tower-layer",
  "tower-service",
+ "tracing",
 ]
 
 [[package]]
@@ -5166,6 +5229,7 @@ version = "0.1.44"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "63e71662fa4b2a2c3a26f570f037eb95bb1f85397f3cd8076caed2f026a6d100"
 dependencies = [
+ "log",
  "pin-project-lite",
  "tracing-attributes",
  "tracing-core",
@@ -5346,7 +5410,6 @@ checksum = "b6c140620e7ffbb22c2dee59cafe6084a59b5ffc27a8859a5f0d494b5d52b6be"
 [[package]]
 name = "utils"
 version = "0.1.0"
-source = "git+https://github.com/breez/spark-sdk.git?rev=c7eecfe670798a8b8332ce412044cbd49123687a#c7eecfe670798a8b8332ce412044cbd49123687a"
 dependencies = [
  "aes-gcm",
  "getrandom 0.2.17",

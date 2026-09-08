@@ -10,7 +10,7 @@ Both acceptance suites use the Git submodules recorded by this repository:
 | Path | Source | Use |
 |---|---|---|
 | `vendor/spark` | [Spark fork](https://github.com/benthecarman/spark) | Three Spark Operators and the supplemental JavaScript SDK |
-| `vendor/breez-sdk` | [SSP SDK fork](https://github.com/benthecarman/spark-sdk) | Embedded SSP wallet and private operator RPC client |
+| `vendor/breez-sdk` | [SSP SDK fork](https://github.com/benthecarman/spark-sdk) | SSP wallet, private operator RPC client, and Breez E2E client |
 | `vendor/ldk-server` | [ldk-server](https://github.com/lightningdevkit/ldk-server) | Two Lightning nodes and their CLI |
 
 The gitlinks store the exact commits. Inspect them with `git submodule status`.
@@ -47,7 +47,7 @@ Corepack are required):
 
 ```sh
 (cd vendor/spark/sdks/js && corepack enable && yarn install --no-immutable && yarn build:sdk)
-./e2e/e2e.sh
+cargo regtest test
 ```
 
 If you set `SDK_REF`, build the SDK in that checkout instead.

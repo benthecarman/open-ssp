@@ -223,6 +223,7 @@ impl Stack {
             .env("LDK_SERVER_REF", &self.ldk)
             .env("SPARK_ADMIN_TOKEN", &self.admin_token)
             .env("SSP_NETWORK", "REGTEST")
+            .env("SSP_WEBHOOK_ALLOW_LOCAL", "1")
             .env(
                 "SSP_INSTANT_MAX_OUTSTANDING_SATS",
                 optional_env("SSP_INSTANT_MAX_OUTSTANDING_SATS", "100000"),

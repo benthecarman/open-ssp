@@ -120,6 +120,16 @@ fn public_ip(ip: IpAddr) -> bool {
     }
 }
 
+fn local_test_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => ip.is_loopback() || ip.is_private(),
+        IpAddr::V6(ip) => match ip.to_ipv4_mapped() {
+            Some(ip) => local_test_ip(IpAddr::V4(ip)),
+            None => ip.is_loopback() || ip.is_unique_local(),
+        },
+    }
+}
+
 async fn client_for(url: &reqwest::Url, local: bool) -> Result<reqwest::Client, String> {
     let host = url
         .host_str()
@@ -141,7 +151,7 @@ async fn client_for(url: &reqwest::Url, local: bool) -> Result<reqwest::Client, 
     if addresses.is_empty()
         || addresses
             .iter()
-            .any(|a| !public_ip(a.ip()) && !(local && a.ip().is_loopback()))
+            .any(|a| !public_ip(a.ip()) && !(local && local_test_ip(a.ip())))
     {
         return Err("webhook address is not public".into());
     }
@@ -292,6 +302,20 @@ mod tests {
             assert!(!public_ip(ip.parse().unwrap()), "{ip}");
         }
         assert!(public_ip("8.8.8.8".parse().unwrap()));
+        for ip in [
+            "127.0.0.1",
+            "172.17.0.1",
+            "10.0.0.1",
+            "::1",
+            "fc00::1",
+            "::ffff:172.17.0.1",
+        ] {
+            assert!(local_test_ip(ip.parse().unwrap()), "{ip}");
+        }
+        for ip in ["169.254.169.254", "0.0.0.0", "fe80::1", "8.8.8.8"] {
+            assert!(!local_test_ip(ip.parse().unwrap()), "{ip}");
+        }
+
         assert!(parse_url("http://example.com", false).is_err());
         assert!(parse_url("https://user:secret@example.com", false).is_err());
         assert_eq!(
