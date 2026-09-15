@@ -46,6 +46,9 @@ The SSP calls existing operator consensus code through this RPC.
 | `RUST_LOG` | Optional tracing filter; use `info` unless more detail is needed |
 
 Production must not set `SPARK_ADMIN_ALLOW_NO_AUTH=1`.
+A numeric variable that is set must parse as an integer; a malformed value
+stops the boot instead of silently falling back to its default.
+`SSP_FROST_THRESHOLD` must be between 1 and the number of `SO_HOSTS` entries.
 The service requires a live LDK backend at startup. Start LDK first and wait
 for its health check before starting the SSP.
 
@@ -277,7 +280,9 @@ continues. Keep the SSP and operator databases with their saved signing data.
 
 `GET /status` reports instant credit exposure and configured limits.
 `GET /admin/settlements` lists unresolved work, including instant recovery
-phases and the last error.
+phases and the last error. Deposit rows report their recovery phase, so a
+payout that is broadcast but not yet confirmed stays listed until its recovery
+transaction has three confirmations.
 `POST /admin/settlements/reconcile` accepts a Lightning `request_id` and runs
 the same guarded recovery as the background worker. A pending BOLT12 send
 with no backend record still needs investigation; do not infer failure from

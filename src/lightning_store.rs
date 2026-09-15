@@ -157,17 +157,28 @@ pub fn index_request(
                 (quote_id, text("payment_hash")),
             )?;
         }
+        // A stored timestamp that cannot be parsed is treated as already
+        // expired, matching the challenge path in `db.rs`. Settled rows are
+        // excluded from the expiry sweep, so only unfinished receives resolve.
         let expiry = chrono::DateTime::parse_from_rfc3339(created)
             .map(|t| t.timestamp())
-            .unwrap_or(i64::MAX)
+            .unwrap_or(0)
             .saturating_add(
                 p["expiry_secs"]
                     .as_u64()
                     .unwrap_or(86_400)
                     .min(i64::MAX as u64) as i64,
             );
+        let amount = p["amount_sats"]
+            .as_u64()
+            .filter(|value| *value > 0)
+            .ok_or_else(|| {
+                rusqlite::Error::ToSqlConversionFailure(
+                    "receive amount_sats is missing or not positive".into(),
+                )
+            })?;
         conn.execute("INSERT INTO lightning_receives(hash,request_id,owner,receiver,amount_sats,invoice,expires_at,kind,settled_payment_hash) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
-            params![text("payment_hash"),id,owner,p["receiver_identity_pubkey"].as_str().unwrap_or(owner),p["amount_sats"].as_u64().unwrap_or(0),text("invoice"),expiry,payment_kind,p["settled_payment_hash"].as_str()])?;
+            params![text("payment_hash"),id,owner,p["receiver_identity_pubkey"].as_str().unwrap_or(owner),amount,text("invoice"),expiry,payment_kind,p["settled_payment_hash"].as_str()])?;
     } else if payment_kind != "INTERNAL_BOLT11" {
         let old_payment = text("payment_id");
         let decoded = lightning_invoice::Bolt11Invoice::from_str(text("encoded_invoice")).ok();
@@ -190,7 +201,20 @@ pub fn index_request(
                 .parse()
                 .map_err(|e: String| rusqlite::Error::ToSqlConversionFailure(e.into()))?
         };
-        conn.execute("INSERT INTO lightning_sends(request_id,owner,outbound_transfer_id,invoice,amount_sats,amount_override,kind,expected_id,payment_id,status) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",params![id,owner,text("user_outbound_transfer_external_id"),text("encoded_invoice"),p["amount_sats"].as_u64().or_else(||decoded.as_ref().and_then(|i|i.amount_milli_satoshis().map(|a|a.div_ceil(1000)))).unwrap_or(0),p["amount_sats"].as_u64(),payment_kind,expected,if old_payment.starts_with("init-failed:"){None}else{Some(old_payment)},status])?;
+        let amount = p["amount_sats"]
+            .as_u64()
+            .or_else(|| {
+                decoded
+                    .as_ref()
+                    .and_then(|i| i.amount_milli_satoshis().map(|a| a.div_ceil(1000)))
+            })
+            .filter(|value| *value > 0)
+            .ok_or_else(|| {
+                rusqlite::Error::ToSqlConversionFailure(
+                    "send amount is missing; a zero-amount invoice needs amount_sats".into(),
+                )
+            })?;
+        conn.execute("INSERT INTO lightning_sends(request_id,owner,outbound_transfer_id,invoice,amount_sats,amount_override,kind,expected_id,payment_id,status) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",params![id,owner,text("user_outbound_transfer_external_id"),text("encoded_invoice"),amount,p["amount_sats"].as_u64(),payment_kind,expected,if old_payment.starts_with("init-failed:"){None}else{Some(old_payment)},status])?;
     }
     Ok(())
 }
@@ -209,6 +233,7 @@ impl Db {
             "total_amount_sats": send.amount_sats,
             "idempotency_key": key,
             "payment_kind": send.kind,
+            "offer_id": (send.kind == SendKind::Bolt12).then_some(&send.expected_id),
             "payment_id": send.request_id,
             "network": network,
             "user_outbound_transfer_external_id": send.outbound_transfer_id,
@@ -286,7 +311,7 @@ impl Db {
         self.with(|c| {
             let mut stmt = c.prepare(&format!(
                 "SELECT {SEND_COLUMNS} FROM lightning_sends
-                 WHERE status NOT IN ('SUCCEEDED','FAILED')"
+                 WHERE status NOT IN ('SUCCEEDED','FAILED') ORDER BY request_id LIMIT 1000"
             ))?;
             let rows = stmt.query_map([], send_row)?;
             rows.collect()
@@ -312,7 +337,8 @@ impl Db {
                 "UPDATE lightning_sends SET payment_id=?2,
                     status=CASE WHEN status IN ('SUBMITTING','PREPARED')
                                 THEN 'PENDING' ELSE status END,
-                    last_error=NULL
+                    last_error=CASE WHEN status IN ('SUBMITTING','PREPARED')
+                                    THEN NULL ELSE last_error END
                  WHERE request_id=?1 AND (payment_id IS NULL OR payment_id=?2)",
                 (id, payment_id),
             )?;
@@ -328,12 +354,59 @@ impl Db {
     pub async fn lightning_submission_error(&self, id: &str, error: &str) -> Result<(), String> {
         self.with(|c| {
             c.execute(
-                "UPDATE lightning_sends SET last_error=?2 WHERE request_id=?1",
+                "UPDATE lightning_sends SET last_error=COALESCE(last_error,?2) WHERE request_id=?1 AND status IN ('PREPARED','SUBMITTING','PENDING')",
                 (id, error),
             )
             .map(|_| ())
         })
         .await
+    }
+
+    pub async fn lightning_failure_reason(&self, id: &str) -> Result<Option<String>, String> {
+        self.with(|c| {
+            c.query_row(
+                "SELECT last_error FROM lightning_sends WHERE request_id=?1 OR payment_id=?1",
+                [id],
+                |r| r.get(0),
+            )
+            .optional()
+            .map(Option::flatten)
+        })
+        .await
+    }
+
+    pub async fn record_lightning_proof(
+        &self,
+        request_id: &str,
+        hash: &str,
+        preimage: &str,
+    ) -> Result<(), String> {
+        self.with(|c| c.execute(
+            "UPDATE requests SET payload=json_set(payload,'$.settled_payment_hash',?2,'$.payment_preimage',?3) WHERE id=?1",
+            (request_id, hash, preimage),
+        ).map(|_| ())).await
+    }
+
+    /// Bind one invoice to this single-credit offer before any Spark payout.
+    pub async fn bind_bolt12_receive(&self, offer_id: &str, hash: &str) -> Result<(), String> {
+        self.with(|c| {
+            let changed = c.execute(
+                "UPDATE lightning_receives SET settled_payment_hash=?2 WHERE hash=?1 AND (settled_payment_hash IS NULL OR settled_payment_hash=?2)",
+                (offer_id, hash),
+            )?;
+            if changed == 1 { Ok(()) } else { Err(rusqlite::Error::InvalidQuery) }
+        }).await
+    }
+
+    pub async fn record_lightning_failure(
+        &self,
+        id: &str,
+        reason: Option<&str>,
+    ) -> Result<(), String> {
+        self.with(|c| c.execute(
+            "UPDATE lightning_sends SET last_error=COALESCE(?2,last_error,'Backend reported FAILED without a reason') WHERE request_id=?1 OR payment_id=?1",
+            (id, reason),
+        ).map(|_| ())).await
     }
 }
 
@@ -344,6 +417,80 @@ mod tests {
     fn database() -> (Db, std::path::PathBuf) {
         let dir = std::env::temp_dir().join(format!("ssp-intents-{}", uuid::Uuid::new_v4()));
         (Db::open(dir.to_str().unwrap()).unwrap(), dir)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn failure_reason_survives_refund_recovery_and_restart() {
+        let (db, dir) = database();
+        let send = LightningSend {
+            request_id: "request".into(),
+            owner: "owner".into(),
+            outbound_transfer_id: "funding".into(),
+            invoice: "offer".into(),
+            amount_sats: 1000,
+            amount_override: Some(1000),
+            kind: SendKind::Bolt12,
+            expected_id: "offer-id".into(),
+            payment_id: None,
+            status: SendStatus::Prepared,
+        };
+        db.prepare_lightning_send(&send, "key", "SIGNET")
+            .await
+            .unwrap();
+        db.begin_lightning_submission("request").await.unwrap();
+        db.lightning_submission_error("request", "LDK rejected submission: MissingPaths")
+            .await
+            .unwrap();
+        db.lightning_submission_error("request", "No matching payment during recovery")
+            .await
+            .unwrap();
+        assert_eq!(
+            db.lightning_failure_reason("request")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("LDK rejected submission: MissingPaths")
+        );
+        db.bind_lightning_payment("request", "payment")
+            .await
+            .unwrap();
+        db.record_lightning_failure(
+            "payment",
+            Some("PAYMENT_FAILURE_REASON_INVOICE_REQUEST_EXPIRED"),
+        )
+        .await
+        .unwrap();
+        db.set_payment("payment", "REFUNDING").await.unwrap();
+        db.lightning_submission_error("request", "refund temporarily unavailable")
+            .await
+            .unwrap();
+        db.bind_lightning_payment("request", "payment")
+            .await
+            .unwrap();
+        db.record_lightning_failure("payment", None).await.unwrap();
+        drop(db);
+        let db = Db::open(dir.to_str().unwrap()).unwrap();
+        assert_eq!(
+            db.lightning_failure_reason("request")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("PAYMENT_FAILURE_REASON_INVOICE_REQUEST_EXPIRED")
+        );
+        db.set_payment("payment", "FAILED").await.unwrap();
+        db.bind_lightning_payment("request", "payment")
+            .await
+            .unwrap();
+        assert_eq!(db.payment_status("request").await.unwrap(), "FAILED");
+        assert_eq!(
+            db.lightning_failure_reason("request")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("PAYMENT_FAILURE_REASON_INVOICE_REQUEST_EXPIRED")
+        );
+        drop(db);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread")]

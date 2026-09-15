@@ -1,2 +1,2 @@
 [alias]
-regtest = "run --locked --manifest-path e2e/breez/Cargo.toml --"
+regtest = "run --locked --manifest-path e2e/breez/Cargo.toml --bin open-ssp-breez-e2e --"

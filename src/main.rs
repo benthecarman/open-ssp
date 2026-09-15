@@ -184,7 +184,7 @@ async fn settlements(State(state): State<AppState>, headers: HeaderMap) -> impl 
         );
     }
     let result=state.db.with(|c| {
-        let mut stmt=c.prepare("SELECT request_id,kind,status,payment_id,last_error FROM lightning_sends WHERE status NOT IN ('SUCCEEDED','FAILED') UNION ALL SELECT id,'STATIC_DEPOSIT',status,NULL,last_error FROM deposit_claims WHERE status!='SUCCEEDED' UNION ALL SELECT id,'INSTANT_STATIC_DEPOSIT',phase,NULL,last_error FROM instant_claims WHERE phase!='SPEND_TX_CONFIRMED' UNION ALL SELECT l.request_id,'LIGHTNING_RECEIVE',COALESCE(p.status,'INVOICE_CREATED'),NULL,NULL FROM lightning_receives l LEFT JOIN receive_payments p ON p.hash=l.hash WHERE COALESCE(p.status,'INVOICE_CREATED') NOT IN ('TRANSFER_COMPLETED','HTLC_FAILED') UNION ALL SELECT id,'COOP_EXIT',status,NULL,NULL FROM coop_exits WHERE status NOT IN ('SUCCEEDED','EXPIRED') LIMIT 1000")?;
+        let mut stmt=c.prepare("SELECT request_id,kind,status,payment_id,last_error FROM lightning_sends WHERE status NOT IN ('SUCCEEDED','FAILED') UNION ALL SELECT id,'STATIC_DEPOSIT',COALESCE(json_extract(data,'$.phase'),'CREATED'),NULL,last_error FROM deposit_claims WHERE COALESCE(json_extract(data,'$.phase'),'CREATED')!='SPEND_TX_CONFIRMED' UNION ALL SELECT id,'INSTANT_STATIC_DEPOSIT',phase,NULL,last_error FROM instant_claims WHERE phase!='SPEND_TX_CONFIRMED' UNION ALL SELECT l.request_id,'LIGHTNING_RECEIVE',COALESCE(p.status,'INVOICE_CREATED'),NULL,NULL FROM lightning_receives l LEFT JOIN receive_payments p ON p.hash=l.hash WHERE COALESCE(p.status,'INVOICE_CREATED') NOT IN ('TRANSFER_COMPLETED','HTLC_FAILED') UNION ALL SELECT id,'COOP_EXIT',status,NULL,NULL FROM coop_exits WHERE status NOT IN ('SUCCEEDED','EXPIRED') LIMIT 1000")?;
         let rows=stmt.query_map([],|r|Ok(serde_json::json!({"request_id":r.get::<_,String>(0)?,"kind":r.get::<_,String>(1)?,"state":r.get::<_,String>(2)?,"backend_payment_id":r.get::<_,Option<String>>(3)?,"last_error":r.get::<_,Option<String>>(4)?})))?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
     }).await;
@@ -397,7 +397,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
-    let config = Config::from_env();
+    let config = Config::from_env()?;
     if config.fee_flat_sats_swap != 0 {
         return Err(
             "SSP_SWAP_FEE_SATS must be zero: fee-bearing Swap V3 fills are not supported".into(),

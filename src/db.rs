@@ -828,7 +828,7 @@ impl Db {
 
     pub async fn expired_receive_hashes(&self, now_epoch: i64) -> Result<Vec<String>, String> {
         self.with(|c| {
-            let mut stmt=c.prepare("SELECT r.hash FROM lightning_receives r LEFT JOIN receive_payments p ON p.hash=r.hash WHERE r.kind='BOLT11' AND r.expires_at<=?1 AND COALESCE(p.status,'INVOICE_CREATED') NOT IN ('TRANSFER_COMPLETED','HTLC_FAILED') AND p.transfer_id IS NULL AND NOT EXISTS(SELECT 1 FROM transfers t WHERE t.request_id=r.request_id AND t.kind='LIGHTNING_RECEIVE')")?;
+            let mut stmt=c.prepare("SELECT r.hash FROM lightning_receives r LEFT JOIN receive_payments p ON p.hash=r.hash WHERE r.kind='BOLT11' AND r.expires_at<=?1 AND COALESCE(p.status,'INVOICE_CREATED') NOT IN ('TRANSFER_COMPLETED','HTLC_FAILED') AND p.transfer_id IS NULL AND NOT EXISTS(SELECT 1 FROM transfers t WHERE t.request_id=r.request_id AND t.kind='LIGHTNING_RECEIVE') ORDER BY r.hash LIMIT 1000")?;
             let rows=stmt.query_map([now_epoch],|r|r.get(0))?;
             rows.collect()
         }).await
@@ -895,7 +895,7 @@ impl Db {
     pub async fn payment_status(&self, id: &str) -> Result<String, String> {
         let found: Option<String> = self
             .with(|c| {
-                c.query_row("SELECT status FROM lightning_sends WHERE request_id=?1 OR payment_id=?1 UNION ALL SELECT status FROM payments WHERE id=?1 LIMIT 1", (id,), |r| {
+                c.query_row("SELECT status FROM (SELECT 1 AS rank,status FROM lightning_sends WHERE request_id=?1 OR payment_id=?1 UNION ALL SELECT 2,status FROM payments WHERE id=?1 ORDER BY rank LIMIT 1)", (id,), |r| {
                     r.get(0)
                 })
                 .map(Some)
@@ -960,7 +960,8 @@ impl Db {
             let mut statement = c.prepare(
                 "SELECT operation_id,parent_node_id,parent_value_sats,child_values_sats,plan,
                         status,child_node_ids,last_error
-                 FROM spark_split_operations WHERE status!='COMPLETED' ORDER BY created_at",
+                 FROM spark_split_operations WHERE status!='COMPLETED'
+                 ORDER BY created_at,operation_id LIMIT 1000",
             )?;
             let rows = statement
                 .query_map([], spark_split_from_row)?
@@ -1724,6 +1725,14 @@ mod tests {
             .await
             .unwrap();
 
+        db.bind_bolt12_receive("offer", "hash").await.unwrap();
+        drop(db);
+        let db = Db::open(dir.to_str().unwrap()).unwrap();
+        db.bind_bolt12_receive("offer", "hash").await.unwrap();
+        assert!(db
+            .bind_bolt12_receive("offer", "other-invoice")
+            .await
+            .is_err());
         for _ in 0..2 {
             db.commit_bolt12_receive("offer", "hash", "transfer", "request", "owner")
                 .await
@@ -2161,7 +2170,7 @@ mod tests {
             "LIGHTNING_RECEIVE",
             "owner",
             &chrono::Utc::now().to_rfc3339(),
-            &serde_json::json!({"payment_hash": "hash"}),
+            &serde_json::json!({"payment_hash": "hash", "amount_sats": 1000}),
             None,
         )
         .await
