@@ -538,9 +538,9 @@ impl CoopExitService {
 
     pub async fn response(&self, record: &ExitRecord) -> Result<Value, String> {
         let updated = self.db.request_updated_at(&record.id).await?;
-        let tx: Transaction =
-            deserialize(&hex::decode(&record.raw_exit).expect("stored transaction hex"))
-                .expect("stored transaction");
+        let tx: Transaction = hex::decode(&record.raw_exit)
+            .map_err(|e| e.to_string())
+            .and_then(|raw| deserialize(&raw).map_err(|e| e.to_string()))?;
         Ok(
             json!({"__typename":"CoopExitRequest", "id":record.id, "network":self.network_name,
             "created_at":timestamp(record.created_at), "updated_at":updated,
@@ -610,7 +610,21 @@ impl CoopExitService {
             }
             let child: Transaction = deserialize(&hex::decode(&raw).map_err(|e| e.to_string())?)
                 .map_err(|e| e.to_string())?;
-            let fee = parent.output[2].value.to_sat() - child.output[0].value.to_sat();
+            let change = parent
+                .output
+                .get(2)
+                .ok_or("withdrawal has no SSP change")?
+                .value
+                .to_sat();
+            let payout = child
+                .output
+                .first()
+                .ok_or("fee bump has no payout output")?
+                .value
+                .to_sat();
+            let fee = change
+                .checked_sub(payout)
+                .ok_or("fee bump output exceeds the parent change")?;
             if fee > max_fee_sats {
                 return Err("stored fee bump exceeds max_fee_sats".into());
             }

@@ -54,10 +54,22 @@ pub struct Config {
     pub instant_max_deposit_sats: u64,
 }
 
+fn parsed<T: std::str::FromStr>(key: &str, default: T) -> Result<T, String>
+where
+    T::Err: std::fmt::Display,
+{
+    match std::env::var(key) {
+        Ok(value) if !value.trim().is_empty() => {
+            value.trim().parse::<T>().map_err(|e| format!("{key}: {e}"))
+        }
+        _ => Ok(default),
+    }
+}
+
 impl Config {
-    pub fn from_env() -> Self {
+    pub fn from_env() -> Result<Self, String> {
         let get = |k: &str, d: &str| std::env::var(k).unwrap_or_else(|_| d.to_string());
-        Self {
+        Ok(Self {
             listen_addr: get("SSP_LISTEN_ADDR", "127.0.0.1:5000"),
             cors_origins: get("SSP_CORS_ORIGINS", ""),
             network: get("SSP_NETWORK", "REGTEST"),
@@ -69,7 +81,7 @@ impl Config {
             ldk_api_key: get("LDK_API_KEY", ""),
             ldk_api_key_file: get("LDK_API_KEY_FILE", ""),
             ldk_tls_cert_file: get("LDK_TLS_CERT_FILE", ""),
-            fee_flat_sats_swap: get("SSP_SWAP_FEE_SATS", "0").parse().unwrap_or(0),
+            fee_flat_sats_swap: parsed("SSP_SWAP_FEE_SATS", 0)?,
             ssp_public_url: get("SSP_PUBLIC_URL", "http://127.0.0.1:5000")
                 .trim_end_matches('/')
                 .to_string(),
@@ -85,22 +97,35 @@ impl Config {
             so_cert_files: get("SO_CERT_FILES", ""),
             ssp_operator_hosts: get("SSP_OPERATOR_HOSTS", ""),
             ssp_operator_cert_files: get("SSP_OPERATOR_CERT_FILES", ""),
-            ssp_min_split_child_sats: get("SSP_MIN_SPLIT_CHILD_SATS", "330")
-                .parse()
-                .unwrap_or(330),
+            ssp_min_split_child_sats: parsed("SSP_MIN_SPLIT_CHILD_SATS", 330)?,
+            // A missing token fails closed unless SPARK_ADMIN_ALLOW_NO_AUTH=1
+            // is explicit.
             spark_admin_token: std::env::var("SPARK_ADMIN_TOKEN")
                 .or_else(|_| std::env::var("SIDECAR_TOKEN"))
                 .unwrap_or_default(),
-            frost_threshold: get("SSP_FROST_THRESHOLD", "2").parse().unwrap_or(2),
-            max_swap_total_sats: get("MAX_SWAP_TOTAL_SATS", "1000000")
-                .parse()
-                .unwrap_or(1000000),
-            instant_max_outstanding_sats: get("SSP_INSTANT_MAX_OUTSTANDING_SATS", "0")
-                .parse()
-                .unwrap_or(0),
-            instant_max_deposit_sats: get("SSP_INSTANT_MAX_DEPOSIT_SATS", "0")
-                .parse()
-                .unwrap_or(0),
-        }
+            frost_threshold: parsed("SSP_FROST_THRESHOLD", 2)?,
+            max_swap_total_sats: parsed("MAX_SWAP_TOTAL_SATS", 1_000_000)?,
+            instant_max_outstanding_sats: parsed("SSP_INSTANT_MAX_OUTSTANDING_SATS", 0)?,
+            instant_max_deposit_sats: parsed("SSP_INSTANT_MAX_DEPOSIT_SATS", 0)?,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parsed;
+
+    #[test]
+    fn numeric_settings_use_defaults_and_reject_malformed_values() {
+        std::env::set_var("SSP_TEST_LIMIT", "21");
+        assert_eq!(parsed::<u64>("SSP_TEST_LIMIT", 0).unwrap(), 21);
+        std::env::set_var("SSP_TEST_LIMIT", " 7 ");
+        assert_eq!(parsed::<u64>("SSP_TEST_LIMIT", 0).unwrap(), 7);
+        std::env::set_var("SSP_TEST_LIMIT", "");
+        assert_eq!(parsed::<u64>("SSP_TEST_LIMIT", 330).unwrap(), 330);
+        std::env::set_var("SSP_TEST_LIMIT", "21,5");
+        assert!(parsed::<u64>("SSP_TEST_LIMIT", 0)
+            .unwrap_err()
+            .contains("SSP_TEST_LIMIT"));
     }
 }

@@ -99,13 +99,18 @@ impl SendLdk for LdkServerClient {
 
 fn validate_send_payment(send: &LightningSend, payment: &Payment) -> Result<(), String> {
     use ldk_server_client::ldk_server_grpc::types::payment_kind::Kind;
-    let expected_msat = if send.kind == SendKind::Bolt11 {
-        lightning_invoice::Bolt11Invoice::from_str(&send.invoice)
-            .ok()
-            .and_then(|invoice| invoice.amount_milli_satoshis())
-            .unwrap_or(send.amount_sats.saturating_mul(1000))
-    } else {
-        send.amount_sats.saturating_mul(1000)
+    // The invoice amount wins; a zero-amount BOLT11 invoice and a BOLT12 offer
+    // both fall back to the stored intent. Both paths are overflow-checked so an
+    // oversized intent reports an overflow rather than a mismatch.
+    let expected_msat = match lightning_invoice::Bolt11Invoice::from_str(&send.invoice)
+        .ok()
+        .and_then(|invoice| invoice.amount_milli_satoshis())
+    {
+        Some(msat) => msat,
+        None => send
+            .amount_sats
+            .checked_mul(1000)
+            .ok_or("send amount is too large")?,
     };
     if payment.direction != PaymentDirection::Outbound as i32
         || !payment.amount_msat.is_some_and(|a| a == expected_msat)
@@ -221,6 +226,7 @@ pub enum LnEvent {
     },
     OutboundFailed {
         payment_id: String,
+        reason: Option<String>,
     },
     InboundClaimable {
         payment_hash: String,
@@ -232,6 +238,7 @@ pub enum LnEvent {
     InboundBolt12Received {
         offer_id: String,
         payment_hash: String,
+        preimage: Option<String>,
         amount_msat: Option<u64>,
     },
 }
@@ -315,7 +322,16 @@ fn map_envelope(env: ldk_server_client::ldk_server_grpc::events::EventEnvelope) 
         }
         LdkRawEvent::PaymentFailed(e) => {
             if let Some(p) = e.payment {
-                out.push(LnEvent::OutboundFailed { payment_id: p.id });
+                out.push(LnEvent::OutboundFailed {
+                    payment_id: p.id,
+                    reason: e.reason.map(|r| {
+                        ldk_server_client::ldk_server_grpc::events::PaymentFailureReason::from_i32(
+                            r,
+                        )
+                        .map(|r| r.as_str_name().to_string())
+                        .unwrap_or_else(|| format!("UNKNOWN_{r}"))
+                    }),
+                });
             }
         }
         LdkRawEvent::PaymentClaimable(e) => {
@@ -336,6 +352,7 @@ fn map_envelope(env: ldk_server_client::ldk_server_grpc::events::EventEnvelope) 
                 out.push(LnEvent::InboundBolt12Received {
                     offer_id,
                     payment_hash,
+                    preimage: bolt12_preimage(e.payment.as_ref()),
                     amount_msat: e.payment.and_then(|payment| payment.amount_msat),
                 });
             }
@@ -343,6 +360,14 @@ fn map_envelope(env: ldk_server_client::ldk_server_grpc::events::EventEnvelope) 
         _ => {}
     }
     out
+}
+
+fn bolt12_preimage(payment: Option<&Payment>) -> Option<String> {
+    use ldk_server_client::ldk_server_grpc::types::payment_kind::Kind;
+    match payment?.kind.as_ref()?.kind.as_ref()? {
+        Kind::Bolt12Offer(offer) => offer.preimage.clone(),
+        _ => None,
+    }
 }
 
 fn bolt12_offer_ids(
@@ -881,6 +906,9 @@ impl LdkGrpcBackend {
                     .as_deref()
                     .ok_or_else(|| format!("payment {payment_id} succeeded without a preimage"))?;
                 validate_preimage(hash, preimage)?;
+                self.db
+                    .record_lightning_proof(&send.request_id, hash, preimage)
+                    .await?;
             }
             _ => {
                 return Err(format!(
@@ -891,10 +919,21 @@ impl LdkGrpcBackend {
         self.db.set_payment(&payment_id, "SUCCEEDED").await
     }
 
-    async fn fail_managed_payment(&self, payment_id: &str) -> Result<(), String> {
+    async fn fail_managed_payment(
+        &self,
+        payment_id: &str,
+        reason: Option<&str>,
+    ) -> Result<(), String> {
         let Some(send) = self.db.lightning_send_for_payment(payment_id).await? else {
             return Ok(());
         };
+        if send.status == SendStatus::Succeeded {
+            return Ok(());
+        }
+        self.db.record_lightning_failure(payment_id, reason).await?;
+        if send.status == SendStatus::Failed {
+            return Ok(());
+        }
         if send.kind == SendKind::Bolt12 {
             self.db.set_payment(payment_id, "REFUNDING").await?;
             self.spark
@@ -908,8 +947,10 @@ impl LdkGrpcBackend {
         &self,
         offer_id: &str,
         payment_hash: &str,
+        preimage: Option<&str>,
         amount_msat: Option<u64>,
     ) -> Result<(), String> {
+        let _guard = self.receive_lock.lock().await;
         let Some(receive) = self.db.lightning_receive_for_hash(offer_id).await? else {
             return Ok(());
         };
@@ -925,6 +966,12 @@ impl LdkGrpcBackend {
                 "BOLT12 receive has {amount_msat:?} msat; expected at least {expected_msat}"
             ));
         }
+        let preimage = preimage.ok_or("BOLT12 receive succeeded without a preimage")?;
+        validate_preimage(payment_hash, preimage)?;
+        self.db.bind_bolt12_receive(offer_id, payment_hash).await?;
+        self.db
+            .record_lightning_proof(&receive.request_id, payment_hash, preimage)
+            .await?;
         let transfer_id = self
             .spark
             .settle_lightning_receive(&receive.receiver, payment_hash, receive.amount_sats)
@@ -1031,7 +1078,11 @@ impl LdkGrpcBackend {
                             }
                         }
                         value if value == PaymentStatus::Failed as i32 => {
-                            self.fail_managed_payment(&payment.id).await?;
+                            self.fail_managed_payment(
+                                &payment.id,
+                                payment.failure_reason.as_deref(),
+                            )
+                            .await?;
                         }
                         _ => self.db.set_payment(&payment.id, "PENDING").await?,
                     }
@@ -1040,7 +1091,12 @@ impl LdkGrpcBackend {
                 if let Some((offer_id, payment_hash)) = bolt12_offer_ids(Some(payment.clone())) {
                     if payment.status == PaymentStatus::Succeeded as i32 {
                         if let Err(error) = self
-                            .finish_bolt12_receive(&offer_id, &payment_hash, payment.amount_msat)
+                            .finish_bolt12_receive(
+                                &offer_id,
+                                &payment_hash,
+                                bolt12_preimage(Some(&payment)).as_deref(),
+                                payment.amount_msat,
+                            )
                             .await
                         {
                             tracing::warn!(
@@ -1306,7 +1362,10 @@ impl LdkGrpcBackend {
                     }
                 }
                 Some(p) if p.status == PaymentStatus::Failed as i32 => {
-                    match self.fail_managed_payment(&p.id).await {
+                    match self
+                        .fail_managed_payment(&p.id, p.failure_reason.as_deref())
+                        .await
+                    {
                         Ok(()) => "FAILED".to_string(),
                         Err(error) => {
                             tracing::warn!(payment_id, "BOLT12 refund is pending: {error}");
@@ -1417,7 +1476,7 @@ impl LdkGrpcBackend {
                     let _ = self.db.set_payment(&payment.id, "SETTLING").await;
                 }
             }
-            LnEvent::OutboundFailed { payment_id } => {
+            LnEvent::OutboundFailed { payment_id, reason } => {
                 match self.is_managed_outbound(&payment_id).await {
                     Ok(true) => {}
                     Ok(false) => return,
@@ -1429,7 +1488,10 @@ impl LdkGrpcBackend {
                         return;
                     }
                 }
-                if let Err(error) = self.fail_managed_payment(&payment_id).await {
+                if let Err(error) = self
+                    .fail_managed_payment(&payment_id, reason.as_deref())
+                    .await
+                {
                     tracing::warn!(payment_id, "BOLT12 refund is pending: {error}");
                 }
             }
@@ -1464,10 +1526,16 @@ impl LdkGrpcBackend {
             LnEvent::InboundBolt12Received {
                 offer_id,
                 payment_hash,
+                preimage,
                 amount_msat,
             } => {
                 if let Err(error) = self
-                    .finish_bolt12_receive(&offer_id, &payment_hash, amount_msat)
+                    .finish_bolt12_receive(
+                        &offer_id,
+                        &payment_hash,
+                        preimage.as_deref(),
+                        amount_msat,
+                    )
                     .await
                 {
                     tracing::warn!(
@@ -1910,6 +1978,26 @@ mod tests {
     }
 
     #[test]
+    fn failed_event_keeps_backend_reason() {
+        use ldk_server_client::ldk_server_grpc::events::{
+            EventEnvelope, PaymentFailed, PaymentFailureReason,
+        };
+        let events = map_envelope(EventEnvelope {
+            event: Some(LdkRawEvent::PaymentFailed(PaymentFailed {
+                payment: Some(Payment {
+                    id: "payment".into(),
+                    ..Default::default()
+                }),
+                reason: Some(PaymentFailureReason::InvoiceRequestExpired as i32),
+            })),
+        });
+        assert!(
+            matches!(events.as_slice(), [LnEvent::OutboundFailed {payment_id,reason:Some(reason)}]
+            if payment_id == "payment" && reason == "PAYMENT_FAILURE_REASON_INVOICE_REQUEST_EXPIRED")
+        );
+    }
+
+    #[test]
     fn bolt12_receive_event_keeps_offer_and_payment_ids() {
         use ldk_server_client::ldk_server_grpc::{
             events::{EventEnvelope, PaymentReceived},
@@ -1941,6 +2029,7 @@ mod tests {
                 offer_id,
                 payment_hash,
                 amount_msat: Some(1_001_000),
+                preimage: None,
             }] if offer_id == "offer-id" && payment_hash == "payment-hash"
         ));
     }

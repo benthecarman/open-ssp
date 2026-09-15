@@ -187,7 +187,8 @@ pub async fn dispatch(
                         "__typename": "Invoice",
                         "encoded_invoice": offer.offer,
                         "bitcoin_network": state.config.network,
-                        "payment_hash": offer.offer_id,
+                        "payment_hash": "",
+                        "offer_id": offer.offer_id,
                         "amount": currency_amount(amount),
                         "created_at": now,
                         "expires_at": invoice_expires_at,
@@ -285,6 +286,9 @@ pub async fn dispatch(
         "RequestLightningSend" | "request_lightning_send" => {
             let owner = auth::require_session(&state, headers).await?;
             let inv = str_of(&input, "encoded_invoice");
+            if inv.is_empty() {
+                return Err("encoded_invoice is required".to_string());
+            }
             let amt = opt_num(&input, "amount_sats");
             let ext_id = str_of(&input, "user_outbound_transfer_external_id");
             if ext_id.is_empty() {
@@ -359,8 +363,21 @@ pub async fn dispatch(
             }
             let network = state.config.network.clone();
             // Target list (rc schema) or scalar (dated schema).
+            const MAX_SWAP_TARGETS: usize = 32;
             let targets: Vec<u64> = match input.get("target_amount_sats") {
-                Some(Value::Array(a)) => a.iter().filter_map(|e| e.as_u64()).collect(),
+                Some(Value::Array(a)) => {
+                    if a.len() > MAX_SWAP_TARGETS {
+                        return Err(format!(
+                            "target_amount_sats accepts at most {MAX_SWAP_TARGETS} targets"
+                        ));
+                    }
+                    a.iter()
+                        .map(|e| {
+                            e.as_u64()
+                                .ok_or_else(|| "target amounts must be numbers".to_string())
+                        })
+                        .collect::<Result<Vec<_>, _>>()?
+                }
                 Some(v) => v.as_u64().map(|t| vec![t]).unwrap_or_default(),
                 None => vec![],
             };
@@ -724,6 +741,11 @@ async fn user_request_union(state: &AppState, rec: &Value) -> Result<Value, Stri
                 "fee": sats(0),
                 "idempotency_key": p.get("idempotency_key").cloned().unwrap_or(Value::Null),
                 "status": status,
+                "failure_reason": state.db.lightning_failure_reason(id.as_str().unwrap_or("")).await?,
+                "payment_kind": p.get("payment_kind"),
+                "payment_preimage": p.get("payment_preimage"),
+                "payment_hash": p.get("settled_payment_hash"),
+                "offer_id": p.get("offer_id"),
             })
         }
         "LIGHTNING_RECEIVE" => {
@@ -771,7 +793,10 @@ async fn user_request_union(state: &AppState, rec: &Value) -> Result<Value, Stri
                     "__typename": "Invoice",
                     "encoded_invoice": p.get("invoice").cloned().unwrap_or(Value::Null),
                     "bitcoin_network": net,
-                    "payment_hash": p.get("payment_hash").cloned().unwrap_or(Value::Null),
+                    "payment_hash": if p.get("invoice").and_then(Value::as_str).is_some_and(|s| s.starts_with("lno1")) {
+                        p.get("settled_payment_hash").cloned().unwrap_or(json!(""))
+                    } else { p.get("payment_hash").cloned().unwrap_or(Value::Null) },
+                    "offer_id": if p.get("invoice").and_then(Value::as_str).is_some_and(|s| s.starts_with("lno1")) {p.get("payment_hash")} else {None},
                     "amount": sats(amount),
                     "created_at": created,
                     "expires_at": p
@@ -782,7 +807,7 @@ async fn user_request_union(state: &AppState, rec: &Value) -> Result<Value, Stri
                 },
                 "status": status,
                 "transfer": transfer,
-                "payment_preimage": preimage,
+                "payment_preimage": preimage.or_else(|| p.get("payment_preimage").and_then(Value::as_str).map(str::to_string)),
                 "receiver_identity_public_key": p
                     .get("receiver_identity_pubkey")
                     .cloned()

@@ -243,6 +243,15 @@ impl SparkService {
         if !cert_files.is_empty() && cert_files.len() != hosts.len() {
             return Err("SO_CERT_FILES must be empty or match SO_HOSTS".to_string());
         }
+        if config.frost_threshold == 0 || config.frost_threshold > hosts.len() {
+            return Err(format!(
+                "SSP_FROST_THRESHOLD {} is outside 1..{} for {} operators",
+                config.frost_threshold,
+                hosts.len(),
+                hosts.len()
+            ));
+        }
+        let local = crate::webhooks::allow_local(&config.network);
         let mut operators = Vec::with_capacity(hosts.len());
         for (index, (host, pubkey)) in hosts.iter().zip(&pubkeys).enumerate() {
             let cert = if cert_files.is_empty() || cert_files[index].is_empty() {
@@ -253,11 +262,7 @@ impl SparkService {
                         .map_err(|e| format!("read SO certificate {}: {e}", cert_files[index]))?,
                 )
             };
-            let address = if host.contains("://") {
-                host.clone()
-            } else {
-                format!("https://{host}")
-            };
+            let address = operator_address(host, local)?;
             operators.push(
                 SparkWalletConfig::create_operator_config(
                     index,
@@ -334,11 +339,7 @@ impl SparkService {
                         )
                     })?)
                 };
-                let address = if host.contains("://") {
-                    host.clone()
-                } else {
-                    format!("https://{host}")
-                };
+                let address = operator_address(host, local)?;
                 private_operators.push(
                     SparkWalletConfig::create_operator_config(
                         index,
@@ -801,7 +802,12 @@ impl SparkService {
                 &output_key,
             )
             .map_err(|_| "deposit recovery signature is invalid")?;
-        spend.input[0].witness.push(bytes);
+        spend
+            .input
+            .first_mut()
+            .ok_or("deposit recovery has no input")?
+            .witness
+            .push(bytes);
         Ok(spend)
     }
 
@@ -1573,6 +1579,7 @@ impl SparkService {
                 Ok(pending) => {
                     for (id, primary) in pending {
                         let Ok(primary) = primary.parse() else {
+                            tracing::warn!(%id, %primary, "swap history has an unusable transfer id");
                             continue;
                         };
                         match self.find_transfer(&primary).await {
@@ -1979,6 +1986,19 @@ fn parse_network(value: &str) -> Result<Network, String> {
         "SIGNET" => Ok(Network::Signet),
         "LOCAL" | "REGTEST" => Ok(Network::Regtest),
         _ => Err(format!("unsupported Spark network {value}")),
+    }
+}
+
+/// Operator endpoints are HTTPS. A bare host is upgraded to `https://`, and an
+/// explicit scheme must match, so a typo cannot silently downgrade a pinned
+/// operator to plaintext. `http://` is only accepted on the local test
+/// networks, matching the webhook destination policy.
+fn operator_address(host: &str, local: bool) -> Result<String, String> {
+    match host.split_once("://") {
+        None => Ok(format!("https://{host}")),
+        Some(("https", _)) => Ok(host.to_string()),
+        Some(("http", _)) if local => Ok(host.to_string()),
+        _ => Err(format!("operator {host} needs an http(s) URL")),
     }
 }
 
@@ -2422,6 +2442,24 @@ mod tests {
         let error = load_or_create_mnemonic(path.to_str().unwrap(), true).unwrap_err();
         assert!(error.contains("is required"));
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn operator_addresses_stay_https_except_on_local_networks() {
+        assert_eq!(
+            operator_address("operator-0:8535", false).unwrap(),
+            "https://operator-0:8535"
+        );
+        assert_eq!(
+            operator_address("https://operator-0:8535", false).unwrap(),
+            "https://operator-0:8535"
+        );
+        assert_eq!(
+            operator_address("http://127.0.0.1:8535", true).unwrap(),
+            "http://127.0.0.1:8535"
+        );
+        assert!(operator_address("http://operator-0:8535", false).is_err());
+        assert!(operator_address("ftp://operator-0:8535", true).is_err());
     }
 
     #[test]
