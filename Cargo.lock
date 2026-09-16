@@ -1713,7 +1713,7 @@ checksum = "bbd2bcb4c963f2ddae06a2efc7e9f3591312473c50c6685e1f298068316e66fe"
 [[package]]
 name = "ldk-server-client"
 version = "0.1.0"
-source = "git+https://github.com/lightningdevkit/ldk-server#6d6d810714706c225ce7effc2163eff6a1b54221"
+source = "git+https://github.com/lightningdevkit/ldk-server?rev=c31191ae6cf70b22b49473b2b435656fc3516ef9#c31191ae6cf70b22b49473b2b435656fc3516ef9"
 dependencies = [
  "bitcoin_hashes",
  "hex-conservative 0.2.3",
@@ -1729,7 +1729,7 @@ dependencies = [
 [[package]]
 name = "ldk-server-grpc"
 version = "0.1.0"
-source = "git+https://github.com/lightningdevkit/ldk-server#6d6d810714706c225ce7effc2163eff6a1b54221"
+source = "git+https://github.com/lightningdevkit/ldk-server?rev=c31191ae6cf70b22b49473b2b435656fc3516ef9#c31191ae6cf70b22b49473b2b435656fc3516ef9"
 dependencies = [
  "bytes",
  "http 1.5.0",

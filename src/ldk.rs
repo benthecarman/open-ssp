@@ -4,7 +4,7 @@ use ldk_server_client::{
     client::LdkServerClient,
     ldk_server_grpc::{
         api::{
-            Bolt11ClaimForHashRequest, Bolt11FailForHashRequest, Bolt11ReceiveForHashRequest,
+            Bolt11ClaimForIdRequest, Bolt11FailForIdRequest, Bolt11ReceiveForHashRequest,
             Bolt11SendRequest, Bolt12ReceiveRequest, Bolt12SendRequest, DecodeInvoiceRequest,
             DecodeOfferRequest, GetPaymentDetailsRequest, ListPaymentsRequest,
         },
@@ -117,7 +117,10 @@ fn validate_send_payment(send: &LightningSend, payment: &Payment) -> Result<(), 
     {
         return Err("LDK payment direction or amount does not match the send intent".into());
     }
-    let known_id = send.payment_id.as_ref().is_some_and(|id| id == &payment.id);
+    let known_id = send
+        .payment_id
+        .as_ref()
+        .is_some_and(|id| id == &payment.payment_id);
     let matches = match (
         send.kind,
         payment.kind.as_ref().and_then(|k| k.kind.as_ref()),
@@ -145,7 +148,7 @@ async fn recover_submission<L: SendLdk + ?Sized>(
     let payment = ldk.lookup(send).await?;
     if let Some(payment) = &payment {
         validate_send_payment(send, payment)?;
-        db.bind_lightning_payment(&send.request_id, &payment.id)
+        db.bind_lightning_payment(&send.request_id, &payment.payment_id)
             .await?;
     }
     Ok(payment)
@@ -228,11 +231,9 @@ pub enum LnEvent {
         payment_id: String,
         reason: Option<String>,
     },
-    InboundClaimable {
-        payment_hash: String,
-        amount_msat: Option<u64>,
-    },
+    InboundClaimable(ClaimableReceive),
     InboundReceived {
+        payment_id: String,
         payment_hash: String,
     },
     InboundBolt12Received {
@@ -241,6 +242,13 @@ pub enum LnEvent {
         preimage: Option<String>,
         amount_msat: Option<u64>,
     },
+}
+
+#[derive(Clone, Debug)]
+pub struct ClaimableReceive {
+    pub payment_id: String,
+    pub payment_hash: String,
+    pub amount_msat: Option<u64>,
 }
 
 impl LdkGrpcBackend {
@@ -321,33 +329,32 @@ fn map_envelope(env: ldk_server_client::ldk_server_grpc::events::EventEnvelope) 
             }
         }
         LdkRawEvent::PaymentFailed(e) => {
-            if let Some(p) = e.payment {
-                out.push(LnEvent::OutboundFailed {
-                    payment_id: p.id,
-                    reason: e.reason.map(|r| {
-                        ldk_server_client::ldk_server_grpc::events::PaymentFailureReason::from_i32(
-                            r,
-                        )
+            out.push(LnEvent::OutboundFailed {
+                payment_id: e.payment_id,
+                reason: e.reason.map(|r| {
+                    ldk_server_client::ldk_server_grpc::events::PaymentFailureReason::from_i32(r)
                         .map(|r| r.as_str_name().to_string())
                         .unwrap_or_else(|| format!("UNKNOWN_{r}"))
-                    }),
-                });
-            }
+                }),
+            });
         }
         LdkRawEvent::PaymentClaimable(e) => {
             if let Some(payment) = e.payment {
-                let amount_msat = payment.amount_msat;
                 if let Some(hash) = bolt11_hash(Some(payment)) {
-                    out.push(LnEvent::InboundClaimable {
+                    out.push(LnEvent::InboundClaimable(ClaimableReceive {
+                        payment_id: e.payment_id,
                         payment_hash: hash,
-                        amount_msat,
-                    });
+                        amount_msat: Some(e.claimable_amount_msat),
+                    }));
                 }
             }
         }
         LdkRawEvent::PaymentReceived(e) => {
             if let Some(hash) = bolt11_hash(e.payment.clone()) {
-                out.push(LnEvent::InboundReceived { payment_hash: hash });
+                out.push(LnEvent::InboundReceived {
+                    payment_id: e.payment_id,
+                    payment_hash: hash,
+                });
             } else if let Some((offer_id, payment_hash)) = bolt12_offer_ids(e.payment.clone()) {
                 out.push(LnEvent::InboundBolt12Received {
                     offer_id,
@@ -392,6 +399,16 @@ fn bolt11_hash(p: Option<ldk_server_client::ldk_server_grpc::types::Payment>) ->
     }
 }
 
+fn bolt11_claimable_amount(payment: &Payment) -> Option<u64> {
+    use ldk_server_client::ldk_server_grpc::types::payment_kind::Kind;
+    match payment.kind.as_ref()?.kind.as_ref()? {
+        Kind::Bolt11(bolt11) => payment
+            .amount_msat?
+            .checked_sub(bolt11.counterparty_skimmed_fee_msat.unwrap_or(0)),
+        _ => None,
+    }
+}
+
 #[async_trait::async_trait]
 trait ReceiveSpark: Send + Sync {
     async fn swap_receive(
@@ -421,38 +438,38 @@ impl ReceiveSpark for SparkService {
 trait ReceiveLdk: Send + Sync {
     async fn claim_receive(
         &self,
-        payment_hash: &str,
+        payment_id: &str,
         amount_msat: u64,
         preimage: &str,
     ) -> Result<(), String>;
-    async fn fail_receive(&self, payment_hash: &str) -> Result<(), String>;
+    async fn fail_receive(&self, payment_id: &str) -> Result<(), String>;
 }
 
 #[async_trait::async_trait]
 impl ReceiveLdk for LdkServerClient {
     async fn claim_receive(
         &self,
-        payment_hash: &str,
+        payment_id: &str,
         amount_msat: u64,
         preimage: &str,
     ) -> Result<(), String> {
-        self.bolt11_claim_for_hash(Bolt11ClaimForHashRequest {
-            payment_hash: Some(payment_hash.to_string()),
+        self.bolt11_claim_for_id(Bolt11ClaimForIdRequest {
+            payment_id: payment_id.to_string(),
             claimable_amount_msat: Some(amount_msat),
             preimage: preimage.to_string(),
         })
         .await
         .map(|_| ())
-        .map_err(|e| format!("claim Lightning receive {payment_hash}: {e}"))
+        .map_err(|e| format!("claim Lightning receive {payment_id}: {e}"))
     }
 
-    async fn fail_receive(&self, payment_hash: &str) -> Result<(), String> {
-        self.bolt11_fail_for_hash(Bolt11FailForHashRequest {
-            payment_hash: payment_hash.to_string(),
+    async fn fail_receive(&self, payment_id: &str) -> Result<(), String> {
+        self.bolt11_fail_for_id(Bolt11FailForIdRequest {
+            payment_id: payment_id.to_string(),
         })
         .await
         .map(|_| ())
-        .map_err(|e| format!("fail Lightning receive {payment_hash}: {e}"))
+        .map_err(|e| format!("fail Lightning receive {payment_id}: {e}"))
     }
 }
 
@@ -510,10 +527,11 @@ fn is_definitive_swap_failure(error: &str) -> bool {
 async fn fail_unfunded_receive<L: ReceiveLdk + ?Sized>(
     db: &Db,
     ldk: &L,
-    payment_hash: &str,
+    payment: &ClaimableReceive,
     delays: &[Duration],
 ) {
-    match retry_bounded(|| ldk.fail_receive(payment_hash), delays).await {
+    let payment_hash = &payment.payment_hash;
+    match retry_bounded(|| ldk.fail_receive(&payment.payment_id), delays).await {
         Ok(()) => {
             let _ = db.set_receive_status(payment_hash, "HTLC_FAILED").await;
         }
@@ -532,8 +550,7 @@ async fn process_standard_receive<S, L>(
     receive_lock: &tokio::sync::Mutex<()>,
     spark: &S,
     ldk: &L,
-    payment_hash: &str,
-    amount_msat: Option<u64>,
+    payment: &ClaimableReceive,
     delays: &[Duration],
 ) -> Result<bool, String>
 where
@@ -541,31 +558,49 @@ where
     L: ReceiveLdk + ?Sized,
 {
     let _guard = receive_lock.lock().await;
+    let payment_hash = &payment.payment_hash;
+    let payment_id = &payment.payment_id;
     if db.internal_send(payment_hash).await?.is_some() {
         // Do not change the receive's local settlement state when rejecting
         // an external HTLC for an invoice reserved by a local payer.
-        retry_bounded(|| ldk.fail_receive(payment_hash), delays).await?;
+        retry_bounded(|| ldk.fail_receive(payment_id), delays).await?;
         return Ok(true);
     }
     let Some(mut receive) = db.lightning_receive_for_hash(payment_hash).await? else {
+        retry_bounded(|| ldk.fail_receive(payment_id), delays).await?;
         return Ok(false);
     };
-    if receive.status.as_str() == "TRANSFER_COMPLETED" || receive.status.as_str() == "HTLC_FAILED" {
+    // An invoice hash is a single-credit key; every inbound attempt has its own
+    // backend ID. Reject a second attempt without changing the first one's state.
+    if receive
+        .payment_id
+        .as_ref()
+        .is_some_and(|id| id != payment_id)
+        || receive.status.as_str() == "HTLC_FAILED"
+        || (receive.status.as_str() == "TRANSFER_COMPLETED"
+            && receive.payment_id.as_ref() != Some(payment_id))
+    {
+        retry_bounded(|| ldk.fail_receive(payment_id), delays).await?;
+        return Ok(true);
+    }
+    if receive.status.as_str() == "TRANSFER_COMPLETED" {
         return Ok(true);
     }
     let expected_msat = receive
         .amount_sats
         .checked_mul(1000)
         .ok_or_else(|| "Lightning receive amount is too large".to_string())?;
-    let actual_msat =
-        amount_msat.ok_or_else(|| "claimable Lightning payment has no amount".to_string())?;
+    let actual_msat = payment
+        .amount_msat
+        .ok_or_else(|| "claimable Lightning payment has no amount".to_string())?;
+    db.mark_receive_claimable(payment_hash, payment_id, actual_msat)
+        .await?;
     if actual_msat != expected_msat {
-        fail_unfunded_receive(db, ldk, payment_hash, delays).await;
+        fail_unfunded_receive(db, ldk, payment, delays).await;
         return Err(format!(
             "claimable amount is {actual_msat} msat; expected {expected_msat} msat"
         ));
     }
-    db.mark_receive_claimable(payment_hash, actual_msat).await?;
 
     if receive.transfer_id.is_none() || receive.preimage.is_none() {
         let swap = match retry_bounded(
@@ -589,7 +624,7 @@ where
                 // Leave that HTLC held for reconciliation. Only fail now when
                 // no transfer could have been committed.
                 if is_definitive_swap_failure(&error) {
-                    fail_unfunded_receive(db, ldk, payment_hash, delays).await;
+                    fail_unfunded_receive(db, ldk, payment, delays).await;
                 }
                 return Err(format!("Spark receive swap failed: {error}"));
             }
@@ -620,7 +655,7 @@ where
         .ok_or_else(|| "committed Spark receive has no preimage".to_string())?;
     validate_preimage(payment_hash, preimage)?;
     retry_bounded(
-        || ldk.claim_receive(payment_hash, expected_msat, preimage),
+        || ldk.claim_receive(payment_id, actual_msat, preimage),
         delays,
     )
     .await?;
@@ -854,7 +889,7 @@ impl LdkGrpcBackend {
             return self.submit_send(send).await;
         }
         if let Some(payment) = recover_submission(&self.db, &self.client, send).await? {
-            self.observe_payment(&payment.id).await;
+            self.observe_payment(&payment.payment_id).await;
         } else if send.kind == SendKind::Bolt11
             && send.status == SendStatus::Submitting
             && send.payment_id.is_none()
@@ -874,7 +909,7 @@ impl LdkGrpcBackend {
     }
 
     async fn settle_succeeded_payment(&self, payment: &Payment) -> Result<(), String> {
-        let payment_id = payment.id.clone();
+        let payment_id = payment.payment_id.clone();
         let Some(send) = self.db.lightning_send_for_payment(&payment_id).await? else {
             return Err(format!(
                 "no Lightning send request for payment {payment_id}"
@@ -995,7 +1030,11 @@ impl LdkGrpcBackend {
             .is_some())
     }
 
-    async fn finish_received_payment(&self, payment_hash: &str) -> Result<bool, String> {
+    async fn finish_received_payment(
+        &self,
+        payment_id: &str,
+        payment_hash: &str,
+    ) -> Result<bool, String> {
         let _guard = self.receive_lock.lock().await;
         if self.db.internal_send(payment_hash).await?.is_some() {
             return Ok(true);
@@ -1003,6 +1042,13 @@ impl LdkGrpcBackend {
         let Some(receive) = self.db.lightning_receive_for_hash(payment_hash).await? else {
             return Ok(false);
         };
+        if receive
+            .payment_id
+            .as_deref()
+            .is_some_and(|id| id != payment_id)
+        {
+            return Err("received payment does not match the bound backend ID".into());
+        }
         let transfer_id = match receive.transfer_id {
             Some(id) => id,
             None => self
@@ -1026,18 +1072,13 @@ impl LdkGrpcBackend {
         Ok(true)
     }
 
-    async fn process_inbound_claimable(
-        &self,
-        payment_hash: &str,
-        amount_msat: Option<u64>,
-    ) -> Result<bool, String> {
+    async fn process_inbound_claimable(&self, payment: &ClaimableReceive) -> Result<bool, String> {
         process_standard_receive(
             self.db.as_ref(),
             self.receive_lock.as_ref(),
             self.spark.as_ref(),
             &self.client,
-            payment_hash,
-            amount_msat,
+            payment,
             &RECEIVE_RETRY_DELAYS,
         )
         .await
@@ -1064,25 +1105,25 @@ impl LdkGrpcBackend {
                 .map_err(|e| e.to_string())?;
             for payment in page.payments {
                 if payment.direction == PaymentDirection::Outbound as i32 {
-                    if !self.is_managed_outbound(&payment.id).await? {
+                    if !self.is_managed_outbound(&payment.payment_id).await? {
                         continue;
                     }
                     match payment.status {
                         value if value == PaymentStatus::Succeeded as i32 => {
                             if let Err(error) = self.settle_succeeded_payment(&payment).await {
                                 tracing::warn!(
-                                    payment_id = %payment.id,
+                                    payment_id = %payment.payment_id,
                                     "Lightning paid but Spark settlement is pending: {error}"
                                 );
-                                self.db.set_payment(&payment.id, "SETTLING").await?;
+                                self.db.set_payment(&payment.payment_id, "SETTLING").await?;
                             }
                         }
                         value if value == PaymentStatus::Failed as i32 => {
                             // Failure reasons arrive in PaymentFailed events, not
                             // payment snapshots. Preserve any stored event reason.
-                            self.fail_managed_payment(&payment.id, None).await?;
+                            self.fail_managed_payment(&payment.payment_id, None).await?;
                         }
-                        _ => self.db.set_payment(&payment.id, "PENDING").await?,
+                        _ => self.db.set_payment(&payment.payment_id, "PENDING").await?,
                     }
                     continue;
                 }
@@ -1109,9 +1150,20 @@ impl LdkGrpcBackend {
                 let Some(payment_hash) = bolt11_hash(Some(payment.clone())) else {
                     continue;
                 };
+                if self
+                    .db
+                    .lightning_receive_for_hash(&payment_hash)
+                    .await?
+                    .is_none()
+                {
+                    continue;
+                }
                 match payment.status {
                     value if value == PaymentStatus::Succeeded as i32 => {
-                        if let Err(error) = self.finish_received_payment(&payment_hash).await {
+                        if let Err(error) = self
+                            .finish_received_payment(&payment.payment_id, &payment_hash)
+                            .await
+                        {
                             tracing::warn!(
                                 payment_hash,
                                 "Lightning received but Spark payout is pending: {error}"
@@ -1119,17 +1171,17 @@ impl LdkGrpcBackend {
                         }
                     }
                     value if value == PaymentStatus::Failed as i32 => {
-                        if self
-                            .db
-                            .lightning_receive_for_hash(&payment_hash)
-                            .await?
-                            .is_some()
-                        {
-                            self.db.fail_external_receive(&payment_hash).await?;
-                        }
+                        let _guard = self.receive_lock.lock().await;
+                        self.db
+                            .fail_external_receive(&payment_hash, &payment.payment_id)
+                            .await?;
                     }
                     _ => match self
-                        .process_inbound_claimable(&payment_hash, payment.amount_msat)
+                        .process_inbound_claimable(&ClaimableReceive {
+                            payment_id: payment.payment_id.clone(),
+                            payment_hash: payment_hash.clone(),
+                            amount_msat: bolt11_claimable_amount(&payment),
+                        })
                         .await
                     {
                         Ok(true) => {}
@@ -1175,13 +1227,14 @@ impl LdkGrpcBackend {
             {
                 continue;
             }
-            if retry_bounded(
-                || self.client.fail_receive(&payment_hash),
-                &RECEIVE_RETRY_DELAYS,
-            )
-            .await
-            .is_ok()
-            {
+            // Issuing an invoice no longer creates a backend payment. Expire
+            // it locally; a late claimable event will be failed by its own ID.
+            if match receive.payment_id.as_deref() {
+                Some(id) => retry_bounded(|| self.client.fail_receive(id), &RECEIVE_RETRY_DELAYS)
+                    .await
+                    .is_ok(),
+                None => true,
+            } {
                 self.db
                     .set_receive_status(&payment_hash, "HTLC_FAILED")
                     .await?;
@@ -1361,7 +1414,7 @@ impl LdkGrpcBackend {
                 }
                 Some(p) if p.status == PaymentStatus::Failed as i32 => {
                     // The pinned client exposes failure reasons only on events.
-                    match self.fail_managed_payment(&p.id, None).await {
+                    match self.fail_managed_payment(&p.payment_id, None).await {
                         Ok(()) => "FAILED".to_string(),
                         Err(error) => {
                             tracing::warn!(payment_id, "BOLT12 refund is pending: {error}");
@@ -1441,24 +1494,15 @@ impl LdkGrpcBackend {
         })
     }
 
-    pub async fn fail_hold(&self, payment_hash_hex: &str) -> bool {
-        self.client
-            .bolt11_fail_for_hash(Bolt11FailForHashRequest {
-                payment_hash: payment_hash_hex.to_string(),
-            })
-            .await
-            .is_ok()
-    }
-
     async fn apply_ln_event(&self, event: LnEvent) {
         match event {
             LnEvent::OutboundSucceeded { payment } => {
-                match self.is_managed_outbound(&payment.id).await {
+                match self.is_managed_outbound(&payment.payment_id).await {
                     Ok(true) => {}
                     Ok(false) => return,
                     Err(error) => {
                         tracing::warn!(
-                            payment_id = %payment.id,
+                            payment_id = %payment.payment_id,
                             "could not classify outbound Lightning payment: {error}"
                         );
                         return;
@@ -1466,10 +1510,10 @@ impl LdkGrpcBackend {
                 }
                 if let Err(error) = self.settle_succeeded_payment(&payment).await {
                     tracing::warn!(
-                        payment_id = %payment.id,
+                        payment_id = %payment.payment_id,
                         "Lightning paid but Spark settlement is pending: {error}"
                     );
-                    let _ = self.db.set_payment(&payment.id, "SETTLING").await;
+                    let _ = self.db.set_payment(&payment.payment_id, "SETTLING").await;
                 }
             }
             LnEvent::OutboundFailed { payment_id, reason } => {
@@ -1491,14 +1535,9 @@ impl LdkGrpcBackend {
                     tracing::warn!(payment_id, "BOLT12 refund is pending: {error}");
                 }
             }
-            LnEvent::InboundClaimable {
-                payment_hash,
-                amount_msat,
-            } => {
-                match self
-                    .process_inbound_claimable(&payment_hash, amount_msat)
-                    .await
-                {
+            LnEvent::InboundClaimable(payment) => {
+                let payment_hash = &payment.payment_hash;
+                match self.process_inbound_claimable(&payment).await {
                     Ok(true) => {
                         tracing::info!(
                             "committed Spark receive and submitted LDK claim {payment_hash}"
@@ -1511,8 +1550,14 @@ impl LdkGrpcBackend {
                     ),
                 }
             }
-            LnEvent::InboundReceived { payment_hash } => {
-                if let Err(error) = self.finish_received_payment(&payment_hash).await {
+            LnEvent::InboundReceived {
+                payment_id,
+                payment_hash,
+            } => {
+                if let Err(error) = self
+                    .finish_received_payment(&payment_id, &payment_hash)
+                    .await
+                {
                     tracing::warn!(
                         payment_hash,
                         "Lightning received but Spark payout is pending: {error}"
@@ -1603,7 +1648,7 @@ mod tests {
             payment_kind::Kind, Bolt11, Bolt12Offer, PaymentKind,
         };
         Payment {
-            id: "ldk-payment".into(),
+            payment_id: "ldk-payment".into(),
             amount_msat: Some(send.amount_sats * 1000),
             direction: PaymentDirection::Outbound as i32,
             status: PaymentStatus::Pending as i32,
@@ -1803,6 +1848,8 @@ mod tests {
         claims: AtomicUsize,
         failures: AtomicUsize,
         failed_holds: AtomicUsize,
+        claimed_ids: SyncMutex<Vec<String>>,
+        failed_ids: SyncMutex<Vec<String>>,
         log: Arc<SyncMutex<Vec<&'static str>>>,
     }
 
@@ -1810,10 +1857,11 @@ mod tests {
     impl ReceiveLdk for MockLdk {
         async fn claim_receive(
             &self,
-            _payment_hash: &str,
+            payment_id: &str,
             _amount_msat: u64,
             _preimage: &str,
         ) -> Result<(), String> {
+            self.claimed_ids.lock().push(payment_id.to_string());
             self.claims.fetch_add(1, Ordering::SeqCst);
             self.log.lock().push("claim");
             if self
@@ -1829,7 +1877,8 @@ mod tests {
             }
         }
 
-        async fn fail_receive(&self, _payment_hash: &str) -> Result<(), String> {
+        async fn fail_receive(&self, payment_id: &str) -> Result<(), String> {
+            self.failed_ids.lock().push(payment_id.to_string());
             self.failed_holds.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
@@ -1860,6 +1909,14 @@ mod tests {
             .await
             .unwrap();
         (db, dir, payment_hash, preimage)
+    }
+
+    fn claimable(hash: &str, amount_msat: u64) -> ClaimableReceive {
+        ClaimableReceive {
+            payment_id: "backend-payment".into(),
+            payment_hash: hash.into(),
+            amount_msat: Some(amount_msat),
+        }
     }
 
     fn mock_spark(preimage: String, log: Arc<SyncMutex<Vec<&'static str>>>) -> MockSpark {
@@ -1906,10 +1963,12 @@ mod tests {
         let lock = tokio::sync::Mutex::new(());
         let spark = mock_spark(preimage, Arc::new(SyncMutex::new(Vec::new())));
         let ldk = MockLdk::default();
-        process_standard_receive(&db, &lock, &spark, &ldk, &hash, Some(5_000_000), &[])
+        process_standard_receive(&db, &lock, &spark, &ldk, &claimable(&hash, 5_000_000), &[])
             .await
             .unwrap();
-        db.fail_external_receive(&hash).await.unwrap();
+        db.fail_external_receive(&hash, "backend-payment")
+            .await
+            .unwrap();
         process_internal_send(&db, &lock, &spark, &send)
             .await
             .unwrap();
@@ -1941,7 +2000,9 @@ mod tests {
         db.prepare_lightning_send(&send, "internal", "REGTEST")
             .await
             .unwrap();
-        db.mark_receive_claimable(&hash, 5_000_000).await.unwrap();
+        db.mark_receive_claimable(&hash, "backend-payment", 5_000_000)
+            .await
+            .unwrap();
         let spark = mock_spark(preimage, Arc::new(SyncMutex::new(Vec::new())));
         assert!(
             process_internal_send(&db, &tokio::sync::Mutex::new(()), &spark, &send)
@@ -1980,10 +2041,8 @@ mod tests {
         };
         let events = map_envelope(EventEnvelope {
             event: Some(LdkRawEvent::PaymentFailed(PaymentFailed {
-                payment: Some(Payment {
-                    id: "payment".into(),
-                    ..Default::default()
-                }),
+                payment_id: "payment".into(),
+                payment: None,
                 reason: Some(PaymentFailureReason::InvoiceRequestExpired as i32),
             })),
         });
@@ -1994,6 +2053,147 @@ mod tests {
     }
 
     #[test]
+    fn claimable_event_uses_backend_id_and_event_amount() {
+        use ldk_server_client::ldk_server_grpc::{
+            events::{EventEnvelope, PaymentClaimable},
+            types::{payment_kind::Kind, Bolt11, PaymentKind},
+        };
+        let mut payment = Payment {
+            payment_id: "backend-payment".into(),
+            amount_msat: Some(5_000_000),
+            kind: Some(PaymentKind {
+                kind: Some(Kind::Bolt11(Bolt11 {
+                    hash: "invoice-hash".into(),
+                    counterparty_skimmed_fee_msat: Some(1_000),
+                    ..Default::default()
+                })),
+            }),
+            ..Default::default()
+        };
+        let events = map_envelope(EventEnvelope {
+            event: Some(LdkRawEvent::PaymentClaimable(PaymentClaimable {
+                payment_id: payment.payment_id.clone(),
+                payment: Some(payment.clone()),
+                claimable_amount_msat: 4_999_000,
+                ..Default::default()
+            })),
+        });
+        assert!(
+            matches!(events.as_slice(), [LnEvent::InboundClaimable(receive)]
+            if receive.payment_id == "backend-payment"
+                && receive.payment_hash == "invoice-hash"
+                && receive.amount_msat == Some(4_999_000))
+        );
+        assert_eq!(bolt11_claimable_amount(&payment), Some(4_999_000));
+        payment.amount_msat = Some(999);
+        assert_eq!(bolt11_claimable_amount(&payment), None);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn different_backend_attempt_cannot_replace_receive_after_restart() {
+        let (db, dir, hash, preimage) = receive_fixture().await;
+        let payment = claimable(&hash, 5_000_000);
+        let lock = tokio::sync::Mutex::new(());
+        let spark = mock_spark(preimage, Arc::new(SyncMutex::new(Vec::new())));
+        let ldk = MockLdk::default();
+        process_standard_receive(&db, &lock, &spark, &ldk, &payment, &[])
+            .await
+            .unwrap();
+        drop(db);
+        let db = Db::open(dir.to_str().unwrap()).unwrap();
+        let original = db.lightning_receive_for_hash(&hash).await.unwrap().unwrap();
+        let duplicate = ClaimableReceive {
+            payment_id: "other-attempt".into(),
+            ..payment.clone()
+        };
+        process_standard_receive(&db, &lock, &spark, &ldk, &duplicate, &[])
+            .await
+            .unwrap();
+        db.fail_external_receive(&hash, &duplicate.payment_id)
+            .await
+            .unwrap();
+        assert!(db
+            .mark_receive_claimable(&hash, &duplicate.payment_id, 5_000_000)
+            .await
+            .is_err());
+        assert_eq!(
+            db.lightning_receive_for_hash(&hash).await.unwrap().unwrap(),
+            original
+        );
+        process_standard_receive(&db, &lock, &spark, &ldk, &payment, &[])
+            .await
+            .unwrap();
+        assert_eq!(spark.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(*ldk.claimed_ids.lock(), vec!["backend-payment"]);
+        assert_eq!(*ldk.failed_ids.lock(), vec!["other-attempt"]);
+        drop(db);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn late_payment_for_expired_invoice_is_failed_by_backend_id() {
+        let (db, dir, hash, preimage) = receive_fixture().await;
+        db.set_receive_status(&hash, "HTLC_FAILED").await.unwrap();
+        let spark = mock_spark(preimage, Arc::new(SyncMutex::new(Vec::new())));
+        let ldk = MockLdk::default();
+        process_standard_receive(
+            &db,
+            &tokio::sync::Mutex::new(()),
+            &spark,
+            &ldk,
+            &claimable(&hash, 5_000_000),
+            &[],
+        )
+        .await
+        .unwrap();
+        assert_eq!(spark.calls.load(Ordering::SeqCst), 0);
+        assert!(ldk.claimed_ids.lock().is_empty());
+        assert_eq!(*ldk.failed_ids.lock(), vec!["backend-payment"]);
+        assert_eq!(db.receive_status(&hash).await.unwrap(), "HTLC_FAILED");
+        drop(db);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn restart_after_failed_claim_keeps_backend_payment_id() {
+        let (db, dir, hash, preimage) = receive_fixture().await;
+        let spark = mock_spark(preimage, Arc::new(SyncMutex::new(Vec::new())));
+        let ldk = MockLdk {
+            failures: AtomicUsize::new(1),
+            ..Default::default()
+        };
+        let lock = tokio::sync::Mutex::new(());
+        let payment = claimable(&hash, 5_000_000);
+        assert!(
+            process_standard_receive(&db, &lock, &spark, &ldk, &payment, &[])
+                .await
+                .is_err()
+        );
+        drop(db);
+        let db = Db::open(dir.to_str().unwrap()).unwrap();
+        let stored = db.lightning_receive_for_hash(&hash).await.unwrap().unwrap();
+        assert_eq!(stored.payment_id.as_deref(), Some("backend-payment"));
+        assert!(!stored.claim_submitted);
+        process_standard_receive(&db, &lock, &spark, &ldk, &payment, &[])
+            .await
+            .unwrap();
+        assert_eq!(spark.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            *ldk.claimed_ids.lock(),
+            vec!["backend-payment", "backend-payment"]
+        );
+        assert!(
+            db.lightning_receive_for_hash(&hash)
+                .await
+                .unwrap()
+                .unwrap()
+                .claim_submitted
+        );
+        drop(db);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn bolt12_receive_event_keeps_offer_and_payment_ids() {
         use ldk_server_client::ldk_server_grpc::{
             events::{EventEnvelope, PaymentReceived},
@@ -2001,7 +2201,7 @@ mod tests {
         };
 
         let payment = Payment {
-            id: "payment-id".to_string(),
+            payment_id: "payment-id".to_string(),
             kind: Some(PaymentKind {
                 kind: Some(payment_kind::Kind::Bolt12Offer(Bolt12Offer {
                     hash: Some("payment-hash".to_string()),
@@ -2014,6 +2214,7 @@ mod tests {
         };
         let events = map_envelope(EventEnvelope {
             event: Some(LdkRawEvent::PaymentReceived(PaymentReceived {
+                payment_id: "backend-payment".into(),
                 payment: Some(payment),
                 custom_records: Vec::new(),
             })),
@@ -2041,15 +2242,22 @@ mod tests {
         };
         let lock = tokio::sync::Mutex::new(());
 
-        assert!(
-            process_standard_receive(&db, &lock, &spark, &ldk, &hash, Some(5_000_000), &[],)
-                .await
-                .unwrap()
-        );
+        assert!(process_standard_receive(
+            &db,
+            &lock,
+            &spark,
+            &ldk,
+            &claimable(&hash, 5_000_000),
+            &[],
+        )
+        .await
+        .unwrap());
         let receive = db.lightning_receive_for_hash(&hash).await.unwrap().unwrap();
         assert!(receive.transfer_id.is_some());
         assert_eq!(receive.preimage, Some("01".repeat(32)));
         assert!(receive.claim_submitted);
+        assert_eq!(receive.payment_id.as_deref(), Some("backend-payment"));
+        assert_eq!(*ldk.claimed_ids.lock(), vec!["backend-payment"]);
         assert_eq!(*log.lock(), vec!["spark", "claim"]);
         std::fs::remove_dir_all(dir).unwrap();
     }
@@ -2065,8 +2273,7 @@ mod tests {
             &tokio::sync::Mutex::new(()),
             &spark,
             &ldk,
-            &hash,
-            Some(5_000_000),
+            &claimable(&hash, 5_000_000),
             &[],
         )
         .await
@@ -2085,7 +2292,7 @@ mod tests {
         let lock = tokio::sync::Mutex::new(());
 
         for _ in 0..2 {
-            process_standard_receive(&db, &lock, &spark, &ldk, &hash, Some(5_000_000), &[])
+            process_standard_receive(&db, &lock, &spark, &ldk, &claimable(&hash, 5_000_000), &[])
                 .await
                 .unwrap();
         }
@@ -2114,8 +2321,7 @@ mod tests {
             &tokio::sync::Mutex::new(()),
             &spark,
             &ldk,
-            &hash,
-            Some(5_000_000),
+            &claimable(&hash, 5_000_000),
             &[],
         )
         .await
@@ -2139,8 +2345,7 @@ mod tests {
             &tokio::sync::Mutex::new(()),
             &spark,
             &ldk,
-            &hash,
-            Some(5_000_000),
+            &claimable(&hash, 5_000_000),
             &[],
         )
         .await
@@ -2165,8 +2370,7 @@ mod tests {
             &tokio::sync::Mutex::new(()),
             &spark,
             &ldk,
-            &hash,
-            Some(5_000_000),
+            &claimable(&hash, 5_000_000),
             &delays,
         )
         .await
@@ -2187,8 +2391,7 @@ mod tests {
             &tokio::sync::Mutex::new(()),
             &spark,
             &ldk,
-            &hash,
-            Some(4_999_000),
+            &claimable(&hash, 4_999_000),
             &[],
         )
         .await
@@ -2240,8 +2443,7 @@ mod tests {
             &tokio::sync::Mutex::new(()),
             &spark,
             &ldk,
-            &hash,
-            Some(5_000_000),
+            &claimable(&hash, 5_000_000),
             &[],
         )
         .await

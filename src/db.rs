@@ -22,6 +22,7 @@ pub struct LightningReceive {
     pub transfer_id: Option<String>,
     pub preimage: Option<String>,
     pub claim_submitted: bool,
+    pub payment_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -174,6 +175,11 @@ impl Db {
                 "receive_payments",
                 "claim_submitted",
                 "ALTER TABLE receive_payments ADD COLUMN claim_submitted INTEGER NOT NULL DEFAULT 0",
+            ),
+            (
+                "receive_payments",
+                "payment_id",
+                "ALTER TABLE receive_payments ADD COLUMN payment_id TEXT",
             ),
         ] {
             ensure_column(&conn, table, column, migration).map_err(|e| e.to_string())?;
@@ -482,7 +488,7 @@ impl Db {
             c.query_row(
                 "SELECT r.request_id, r.owner, r.receiver, r.amount_sats, r.invoice,
                         COALESCE(p.status, 'INVOICE_CREATED'), p.transfer_id,
-                        p.preimage, COALESCE(p.claim_submitted, 0)
+                        p.preimage, COALESCE(p.claim_submitted, 0), p.payment_id
                  FROM lightning_receives r LEFT JOIN receive_payments p ON p.hash=r.hash WHERE r.hash=?1
                  LIMIT 1",
                 (payment_hash,),
@@ -497,6 +503,7 @@ impl Db {
                         transfer_id: row.get(6)?,
                         preimage: row.get(7)?,
                         claim_submitted: row.get::<_, i64>(8)? != 0,
+                        payment_id: row.get(9)?,
                     })
                 },
             )
@@ -532,13 +539,18 @@ impl Db {
         .await
     }
 
-    pub async fn mark_receive_claimable(&self, hash: &str, amount_msat: u64) -> Result<(), String> {
+    pub async fn mark_receive_claimable(
+        &self,
+        hash: &str,
+        payment_id: &str,
+        amount_msat: u64,
+    ) -> Result<(), String> {
         let amount_msat = i64::try_from(amount_msat)
             .map_err(|_| "claimable amount is too large for storage".to_string())?;
         self.with(|c| {
-            c.execute(
-                "INSERT INTO receive_payments(hash,status,claimable_amount_msat)
-                 VALUES(?1,'HTLC_RECEIVED',?2)
+            let changed = c.execute(
+                "INSERT INTO receive_payments(hash,status,claimable_amount_msat,payment_id)
+                 VALUES(?1,'HTLC_RECEIVED',?2,?3)
                  ON CONFLICT(hash) DO UPDATE SET
                    status=CASE
                      WHEN receive_payments.status IN ('TRANSFER_COMPLETED','HTLC_FAILED')
@@ -546,10 +558,16 @@ impl Db {
                      THEN receive_payments.status
                      ELSE 'HTLC_RECEIVED'
                    END,
-                   claimable_amount_msat=excluded.claimable_amount_msat",
-                (hash, amount_msat),
-            )
-            .map(|_| ())
+                   claimable_amount_msat=excluded.claimable_amount_msat,
+                   payment_id=excluded.payment_id
+                 WHERE receive_payments.payment_id IS NULL OR receive_payments.payment_id=?3",
+                (hash, amount_msat, payment_id),
+            )?;
+            if changed == 1 {
+                Ok(())
+            } else {
+                Err(rusqlite::Error::InvalidQuery)
+            }
         })
         .await
     }
@@ -847,12 +865,12 @@ impl Db {
         .await
     }
 
-    pub async fn fail_external_receive(&self, hash: &str) -> Result<(), String> {
+    pub async fn fail_external_receive(&self, hash: &str, payment_id: &str) -> Result<(), String> {
         self.with(|c| {
             c.execute(
                 "UPDATE receive_payments SET status='HTLC_FAILED'
-                 WHERE hash=?1 AND status != 'TRANSFER_COMPLETED' AND NOT EXISTS(SELECT 1 FROM internal_payments WHERE hash=?1)",
-                (hash,),
+                 WHERE hash=?1 AND (payment_id IS NULL OR payment_id=?2) AND status != 'TRANSFER_COMPLETED' AND NOT EXISTS(SELECT 1 FROM internal_payments WHERE hash=?1)",
+                (hash, payment_id),
             )
             .map(|_| ())
         })
@@ -1637,6 +1655,7 @@ mod tests {
                 transfer_id: None,
                 preimage: None,
                 claim_submitted: false,
+                payment_id: None,
             })
         );
         assert_eq!(

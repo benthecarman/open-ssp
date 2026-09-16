@@ -4,6 +4,10 @@ The SSP uses `ldk-server-client` for Lightning and keeps all Spark settlement
 state in the SSP. This document lists the current integration boundary and
 verified limitations.
 
+The client and server are pinned to `c31191ae6cf70b22b49473b2b435656fc3516ef9`.
+Upgrade SSP and LDK server together: the payment event layout, payment ID
+field, pagination tokens, and BOLT11 claim/fail RPCs changed upstream.
+
 ## Supported production path
 
 ### BOLT11 send
@@ -58,12 +62,19 @@ Spark Operators through the existing Spark SDK receive flow. The SSP calls
 prepares an SSP-to-wallet transfer and calls `InitiatePreimageSwapV3` with
 `REASON_RECEIVE`. The operators commit the transfer and return the reconstructed
 preimage. The SSP verifies the preimage hash before it calls
-`Bolt11ClaimForHash`.
+`Bolt11ClaimForId`.
 
 The Spark commit and returned preimage are stored before the Lightning claim.
 Retries and process restarts therefore do not create a second Spark transfer.
-The SSP calls `Bolt11FailForHash` when an unfunded swap cannot complete or the
-hold invoice expires.
+The SSP stores the backend payment ID from `PaymentClaimable` separately from
+its invoice hash and uses that ID for claim/fail calls. It validates the event's
+claimable amount before paying out. A different payment ID for the same invoice
+is rejected without another Spark transfer. Polling recovers the claimable
+amount from payment details after subtracting any counterparty skimmed fee.
+
+The SSP calls `Bolt11FailForId` when an unfunded swap cannot complete. An
+expired invoice with no backend payment is expired locally; a later claimable
+event is rejected using that event's payment ID.
 
 ### BOLT12 send
 
@@ -108,7 +119,7 @@ as the payment call.
 ### BOLT12 hold invoices
 
 `ldk-server` does not expose a BOLT12 equivalent of
-`Bolt11ReceiveForHash`, `Bolt11ClaimForHash`, and `Bolt11FailForHash`.
+`Bolt11ReceiveForHash`, `Bolt11ClaimForId`, and `Bolt11FailForId`.
 The SSP can receive BOLT12 payments, but it cannot hold them until the Spark
 payout completes.
 

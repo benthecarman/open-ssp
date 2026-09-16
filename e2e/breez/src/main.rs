@@ -1533,7 +1533,7 @@ async fn receive_bolt12(
     let offer = request["invoice"]["encoded_invoice"]
         .as_str()
         .context("BOLT12 receive response has no offer")?;
-    let offer_id = request["invoice"]["payment_hash"]
+    let offer_id = request["invoice"]["offer_id"]
         .as_str()
         .context("BOLT12 receive response has no offer ID")?;
     ensure!(offer.to_ascii_lowercase().starts_with("lno1"));

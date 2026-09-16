@@ -39,7 +39,7 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 spark-wallet = { path = "vendor/breez-sdk/crates/spark-wallet" }
 spark = { path = "vendor/breez-sdk/crates/spark" }
 subtle = "2"
-ldk-server-client = { git = "https://github.com/lightningdevkit/ldk-server", package = "ldk-server-client" }
+ldk-server-client = { git = "https://github.com/lightningdevkit/ldk-server", rev = "c31191ae6cf70b22b49473b2b435656fc3516ef9", package = "ldk-server-client" }
 
 [dev-dependencies]
 parking_lot = "0.12"
