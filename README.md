@@ -8,6 +8,8 @@ The service uses the Breez Spark Rust SDK for its embedded wallet. Spark
 Operators remain separate services and use the existing Spark protocol. The
 operator build must expose the authenticated counter-swap RPC used by the SSP.
 
+For a precompiled executable, see [binary releases](docs/BINARY_RELEASES.md).
+
 ## Supported flows
 
 - Wallet challenge authentication and durable 24-hour sessions.

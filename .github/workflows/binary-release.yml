@@ -1,0 +1,94 @@
+name: binary-release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Binary version: vMAJOR.MINOR.PATCH[-prerelease]'
+        required: true
+        type: string
+      publish:
+        description: 'Publish to the existing VERSION tag after building'
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: binary-release-${{ inputs.version }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      VERSION: ${{ inputs.version }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: recursive
+      - name: Validate version and publication ref
+        env:
+          PUBLISH: ${{ inputs.publish }}
+        run: |
+          [[ "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.-]+)?$ ]]
+          if [[ "$PUBLISH" == true ]]; then
+            [[ "$GITHUB_REF" == "refs/tags/$VERSION" ]]
+          fi
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: binary-release-ubuntu24
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential pkg-config libssl-dev \
+            libprotobuf-dev protobuf-compiler
+      - name: Build standalone SSP
+        run: cargo build --release --locked --bin open-ssp
+      - name: Prepare executable and checksum
+        run: |
+          mkdir -p dist
+          install -m755 target/release/open-ssp "dist/open-ssp-$VERSION-linux-x86_64"
+          strip --strip-debug "dist/open-ssp-$VERSION-linux-x86_64"
+          ldd "dist/open-ssp-$VERSION-linux-x86_64" | tee linkage.txt
+          ! grep -q 'not found' linkage.txt
+          cd dist
+          sha256sum "open-ssp-$VERSION-linux-x86_64" > "open-ssp-$VERSION-linux-x86_64.sha256"
+          sha256sum -c "open-ssp-$VERSION-linux-x86_64.sha256"
+      - name: Smoke test standalone executable
+        run: |
+          binary="$GITHUB_WORKSPACE/dist/open-ssp-$VERSION-linux-x86_64"
+          cd "$RUNNER_TEMP"
+          if SSP_SWAP_FEE_SATS=invalid "$binary" > binary-smoke.log 2>&1; then
+            echo 'Expected invalid configuration to fail'
+            exit 1
+          fi
+          grep -q 'SSP_SWAP_FEE_SATS' binary-smoke.log
+      - uses: actions/upload-artifact@v4
+        with:
+          name: open-ssp-${{ inputs.version }}-linux-x86_64
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    if: inputs.publish
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ inputs.version }}
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: open-ssp-${{ inputs.version }}-linux-x86_64
+          path: dist
+      - name: Publish explicitly requested release
+        run: |
+          gh release create "$VERSION" dist/* --verify-tag \
+            --title "open-ssp $VERSION" \
+            --notes 'Standalone Linux x86_64 SSP executable and SHA-256 checksum. Spark operators and LDK run separately; see docs/BINARY_RELEASES.md for configuration and runtime requirements.'

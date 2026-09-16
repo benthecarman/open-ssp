@@ -5,10 +5,6 @@ This guide uses the **Breez SDK - Spark Rust SDK**, at the revision pinned in
 client on the same Linux host. All coins, operator keys, and credentials in
 this setup are for local regtest use only.
 
-For a fixture without a source checkout or compilers, use the
-[compiled regtest bundle](REGTEST_BUNDLE.md). Its binary CLI provides the same
-lifecycle, funding, mining, LDK, certificate and log controls.
-
 Use `cargo regtest up` to start a funded development stack, then connect your
 own Breez wallet. Use `cargo regtest test` for the separate acceptance suite.
 
