@@ -23,7 +23,7 @@ RUN apt-get update && apt-get install -y ca-certificates \
 COPY --from=builder /app/target/release/open-ssp /usr/local/bin/open-ssp
 ENV SSP_DATA_DIR=/data
 USER ssp
-EXPOSE 5000
+EXPOSE 5000 9735
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
   CMD ["open-ssp", "healthcheck"]
 ENTRYPOINT ["open-ssp"]

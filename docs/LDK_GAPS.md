@@ -1,12 +1,21 @@
-# ldk-server compatibility
+# Lightning backend compatibility
 
-The SSP uses `ldk-server-client` for Lightning and keeps all Spark settlement
-state in the SSP. This document lists the current integration boundary and
+The SSP selects `ldk-server-client` (`LDK_BACKEND=server`, the default) or an
+embedded `ldk-node` (`LDK_BACKEND=embedded`) and keeps all Spark settlement
+state in the SSP. See [backend configuration](../README.md#lightning-backend). This document lists the current integration boundary and
 verified limitations.
 
 The client and server are pinned to `c31191ae6cf70b22b49473b2b435656fc3516ef9`.
 Upgrade SSP and LDK server together: the payment event layout, payment ID
 field, pagination tokens, and BOLT11 claim/fail RPCs changed upstream.
+
+Embedded mode pins LDK Node to `b1337d2f1665716313d2ccf849a04114f8b3ca19`,
+the revision used by this server. It uses an Esplora chain source, filesystem
+storage, and a persistent event queue. Blocking node calls run off the async
+executor. Both transports provide the same payment snapshots to the settlement
+and reconciliation code. Embedded events are acknowledged after processing;
+unfinished settlement is retried from durable payment records. SIGINT/SIGTERM
+drains HTTP requests and stops the embedded node.
 
 ## Supported production path
 

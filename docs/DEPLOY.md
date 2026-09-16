@@ -9,7 +9,8 @@ repository.
 - A Bitcoin node for the selected network.
 - At least two Spark Operators and their signers.
 - PostgreSQL databases used by the Spark Operators.
-- `ldk-server` with usable inbound and outbound channel capacity.
+- A Lightning backend with usable inbound and outbound channel capacity:
+  `ldk-server` or [embedded LDK Node](../README.md#lightning-backend).
 - `open-ssp` with persistent storage mounted at `/data`.
 
 The Spark Operator build must include the authenticated Swap V3 counter RPC.
@@ -34,6 +35,7 @@ The SSP calls existing operator consensus code through this RPC.
 | `SSP_MIN_SPLIT_CHILD_SATS` | Local minimum split-child value (default `330`, the standard P2TR relay dust floor) |
 | `SSP_FROST_THRESHOLD` | Spark wallet signing threshold |
 | `SPARK_ADMIN_TOKEN` | Bearer token for the liquidity endpoints |
+| `LDK_BACKEND` | `server` (default) or `embedded`; see [embedded configuration](../README.md#lightning-backend) |
 | `LDK_GRPC_ADDR` | `ldk-server` gRPC address without a URL scheme |
 | `LDK_API_KEY` | Hex API key; use this or `LDK_API_KEY_FILE` |
 | `LDK_API_KEY_FILE` | Mounted raw `ldk-server` API-key file |
@@ -49,7 +51,7 @@ Production must not set `SPARK_ADMIN_ALLOW_NO_AUTH=1`.
 A numeric variable that is set must parse as an integer; a malformed value
 stops the boot instead of silently falling back to its default.
 `SSP_FROST_THRESHOLD` must be between 1 and the number of `SO_HOSTS` entries.
-The service requires a live LDK backend at startup. Start LDK first and wait
+The service requires a live LDK backend at startup. In server mode, start LDK first and wait
 for its health check before starting the SSP.
 
 ## Upgrade from the retired preimage extension

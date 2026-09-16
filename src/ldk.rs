@@ -1,3 +1,6 @@
+mod client;
+use client::LdkClient;
+
 use std::{future::Future, str::FromStr, sync::Arc, time::Duration};
 
 use ldk_server_client::{
@@ -5,8 +8,8 @@ use ldk_server_client::{
     ldk_server_grpc::{
         api::{
             Bolt11ClaimForIdRequest, Bolt11FailForIdRequest, Bolt11ReceiveForHashRequest,
-            Bolt11SendRequest, Bolt12ReceiveRequest, Bolt12SendRequest, DecodeInvoiceRequest,
-            DecodeOfferRequest, GetPaymentDetailsRequest, ListPaymentsRequest,
+            Bolt11SendRequest, Bolt12ReceiveRequest, Bolt12SendRequest, GetPaymentDetailsRequest,
+            ListPaymentsRequest,
         },
         events::event_envelope::Event as LdkRawEvent,
         types::{Bolt11InvoiceDescription, Payment, PaymentDirection, PaymentStatus},
@@ -53,6 +56,16 @@ impl SendLdk for LdkServerClient {
                 .map(|r| r.payment_id)
                 .map_err(|e| e.to_string()),
         }
+    }
+    async fn lookup(&self, send: &LightningSend) -> Result<Option<Payment>, String> {
+        LdkClient::Server(Arc::new(self.clone())).lookup(send).await
+    }
+}
+
+#[async_trait::async_trait]
+impl SendLdk for LdkClient {
+    async fn submit(&self, send: &LightningSend) -> Result<String, String> {
+        self.send(send).await
     }
     async fn lookup(&self, send: &LightningSend) -> Result<Option<Payment>, String> {
         if let Some(id) = send
@@ -221,7 +234,7 @@ pub struct CreateOfferResult {
     pub offer_id: String,
 }
 
-/// Minimal SSP view of ldk-server SubscribeEvents payloads.
+/// Events used by settlement, independent of the node transport.
 #[derive(Clone, Debug)]
 pub enum LnEvent {
     OutboundSucceeded {
@@ -251,11 +264,15 @@ pub struct ClaimableReceive {
     pub amount_msat: Option<u64>,
 }
 
-impl LdkGrpcBackend {
+impl LdkBackend {
     /// SubscribeEvents pump for a live backend. The upstream streaming client
     /// does not set a `grpc-timeout` header. Reconnect with capped exponential
     /// backoff when the server, proxy, or HTTP/2 connection ends the stream.
-    pub async fn run_event_pump(live: Arc<LdkGrpcBackend>) {
+    pub async fn run_event_pump(live: Arc<LdkBackend>) {
+        let LdkClient::Server(client) = &live.client else {
+            live.client.run_embedded_events(&live).await;
+            return;
+        };
         let mut failures = 0u32;
         loop {
             let connected_at = std::time::Instant::now();
@@ -264,7 +281,7 @@ impl LdkGrpcBackend {
             // a deadline on the returned server stream.
             match tokio::time::timeout(
                 std::time::Duration::from_secs(15),
-                live.client.subscribe_events(),
+                client.subscribe_events(),
             )
             .await
             {
@@ -301,7 +318,7 @@ impl LdkGrpcBackend {
     }
 
     /// Recover events lost during a stream gap from the durable payment list.
-    pub async fn run_reconciler(live: Arc<LdkGrpcBackend>) {
+    pub async fn run_reconciler(live: Arc<LdkBackend>) {
         loop {
             if let Err(e) = live.reconcile_payments().await {
                 tracing::warn!("ldk payment reconcile failed: {e}");
@@ -738,8 +755,8 @@ async fn process_internal_send<S: InternalSpark + ?Sized>(
 }
 
 #[derive(Clone)]
-pub struct LdkGrpcBackend {
-    pub client: LdkServerClient,
+pub struct LdkBackend {
+    client: LdkClient,
     pub node_id: String,
     db: Arc<Db>,
     spark: Arc<SparkService>,
@@ -747,45 +764,25 @@ pub struct LdkGrpcBackend {
     invoice_network: bitcoin::Network,
 }
 
-impl LdkGrpcBackend {
+impl LdkBackend {
+    pub async fn stop(&self) -> Result<(), String> {
+        self.client.stop().await
+    }
+
     pub async fn connect(
         config: &Config,
         db: Arc<Db>,
         spark: Arc<SparkService>,
     ) -> Result<Self, String> {
-        if config.ldk_grpc_addr.is_empty() {
-            return Err("LDK_GRPC_ADDR unset".to_string());
-        }
-        let api_key = if !config.ldk_api_key.is_empty() {
-            config.ldk_api_key.clone()
-        } else if !config.ldk_api_key_file.is_empty() {
-            // On-disk key is raw bytes; ldk-server hex-encodes before HMAC.
-            let raw = std::fs::read(&config.ldk_api_key_file)
-                .map_err(|e| format!("read LDK_API_KEY_FILE: {e}"))?;
-            hex::encode(raw).trim().to_string()
-        } else {
-            return Err("LDK_API_KEY or LDK_API_KEY_FILE required for live mode".to_string());
-        };
-        if api_key.is_empty() {
-            return Err("empty LDK api key".to_string());
-        }
-        let cert_pem = std::fs::read(&config.ldk_tls_cert_file)
-            .map_err(|e| format!("read LDK_TLS_CERT_FILE {}: {e}", config.ldk_tls_cert_file))?;
-        let client = LdkServerClient::new(config.ldk_grpc_addr.clone(), api_key, &cert_pem)?;
-        let info = tokio::time::timeout(
-            std::time::Duration::from_secs(15),
-            client.get_node_info(ldk_server_client::ldk_server_grpc::api::GetNodeInfoRequest {}),
-        )
-        .await
-        .map_err(|_| "get_node_info timed out".to_string())?
-        .map_err(|e| format!("get_node_info: {e}"))?;
+        let invoice_network = invoice_network(&config.network)?;
+        let (client, node_id) = LdkClient::connect(config, invoice_network).await?;
         Ok(Self {
             client,
-            node_id: info.node_id,
+            node_id,
             db,
             spark,
             receive_lock: Arc::new(tokio::sync::Mutex::new(())),
-            invoice_network: invoice_network(&config.network)?,
+            invoice_network,
         })
     }
 
@@ -798,16 +795,10 @@ impl LdkGrpcBackend {
     ) -> Result<LightningSend, String> {
         uuid::Uuid::parse_str(transfer).map_err(|_| "invalid Spark funding transfer ID")?;
         let (kind, expected_id, total) = if invoice.to_ascii_lowercase().starts_with("lno1") {
-            let decoded = self
-                .client
-                .decode_offer(DecodeOfferRequest {
-                    offer: invoice.into(),
-                })
-                .await
-                .map_err(|e| e.to_string())?;
+            let offer_id = self.client.offer_id(invoice).await?;
             (
                 SendKind::Bolt12,
-                decoded.offer_id,
+                offer_id,
                 amount.ok_or("BOLT12 sends require amount_sats")?,
             )
         } else {
@@ -1296,7 +1287,7 @@ fn description_of(memo: &str) -> Option<Bolt11InvoiceDescription> {
     })
 }
 
-impl LdkGrpcBackend {
+impl LdkBackend {
     // Decision: 0 fee.
     pub async fn fee_estimate_msat(&self, _invoice: &str, _amount_sats: Option<u64>) -> u64 {
         0
@@ -1320,14 +1311,9 @@ impl LdkGrpcBackend {
                 .verify_bolt12_send(owner, outbound_transfer_id, amount_sats)
                 .await;
         }
-        let decoded = self
-            .client
-            .decode_invoice(DecodeInvoiceRequest {
-                invoice: invoice.to_string(),
-            })
-            .await
+        let decoded = lightning_invoice::Bolt11Invoice::from_str(invoice)
             .map_err(|error| format!("decode invoice: {error}"))?;
-        let amount_msat = match decoded.amount_msat {
+        let amount_msat = match decoded.amount_milli_satoshis() {
             Some(value) => {
                 if amount_sats.is_some() {
                     return Err("amount_sats is only valid for zero-amount invoices".to_string());
@@ -1349,7 +1335,7 @@ impl LdkGrpcBackend {
             .verify_lightning_send(
                 owner,
                 outbound_transfer_id,
-                &decoded.payment_hash.to_lowercase(),
+                &decoded.payment_hash().to_string(),
                 total_sats,
             )
             .await

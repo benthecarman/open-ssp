@@ -57,6 +57,20 @@ Core 29 and the bundled Electrs support package relay for clients that use
 zero-fee commitments. Clients can broadcast packages through Bitcoin RPC or
 Esplora's `/txs/package` endpoint.
 
+The embedded Lightning adapter also has an isolated acceptance test:
+
+```sh
+cargo test --locked embedded_regtest_payments_and_restart -- --ignored
+```
+
+Run it after `cargo regtest build` has installed the native tools, or set
+`LDK_TEST_BITCOIND` and `LDK_TEST_ELECTRS` to their executable paths. The test
+starts fresh Bitcoin Core and Esplora instances on temporary ports, funds a
+channel between two embedded nodes, and checks BOLT11 claims and failures,
+BOLT12 recovery by payer note, and a restart with a queued claimable payment.
+It does not start Spark or ldk-server. The default Breez acceptance suite
+continues to exercise the server backend.
+
 ## 2. Clone the repository and its sources
 
 ```sh

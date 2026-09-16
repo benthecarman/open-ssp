@@ -41,6 +41,11 @@ spark = { path = "vendor/breez-sdk/crates/spark" }
 subtle = "2"
 ldk-server-client = { git = "https://github.com/lightningdevkit/ldk-server", rev = "c31191ae6cf70b22b49473b2b435656fc3516ef9", package = "ldk-server-client" }
 
+# Match the node revision used by the pinned ldk-server. Filesystem storage
+# avoids linking a second SQLite version alongside the SSP database.
+ldk-node = { git = "https://github.com/lightningdevkit/ldk-node", rev = "b1337d2f1665716313d2ccf849a04114f8b3ca19", default-features = false, features = ["chain-esplora", "storage-filesystem"] }
+fs2 = "0.4"
+
 [dev-dependencies]
 parking_lot = "0.12"
 

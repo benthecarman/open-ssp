@@ -2,7 +2,7 @@
 
 `open-ssp` is a self-hosted Spark Service Provider written in Rust. One
 process provides the SSP GraphQL API, owns the Spark liquidity wallet, fills
-Swap V3 requests, and settles Lightning payments through `ldk-server`.
+Swap V3 requests, and settles Lightning payments through `ldk-server` or an embedded `ldk-node`.
 
 The service uses the Breez Spark Rust SDK for its embedded wallet. Spark
 Operators remain separate services and use the existing Spark protocol. The
@@ -152,6 +152,41 @@ request-history pagination. All wallet actions use the pinned Breez SDK fork.
 Bitcoin Core, LDK, and admin APIs only prepare the fixture and check settlement.
 `./e2e/e2e.sh` forwards to the same Rust suite. Image publication waits for
 that suite and the Rust checks. See [coverage and remaining gaps](docs/E2E_COVERAGE.md).
+
+## Lightning backend
+
+`LDK_BACKEND=server` (the default) uses the existing `LDK_GRPC_ADDR`, API key,
+and TLS settings. Set `LDK_BACKEND=embedded` to run LDK Node inside the SSP:
+
+```sh
+LDK_BACKEND=embedded
+LDK_NODE_ESPLORA_URL=http://127.0.0.1:30000
+LDK_NODE_LISTEN_ADDR=0.0.0.0:9735
+SSP_NETWORK=REGTEST
+SSP_DATA_DIR=./data
+```
+
+Embedded mode needs no ldk-server process, API key, or gRPC certificate. Both
+modes share the BOLT11/BOLT12 settlement and restart-recovery logic. The
+embedded node uses the same pinned LDK Node revision as ldk-server.
+
+The Esplora service must track the selected network. Node state and a separate
+Lightning seed live in `<SSP_DATA_DIR>/ldk-node`, overridable with
+`LDK_NODE_DATA_DIR`. Persist and back up that entire directory along with SSP
+state. After first boot, set `LDK_NODE_SEED_REQUIRED=true`. A missing seed next
+to existing node state always prevents startup. Only one SSP process may use
+a node directory.
+
+The node starts without channels. A funded peer can open a channel to the
+configured Lightning listening address and push funds to provide outbound
+capacity. Node/channel administration remains external in server mode;
+embedded mode currently exposes payments through SSP, not the ldk-server
+administration API. Allow inbound traffic on the Lightning port if peers
+need to connect. `/status` reports `ldk_backend` and `ldk_node_id`.
+
+Switching backend settings does not migrate a node or its channels. Use a
+fresh SSP state directory for a new node; keep an existing deployment paired
+with its original node until its pending payments have settled.
 
 ## Deployment
 

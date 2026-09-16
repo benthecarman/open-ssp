@@ -77,6 +77,8 @@ jobs:
           cargo clippy --locked --manifest-path e2e/breez/Cargo.toml --all-targets -- -D warnings
       - name: Build native test services
         run: cargo regtest build
+      - name: Test embedded LDK payments and restart recovery
+        run: cargo test --locked embedded_regtest_payments_and_restart -- --ignored
       - name: Save native builds before acceptance
         if: steps.native-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4

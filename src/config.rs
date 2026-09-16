@@ -13,6 +13,13 @@ pub struct Config {
     pub ssp_identity_pubkey: String,
     /// Directory for sqlite state (volume-mount in compose).
     pub data_dir: String,
+    pub ldk_backend: LdkBackendMode,
+    /// Empty selects <SSP_DATA_DIR>/ldk-node.
+    pub ldk_node_data_dir: String,
+    pub ldk_node_esplora_url: String,
+    pub ldk_node_listen_addr: String,
+    /// Refuse to generate a seed on an existing deployment.
+    pub ldk_node_seed_required: bool,
     /// Live LDK backend (host:port WITHOUT scheme, e.g. "ldk-server:3536").
     pub ldk_grpc_addr: String,
     pub ldk_api_key: String,
@@ -77,6 +84,11 @@ impl Config {
             // generates its mnemonic and publishes the key via /identity).
             ssp_identity_pubkey: get("SSP_IDENTITY_PUBKEY", ""),
             data_dir: get("SSP_DATA_DIR", "./data"),
+            ldk_backend: parsed("LDK_BACKEND", LdkBackendMode::Server)?,
+            ldk_node_data_dir: get("LDK_NODE_DATA_DIR", ""),
+            ldk_node_esplora_url: get("LDK_NODE_ESPLORA_URL", ""),
+            ldk_node_listen_addr: get("LDK_NODE_LISTEN_ADDR", "0.0.0.0:9735"),
+            ldk_node_seed_required: parsed("LDK_NODE_SEED_REQUIRED", false)?,
             ldk_grpc_addr: get("LDK_GRPC_ADDR", ""),
             ldk_api_key: get("LDK_API_KEY", ""),
             ldk_api_key_file: get("LDK_API_KEY_FILE", ""),
@@ -113,7 +125,22 @@ impl Config {
 
 #[cfg(test)]
 mod tests {
-    use super::parsed;
+    use super::{parsed, LdkBackendMode};
+
+    #[test]
+    fn lightning_backend_selection_is_explicit() {
+        assert_eq!(LdkBackendMode::default(), LdkBackendMode::Server);
+        assert_eq!(
+            "server".parse::<LdkBackendMode>().unwrap(),
+            LdkBackendMode::Server
+        );
+        assert_eq!(
+            "embedded".parse::<LdkBackendMode>().unwrap(),
+            LdkBackendMode::Embedded
+        );
+        assert!("embeded".parse::<LdkBackendMode>().is_err());
+        assert!("".parse::<LdkBackendMode>().is_err());
+    }
 
     #[test]
     fn numeric_settings_use_defaults_and_reject_malformed_values() {
@@ -127,5 +154,26 @@ mod tests {
         assert!(parsed::<u64>("SSP_TEST_LIMIT", 0)
             .unwrap_err()
             .contains("SSP_TEST_LIMIT"));
+    }
+}
+
+/// Explicit selection; never fall back to a different node after a connection error.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum LdkBackendMode {
+    #[default]
+    Server,
+    Embedded,
+}
+
+impl std::str::FromStr for LdkBackendMode {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "server" => Ok(Self::Server),
+            "embedded" => Ok(Self::Embedded),
+            _ => Err("expected server or embedded".into()),
+        }
     }
 }

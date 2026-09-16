@@ -31,14 +31,14 @@ mod webhooks;
 
 use config::Config;
 use db::Db;
-use ldk::LdkGrpcBackend;
+use ldk::LdkBackend;
 use spark::SparkService;
 
 #[derive(Clone)]
 pub struct AppState {
     pub config: Config,
     pub db: Arc<Db>,
-    pub ldk: Arc<LdkGrpcBackend>,
+    pub ldk: Arc<LdkBackend>,
     pub spark: Arc<SparkService>,
     pub coop_exit: Option<Arc<coop_exit::CoopExitService>>,
     pub static_deposit: Option<Arc<static_deposits::StaticDepositService>>,
@@ -102,6 +102,7 @@ async fn status(State(state): State<AppState>, headers: HeaderMap) -> impl IntoR
             "error": instant_outstanding.as_ref().err(),
         },
         "ldk_mode": "live",
+        "ldk_backend": state.config.ldk_backend,
         "ldk_node_id": backend.node_id,
         })),
     )
@@ -429,9 +430,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         tokio::spawn(service.clone().run());
         tokio::spawn(service.clone().run_instant());
     }
-    let backend = Arc::new(LdkGrpcBackend::connect(&config, db.clone(), spark.clone()).await?);
-    tokio::spawn(LdkGrpcBackend::run_event_pump(backend.clone()));
-    tokio::spawn(LdkGrpcBackend::run_reconciler(backend.clone()));
+    let backend = Arc::new(LdkBackend::connect(&config, db.clone(), spark.clone()).await?);
+    let event_pump = tokio::spawn(LdkBackend::run_event_pump(backend.clone()));
+    let reconciler = tokio::spawn(LdkBackend::run_reconciler(backend.clone()));
     // Prune expired sessions, old challenges, and compatibility requests.
     {
         let db = db.clone();
@@ -461,7 +462,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let state = AppState {
         config: config.clone(),
         db,
-        ldk: backend,
+        ldk: backend.clone(),
         spark: spark.clone(),
         coop_exit,
         static_deposit,
@@ -504,9 +505,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     };
     let listener = tokio::net::TcpListener::bind(addr).await?;
     spark.start_background_processing().await;
-    axum::serve(listener, app)
+    let result = axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
-        .await?;
+        .await;
+    event_pump.abort();
+    reconciler.abort();
+    let _ = event_pump.await;
+    let _ = reconciler.await;
+    backend.stop().await?;
+    result?;
     Ok(())
 }
 
