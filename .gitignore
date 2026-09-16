@@ -16,3 +16,5 @@ deploy/.env
 e2e/*.log
 .DS_Store
 /.regtest/
+
+/dist/

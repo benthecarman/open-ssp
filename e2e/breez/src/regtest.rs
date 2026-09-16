@@ -10,11 +10,13 @@ use super::{
     LdkClient, TestConfig, acceptance, fund_ssp, optional_env, poll, setup_lightning, timed,
 };
 
-const HELP: &str = "Usage: cargo regtest [--project NAME] COMMAND
+const HELP: &str = "Usage: open-ssp-regtest [--project NAME] [--data-dir DIRECTORY] COMMAND
+       cargo regtest [--project NAME] [--data-dir DIRECTORY] COMMAND
 
   init                  Fetch the pinned Git submodules
   build                 Provision tools and build native service binaries
-  up                    Build, start, and fund a persistent development stack
+  up                    Start and fund a stack (builds only in a checkout)
+  info                  Print project paths and endpoints as JSON
   status                Show processes and check both SSPs and the chain service
   stop                  Stop processes and preserve all data
   start                 Resume stopped processes and wait for readiness
@@ -34,7 +36,10 @@ Development defaults to open-ssp-regtest; test defaults to open-ssp-breez-e2e.
 Use --project or REGTEST_PROJECT to select a project. Test deletes that project's
 data directories before every run, even with --keep. Other projects can still conflict
 with its host ports. Stop them first.
---no-build uses existing native binaries; run cargo regtest build first.
+In a bundle, up/start/test use bundled binaries and never build or download.
+--data-dir or REGTEST_DATA_DIR selects writable data outside the bundle.
+info prints endpoint and path JSON; ldk/status/logs/info/certs do not lock.
+In a checkout, --no-build uses existing native binaries; run build first.
 
 Sources default to vendor/spark and vendor/ldk-server. SPARK_REF and LDK_SERVER_REF
 override those paths. SPARK_OPERATOR_COMMIT selects a committed operator revision.
@@ -50,6 +55,7 @@ enum Action {
     Miner(bool),
     Up,
     Status,
+    Info,
     Stop,
     Start,
     Down,
@@ -78,20 +84,27 @@ enum Action {
 #[derive(Debug)]
 struct Options {
     project: Option<String>,
+    data_dir: Option<PathBuf>,
     action: Action,
 }
 
 impl Options {
     fn parse(args: Vec<String>) -> Result<Self> {
         let mut args = args.as_slice();
-        let project = if args.first().map(String::as_str) == Some("--project") {
-            let name = args.get(1).context("--project needs a name")?;
-            validate_project(name)?;
+        let mut project = None;
+        let mut data_dir = None;
+        while let Some(flag @ ("--project" | "--data-dir")) = args.first().map(String::as_str) {
+            let value = args
+                .get(1)
+                .with_context(|| format!("{flag} needs a value"))?;
+            if flag == "--project" {
+                validate_project(value)?;
+                project = Some(value.clone());
+            } else {
+                data_dir = Some(PathBuf::from(value));
+            }
             args = &args[2..];
-            Some(name.clone())
-        } else {
-            None
-        };
+        }
         let words: Vec<&str> = args.iter().map(String::as_str).collect();
         let action = match words.as_slice() {
             [] | ["help" | "--help" | "-h"] => Action::Help,
@@ -102,6 +115,7 @@ impl Options {
             ["miner", "stop"] => Action::Miner(false),
             ["up"] => Action::Up,
             ["status"] => Action::Status,
+            ["info"] => Action::Info,
             ["stop"] => Action::Stop,
             ["start"] => Action::Start,
             ["down"] => Action::Down,
@@ -178,7 +192,11 @@ impl Options {
             }
             _ => bail!("invalid command; run cargo regtest --help"),
         };
-        Ok(Self { project, action })
+        Ok(Self {
+            project,
+            data_dir,
+            action,
+        })
     }
 }
 
@@ -206,9 +224,25 @@ struct Stack {
 
 impl Stack {
     fn new(options: &Options) -> Result<Self> {
-        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../..")
-            .canonicalize()?;
+        let executable = env::current_exe()?.canonicalize()?;
+        let bundle = executable
+            .parent()
+            .and_then(|p| p.parent())
+            .filter(|p| p.join("manifest.json").is_file());
+        let root = if let Some(bundle) = bundle {
+            let manifest: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(bundle.join("manifest.json"))?)?;
+            ensure!(
+                manifest["schema_version"] == 1,
+                "unsupported bundle manifest schema"
+            );
+            bundle.to_owned()
+        } else {
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../..")
+                .canonicalize()
+                .context("source checkout missing; use the complete extracted regtest bundle")?
+        };
         let fallback = if matches!(options.action, Action::Test { .. }) {
             optional_env("BREEZ_E2E_PROJECT_NAME", "open-ssp-breez-e2e")
         } else {
@@ -219,8 +253,31 @@ impl Stack {
             .clone()
             .unwrap_or_else(|| optional_env("REGTEST_PROJECT", &fallback));
         validate_project(&project)?;
+        let data_dir = options
+            .data_dir
+            .clone()
+            .or_else(|| env::var_os("REGTEST_DATA_DIR").map(PathBuf::from));
+        let runtime = if bundle.is_some() {
+            let data_dir = match data_dir {
+                Some(path) => path,
+                None => env::var_os("XDG_DATA_HOME")
+                    .map(PathBuf::from)
+                    .or_else(|| env::var_os("HOME").map(|p| PathBuf::from(p).join(".local/share")))
+                    .context("set --data-dir or REGTEST_DATA_DIR")?
+                    .join("open-ssp/regtest"),
+            };
+            crate::native::Runtime::bundle(root.clone(), data_dir, project.clone())?
+        } else {
+            let mut runtime = crate::native::Runtime::new(root.clone(), project.clone());
+            if let Some(path) = data_dir {
+                std::fs::create_dir_all(&path)?;
+                runtime.data_root = path.canonicalize()?;
+                runtime.directory = runtime.data_root.join(&project).join("native");
+            }
+            runtime
+        };
         Ok(Self {
-            runtime: crate::native::Runtime::new(root.clone(), project.clone()),
+            runtime,
             spark: root.join(optional_env("SPARK_REF", "vendor/spark")),
             ldk: root.join(optional_env("LDK_SERVER_REF", "vendor/ldk-server")),
             root,
@@ -231,6 +288,10 @@ impl Stack {
     }
 
     fn check_sources(&self) -> Result<()> {
+        ensure!(
+            !self.runtime.bundled,
+            "init/build require a source checkout; bundles are prebuilt"
+        );
         ensure!(
             self.spark.join("spark/go.mod").is_file(),
             "missing Spark sources; run cargo regtest init"
@@ -374,12 +435,18 @@ impl Stack {
         self.ready().await
     }
 
-    async fn up(&self, build: bool) -> Result<()> {
-        let source = if build {
-            self.build().await?
+    async fn source(&self, build: bool) -> Result<PathBuf> {
+        if self.runtime.bundled {
+            Ok(self.root.join("share/spark"))
+        } else if build {
+            self.build().await
         } else {
-            crate::native::tools::spark_source(&self.root, &self.spark).await?
-        };
+            crate::native::tools::spark_source(&self.root, &self.spark).await
+        }
+    }
+
+    async fn up(&self, build: bool) -> Result<()> {
+        let source = self.source(build).await?;
         let result = interruptible(async {
             // Load rebuilt binaries while preserving wallets and channels.
             self.runtime.stop_all().await?;
@@ -420,12 +487,7 @@ impl Stack {
 
     async fn test(&self, keep: bool, build: bool) -> Result<()> {
         let started = std::time::Instant::now();
-        self.check_sources()?;
-        let source = if build {
-            self.build().await?
-        } else {
-            crate::native::tools::spark_source(&self.root, &self.spark).await?
-        };
+        let source = self.source(build).await?;
         println!("Reset native test project {}", self.project);
         let result = interruptible(async {
             self.runtime.reset().await?;
@@ -491,7 +553,12 @@ pub(super) async fn run() -> Result<()> {
     let stack = Stack::new(&options)?;
     let _lock = if matches!(
         options.action,
-        Action::Mine | Action::Status | Action::Logs(_)
+        Action::Mine
+            | Action::Status
+            | Action::Info
+            | Action::Logs(_)
+            | Action::Ldk { .. }
+            | Action::Certs(_)
     ) {
         None
     } else {
@@ -500,6 +567,10 @@ pub(super) async fn run() -> Result<()> {
     match options.action {
         Action::Help => unreachable!(),
         Action::Init => {
+            ensure!(
+                !stack.runtime.bundled,
+                "init requires a source checkout; bundles are prebuilt"
+            );
             let status = Command::new("git")
                 .kill_on_drop(true)
                 .current_dir(&stack.root)
@@ -531,7 +602,7 @@ pub(super) async fn run() -> Result<()> {
         }
         Action::Stop => stack.runtime.stop_all().await?,
         Action::Start => {
-            let source = crate::native::tools::spark_source(&stack.root, &stack.spark).await?;
+            let source = stack.source(false).await?;
             let result = interruptible(stack.start_services(&source)).await;
             if result.is_err() {
                 let _ = stack.runtime.logs(&[]);
@@ -545,6 +616,7 @@ pub(super) async fn run() -> Result<()> {
         Action::Certs(directory) => {
             stack.certificates(directory).await?;
         }
+        Action::Info => println!("{}", serde_json::to_string_pretty(&stack.runtime.info())?),
         Action::Status => {
             stack.runtime.status()?;
             for port in [5000, 5001] {
@@ -606,6 +678,16 @@ mod tests {
 
     fn parse(args: &[&str]) -> Result<Options> {
         Options::parse(args.iter().map(|s| s.to_string()).collect())
+    }
+
+    #[test]
+    fn bundle_global_options_and_info() {
+        let options = parse(&["--data-dir", "/state", "--project", "orange", "info"]).unwrap();
+        assert_eq!(options.data_dir, Some(PathBuf::from("/state")));
+        assert_eq!(options.project.as_deref(), Some("orange"));
+        assert_eq!(options.action, Action::Info);
+        assert!(parse(&["--data-dir"]).is_err());
+        assert!(parse(&["--project", "../escape", "reset"]).is_err());
     }
 
     #[test]

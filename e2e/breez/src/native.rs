@@ -37,6 +37,8 @@ const SERVICES: &[&str] = &[
 pub struct Runtime {
     pub root: PathBuf,
     pub directory: PathBuf,
+    pub data_root: PathBuf,
+    pub bundled: bool,
     pub project: String,
 }
 
@@ -78,20 +80,20 @@ impl Runtime {
     /// Serialize mutations and builds across projects sharing ports and caches.
     /// The lock lives outside resettable data and closes automatically on exit.
     pub fn lock(&self) -> Result<Lock> {
-        fs::create_dir_all(self.root.join(".regtest"))?;
+        fs::create_dir_all(&self.data_root)?;
         let file = fs::OpenOptions::new()
             .create(true)
             .truncate(false)
             .write(true)
-            .open(self.root.join(".regtest/native.lock"))?;
+            .open(self.data_root.join("native.lock"))?;
         ensure!(
             unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0,
-            "another native regtest command is running in this repository"
+            "another native regtest command is running in this data directory"
         );
         Ok(Lock(file))
     }
 
-    fn check_ports(&self) -> Result<()> {
+    async fn check_ports(&self) -> Result<()> {
         let bitcoin_port = optional_env("BITCOIN_RPC_PORT", "8332").parse::<u16>()?;
         for (name, ports) in [
             ("postgres", vec![54329]),
@@ -109,24 +111,111 @@ impl Runtime {
                 continue;
             }
             for port in ports {
-                let socket = tokio::net::TcpSocket::new_v4()?;
-                socket.set_reuseaddr(true)?;
-                socket
-                    .bind((std::net::Ipv4Addr::LOCALHOST, port).into())
-                    .with_context(|| {
-                        format!("{name} needs port {port}; stop the conflicting stack first")
-                    })?;
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(75);
+                let mut waiting = false;
+                loop {
+                    let socket = tokio::net::TcpSocket::new_v4()?;
+                    socket.set_reuseaddr(true)?;
+                    match socket.bind((std::net::Ipv4Addr::LOCALHOST, port).into()) {
+                        Ok(()) => break,
+                        Err(error) => {
+                            // Electrs uses SO_REUSEPORT without SO_REUSEADDR. Its
+                            // closed HTTP sockets can outlive the process for 60s.
+                            let time_wait = port == 30000
+                                && error.kind() == std::io::ErrorKind::AddrInUse
+                                && matches!(tokio::time::timeout(Duration::from_secs(1),
+                                    tokio::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port))).await,
+                                    Ok(Err(ref e)) if e.kind() == std::io::ErrorKind::ConnectionRefused);
+                            if !time_wait || tokio::time::Instant::now() >= deadline {
+                                return Err(error).with_context(|| {
+                                    format!(
+                                        "{name} needs port {port}; stop the conflicting stack first"
+                                    )
+                                });
+                            }
+                            if !waiting {
+                                println!(
+                                    "Waiting for Esplora port 30000 TIME_WAIT sockets (up to 75s)"
+                                );
+                                waiting = true;
+                            }
+                            tokio::time::sleep(Duration::from_secs(1)).await;
+                        }
+                    }
+                }
             }
         }
         Ok(())
     }
     pub fn new(root: PathBuf, project: String) -> Self {
-        let directory = root.join(".regtest").join(&project).join("native");
+        let data_root = root.join(".regtest");
+        let directory = data_root.join(&project).join("native");
         Self {
             root,
             directory,
+            data_root,
+            bundled: false,
             project,
         }
+    }
+
+    pub fn bundle(root: PathBuf, data_root: PathBuf, project: String) -> Result<Self> {
+        ensure!(
+            !std::path::absolute(&data_root)?.starts_with(&root),
+            "project data must be outside the bundle"
+        );
+        fs::create_dir_all(&data_root)?;
+        let data_root = data_root.canonicalize()?;
+        ensure!(
+            !data_root.starts_with(&root),
+            "project data must be outside the bundle"
+        );
+        let mut runtime = Self::new(root, project);
+        runtime.directory = data_root.join(&runtime.project).join("native");
+        runtime.data_root = data_root;
+        runtime.bundled = true;
+        Ok(runtime)
+    }
+
+    fn binary(&self, name: &str, development: &str) -> PathBuf {
+        self.root
+            .join(if self.bundled { "bin" } else { development })
+            .join(name)
+    }
+
+    fn assets(&self) -> PathBuf {
+        self.root.join(if self.bundled {
+            "share/upstream"
+        } else {
+            "e2e/upstream"
+        })
+    }
+
+    pub fn info(&self) -> Value {
+        json!({
+            "schema_version": 1, "project": self.project,
+            "bundle_root": if self.bundled { Some(&self.root) } else { None },
+            "data_dir": self.directory, "log_dir": self.directory,
+            "operator_cert_dir": self.cert_dir(),
+            "ssp": {"a": "http://127.0.0.1:5000", "b": "http://127.0.0.1:5001"},
+            "ldk": {"a": "https://localhost:3536", "b": "https://localhost:3537"},
+            "operators": (0..3).map(|i| json!({
+                "id": i, "address": format!("https://localhost:{}", 8535 + i),
+                "ssp_address": format!("https://localhost:{}", 18535 + i),
+                "identity_public_key": crate::OPERATOR_IDENTITIES[i],
+                "cert": self.cert_dir().join(format!("server_{i}.crt"))
+            })).collect::<Vec<_>>(),
+            "esplora": "http://127.0.0.1:30000",
+            "bitcoin_rpc": format!("http://127.0.0.1:{}", optional_env("BITCOIN_RPC_PORT", "8332"))
+        })
+    }
+
+    fn socket_dir(&self) -> PathBuf {
+        self.data_root.join("native-sockets").join(
+            &hex::encode(Sha256::digest(
+                self.directory.as_os_str().as_encoded_bytes(),
+            ))[..12],
+        )
     }
 
     pub fn cert_dir(&self) -> PathBuf {
@@ -136,8 +225,7 @@ impl Runtime {
         self.directory.join(name)
     }
     pub fn ldk_cli(&self) -> PathBuf {
-        self.root
-            .join(".regtest/native-build/ldk/debug/ldk-server-cli")
+        self.binary("ldk-server-cli", ".regtest/native-build/ldk/debug")
     }
 
     fn service_file(&self, name: &str, suffix: &str) -> Result<PathBuf> {
@@ -181,7 +269,7 @@ impl Runtime {
         }
         let spec: Service = serde_json::from_slice(
             &fs::read(self.service_file(name, "json")?)
-                .with_context(|| format!("{name} is not configured; run cargo regtest up"))?,
+                .with_context(|| format!("{name} is not configured; run regtest up"))?,
         )?;
         let log = fs::OpenOptions::new()
             .create(true)
@@ -277,6 +365,9 @@ impl Runtime {
         self.stop_all().await?;
         if self.directory.exists() {
             fs::remove_dir_all(&self.directory)?;
+        }
+        if self.socket_dir().exists() {
+            fs::remove_dir_all(self.socket_dir())?;
         }
         Ok(())
     }
@@ -387,11 +478,23 @@ impl Runtime {
     }
 
     pub async fn setup(&self, spark: &Path, admin_token: &str) -> Result<()> {
-        self.check_ports()?;
+        ensure!(
+            self.socket_dir()
+                .join("0.sock")
+                .as_os_str()
+                .as_encoded_bytes()
+                .len()
+                < 108,
+            "data directory path is too long for signer Unix sockets; use a shorter --data-dir"
+        );
+        self.check_ports().await?;
         fs::create_dir_all(&self.directory)?;
         let pg = tools::pg_bin().await?;
-        let bin = self.root.join(".regtest/native-tools");
-        let builds = self.root.join(".regtest/native-build");
+        let bin = self.root.join(if self.bundled {
+            "bin"
+        } else {
+            ".regtest/native-tools"
+        });
         let empty = BTreeMap::new();
         if !self.data("postgres/PG_VERSION").exists() {
             tools::output(
@@ -430,7 +533,7 @@ impl Runtime {
         .await?;
 
         fs::create_dir_all(self.data("bitcoin"))?;
-        let bitcoin_config = fs::read_to_string(self.root.join("e2e/upstream/bitcoin.conf"))?
+        let bitcoin_config = fs::read_to_string(self.assets().join("bitcoin.conf"))?
             .replace("0.0.0.0", "127.0.0.1")
             .replace("rpcallowip=127.0.0.1/0", "rpcallowip=127.0.0.1")
             .replace(
@@ -444,7 +547,7 @@ impl Runtime {
         fs::write(self.data("bitcoin.conf"), bitcoin_config)?;
         self.configure(
             "bitcoind",
-            bin.join("bitcoin-29.0/bin/bitcoind"),
+            self.binary("bitcoind", ".regtest/native-tools/bitcoin-29.0/bin"),
             vec![
                 format!("-datadir={}", self.data("bitcoin").display()),
                 format!("-conf={}", self.data("bitcoin.conf").display()),
@@ -543,9 +646,8 @@ impl Runtime {
                 .await?;
             }
         }
-        let mut operators: Value = serde_json::from_str(&fs::read_to_string(
-            self.root.join("e2e/upstream/config.json"),
-        )?)?;
+        let mut operators: Value =
+            serde_json::from_str(&fs::read_to_string(self.assets().join("config.json"))?)?;
         for (i, operator) in operators
             .as_array_mut()
             .context("operator config missing")?
@@ -560,18 +662,14 @@ impl Runtime {
             self.data("operators.json"),
             serde_json::to_vec_pretty(&operators)?,
         )?;
-        let config = fs::read_to_string(self.root.join("e2e/upstream/operator.config.yaml"))?
+        let config = fs::read_to_string(self.assets().join("operator.config.yaml"))?
             .replace(
                 "bitcoind:8332",
                 &format!("127.0.0.1:{}", optional_env("BITCOIN_RPC_PORT", "8332")),
             )
             .replace("bitcoind:28332", "127.0.0.1:28332");
         fs::write(self.data("operator.yaml"), config)?;
-        let socket_dir = self.root.join(".regtest/native-sockets").join(
-            &hex::encode(Sha256::digest(
-                self.directory.as_os_str().as_encoded_bytes(),
-            ))[..12],
-        );
+        let socket_dir = self.socket_dir();
         fs::create_dir_all(&socket_dir)?;
         for i in 0..3 {
             for (db, migrations) in [
@@ -613,7 +711,7 @@ impl Runtime {
             }
             self.configure(
                 &signer,
-                builds.join("signer/debug/spark-frost-signer"),
+                self.binary("spark-frost-signer", ".regtest/native-build/signer/debug"),
                 vec!["-u".into(), socket.display().to_string()],
                 BTreeMap::from([("RUST_LOG".into(), "warn".into())]),
             )?;
@@ -633,8 +731,8 @@ impl Runtime {
                     "-index".into(),
                     i.to_string(),
                     "-key".into(),
-                    self.root
-                        .join(format!("e2e/upstream/operator_{i}.key"))
+                    self.assets()
+                        .join(format!("operator_{i}.key"))
                         .display()
                         .to_string(),
                     "-operators".into(),
@@ -676,7 +774,11 @@ impl Runtime {
         fs::create_dir_all(self.data("electrs"))?;
         self.configure(
             "electrs",
-            tools::electrs_binary(&self.root),
+            if self.bundled {
+                bin.join("electrs")
+            } else {
+                tools::electrs_binary(&self.root)
+            },
             vec![
                 "--network=regtest".into(),
                 "--jsonrpc-import".into(),
@@ -703,14 +805,14 @@ impl Runtime {
             let data = self.data(name);
             fs::create_dir_all(&data)?;
             let config = format!(
-                "[node]\ngrpc_service_address = '127.0.0.1:{grpc}'\nnetwork = 'regtest'\nlistening_addresses = ['127.0.0.1:{peer}']\n[storage.disk]\ndir_path = '{}'\n[log]\nlevel = 'Info'\n[tls]\nhosts = ['localhost', '127.0.0.1']\n[bitcoind]\nrpc_address = '127.0.0.1:{}'\nrpc_user = 'testutil'\nrpc_password = 'testutilpassword'\n",
-                data.display(),
+                "[node]\ngrpc_service_address = '127.0.0.1:{grpc}'\nnetwork = 'regtest'\nlistening_addresses = ['127.0.0.1:{peer}']\n[storage.disk]\ndir_path = {}\n[log]\nlevel = 'Info'\n[tls]\nhosts = ['localhost', '127.0.0.1']\n[bitcoind]\nrpc_address = '127.0.0.1:{}'\nrpc_user = 'testutil'\nrpc_password = 'testutilpassword'\n",
+                serde_json::to_string(&data.display().to_string())?,
                 optional_env("BITCOIN_RPC_PORT", "8332")
             );
             fs::write(self.data(&format!("{name}.toml")), config)?;
             self.configure(
                 name,
-                builds.join("ldk/debug/ldk-server"),
+                self.binary("ldk-server", ".regtest/native-build/ldk/debug"),
                 vec![self.data(&format!("{name}.toml")).display().to_string()],
                 empty.clone(),
             )?;
@@ -793,7 +895,7 @@ impl Runtime {
             }
             self.configure(
                 ssp_name,
-                self.root.join("target/debug/open-ssp"),
+                self.binary("open-ssp", "target/debug"),
                 vec![],
                 env,
             )?;
@@ -802,7 +904,10 @@ impl Runtime {
             "bitcoin-miner",
             std::env::current_exe()?,
             vec!["--project".into(), self.project.clone(), "_mine".into()],
-            empty,
+            BTreeMap::from([(
+                "REGTEST_DATA_DIR".into(),
+                self.data_root.display().to_string(),
+            )]),
         )?;
         self.start("bitcoin-miner").await?;
         Ok(())
@@ -812,6 +917,37 @@ impl Runtime {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn bundle_reset_preserves_assets_and_other_projects() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("bundle");
+        fs::create_dir_all(root.join("bin")).unwrap();
+        fs::write(root.join("manifest.json"), "immutable").unwrap();
+        let data = temp.path().join("data");
+        let a = Runtime::bundle(root.clone(), data.clone(), "a".into()).unwrap();
+        let b = Runtime::bundle(root.clone(), data.clone(), "b".into()).unwrap();
+        assert_eq!(a.ldk_cli(), root.join("bin/ldk-server-cli"));
+        assert_eq!(a.info()["data_dir"], a.directory.to_str().unwrap());
+        assert_eq!(a.assets(), root.join("share/upstream"));
+        for r in [&a, &b] {
+            fs::create_dir_all(&r.directory).unwrap();
+            fs::create_dir_all(r.socket_dir()).unwrap();
+        }
+        let _lock = a.lock().unwrap();
+        assert!(b.lock().is_err());
+        a.reset().await.unwrap();
+        assert!(!a.directory.exists());
+        assert!(!a.socket_dir().exists());
+        assert!(b.directory.exists());
+        assert!(b.socket_dir().exists());
+        assert_eq!(
+            fs::read_to_string(root.join("manifest.json")).unwrap(),
+            "immutable"
+        );
+        assert!(Runtime::bundle(root.clone(), root.join("data"), "x".into()).is_err());
+        assert!(!root.join("data").exists());
+    }
 
     #[tokio::test]
     async fn detect_daemon_exit_during_startup() {
