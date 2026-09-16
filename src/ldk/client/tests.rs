@@ -22,6 +22,13 @@ fn config(dir: &TestDir) -> Config {
     config.ldk_backend = LdkBackendMode::Embedded;
     config.data_dir = dir.0.to_str().unwrap().into();
     config.ldk_node_data_dir = String::new();
+    config.ldk_node_chain_source = LdkChainSource::Esplora;
+    config.ldk_node_bitcoind_rpc_host.clear();
+    config.ldk_node_bitcoind_rpc_port = 8332;
+    config.ldk_node_bitcoind_rpc_user.clear();
+    config.ldk_node_bitcoind_rpc_password.clear();
+    config.ldk_node_bitcoind_rpc_password_file.clear();
+    config.ldk_node_bitcoind_rescan_from_height = None;
     config.ldk_node_esplora_url = "http://127.0.0.1:1".into();
     config.ldk_node_listen_addr = "127.0.0.1:0".into();
     config.ldk_node_seed_required = false;
@@ -86,6 +93,58 @@ fn embedded_config_and_seed_errors_fail_closed() {
     std::fs::write(dir.0.join("seed"), [1u8; 63]).unwrap();
     assert!(load_entropy(&dir.0, false).is_err());
     assert_eq!(std::fs::read(dir.0.join("seed")).unwrap().len(), 63);
+}
+
+#[test]
+fn bitcoind_configuration_fails_closed_without_esplora_fallback() {
+    let dir = TestDir::new();
+    let mut config = config(&dir);
+    config.ldk_node_chain_source = LdkChainSource::Bitcoind;
+    let check = |config: &Config| configure_chain_source(&mut Builder::new(), config);
+    // A valid Esplora URL must not hide incomplete bitcoind settings.
+    assert!(check(&config).unwrap_err().contains("RPC_HOST"));
+    config.ldk_node_bitcoind_rpc_host = "localhost".into();
+    assert!(check(&config).unwrap_err().contains("RPC_USER"));
+    config.ldk_node_bitcoind_rpc_user = "testutil".into();
+    assert!(check(&config).unwrap_err().contains("RPC_PASSWORD"));
+    config.ldk_node_bitcoind_rpc_password = "testutilpassword".into();
+    config.ldk_node_esplora_url.clear();
+    check(&config).unwrap();
+
+    for host in [
+        "http://localhost",
+        "localhost:8332",
+        "localhost/wallet/ssp",
+        "user@localhost",
+        "localhost?x",
+        "localhost#x",
+    ] {
+        config.ldk_node_bitcoind_rpc_host = host.into();
+        assert!(check(&config).unwrap_err().contains("RPC_HOST"));
+    }
+    for host in ["[::1]", "127.0.0.1", "BITCOIND"] {
+        config.ldk_node_bitcoind_rpc_host = host.into();
+        check(&config).unwrap();
+    }
+    config.ldk_node_bitcoind_rpc_port = 0;
+    assert!(check(&config).unwrap_err().contains("RPC_PORT"));
+    config.ldk_node_bitcoind_rpc_port = 18443;
+
+    let password_file = dir.0.join("rpc-password");
+    config.ldk_node_bitcoind_rpc_password_file = password_file.to_str().unwrap().into();
+    assert!(check(&config).unwrap_err().contains("PASSWORD_FILE"));
+    std::fs::write(&password_file, "\n").unwrap();
+    assert!(check(&config).unwrap_err().contains("RPC_PASSWORD"));
+    std::fs::write(&password_file, "testutilpassword\r\n").unwrap();
+    config.ldk_node_bitcoind_rpc_password.clear();
+    check(&config).unwrap();
+
+    // Only the selected source's credentials are required.
+    config.ldk_node_chain_source = LdkChainSource::Esplora;
+    assert!(check(&config).unwrap_err().contains("ESPLORA_URL"));
+    config.ldk_node_esplora_url = "http://127.0.0.1:1".into();
+    std::fs::remove_file(password_file).unwrap();
+    check(&config).unwrap();
 }
 
 fn details(kind: payment::PaymentKind) -> PaymentDetails {

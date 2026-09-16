@@ -21,7 +21,7 @@ use ldk_server_client::{
 
 use super::{ClaimableReceive, LdkBackend, LnEvent, ReceiveLdk, SendLdk};
 use crate::{
-    config::{Config, LdkBackendMode},
+    config::{Config, LdkBackendMode, LdkChainSource},
     lightning_store::{LightningSend, SendKind},
 };
 
@@ -39,14 +39,6 @@ pub(super) struct EmbeddedNode {
 
 impl EmbeddedNode {
     fn build(config: &Config, network: bitcoin::Network) -> Result<Self, String> {
-        if config.ldk_node_esplora_url.trim().is_empty() {
-            return Err("LDK_NODE_ESPLORA_URL is required for embedded mode".into());
-        }
-        let url = reqwest::Url::parse(&config.ldk_node_esplora_url)
-            .map_err(|e| format!("LDK_NODE_ESPLORA_URL: {e}"))?;
-        if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
-            return Err("LDK_NODE_ESPLORA_URL must be an HTTP(S) URL".into());
-        }
         let listen = config
             .ldk_node_listen_addr
             .parse()
@@ -56,6 +48,14 @@ impl EmbeddedNode {
         } else {
             config.ldk_node_data_dir.clone().into()
         };
+        let mut builder = Builder::from_config(ldk_node::config::Config {
+            network,
+            storage_dir_path: dir.to_string_lossy().into_owned(),
+            // SSP supplies preimages only after the Spark transfer is durable.
+            manually_handle_unknown_bolt11_payments: true,
+            ..Default::default()
+        });
+        configure_chain_source(&mut builder, config)?;
         std::fs::create_dir_all(&dir).map_err(|e| format!("create node directory: {e}"))?;
         let lock = std::fs::OpenOptions::new()
             .read(true)
@@ -67,14 +67,6 @@ impl EmbeddedNode {
         lock.try_lock_exclusive()
             .map_err(|e| format!("LDK node directory is already in use: {e}"))?;
         let entropy = load_entropy(&dir, config.ldk_node_seed_required)?;
-        let mut builder = Builder::from_config(ldk_node::config::Config {
-            network,
-            storage_dir_path: dir.to_string_lossy().into_owned(),
-            // SSP supplies preimages only after the Spark transfer is durable.
-            manually_handle_unknown_bolt11_payments: true,
-            ..Default::default()
-        });
-        builder.set_chain_source_esplora(config.ldk_node_esplora_url.clone(), None);
         builder
             .set_listening_addresses(vec![listen])
             .map_err(|e| e.to_string())?;
@@ -96,6 +88,74 @@ impl EmbeddedNode {
             .await
             .map_err(|e| format!("LDK node task: {e}"))?
     }
+}
+
+fn configure_chain_source(builder: &mut Builder, config: &Config) -> Result<(), String> {
+    match config.ldk_node_chain_source {
+        LdkChainSource::Esplora => {
+            if config.ldk_node_esplora_url.trim().is_empty() {
+                return Err("LDK_NODE_ESPLORA_URL is required for the esplora chain source".into());
+            }
+            let url = reqwest::Url::parse(&config.ldk_node_esplora_url)
+                .map_err(|e| format!("LDK_NODE_ESPLORA_URL: {e}"))?;
+            if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+                return Err("LDK_NODE_ESPLORA_URL must be an HTTP(S) URL".into());
+            }
+            builder.set_chain_source_esplora(config.ldk_node_esplora_url.clone(), None);
+        }
+        LdkChainSource::Bitcoind => {
+            // LDK takes a host and port, not a URL or a Core wallet endpoint.
+            let host = &config.ldk_node_bitcoind_rpc_host;
+            if host.is_empty()
+                || reqwest::Url::parse(&format!("http://{host}"))
+                    .map(|url| {
+                        !url.host_str()
+                            .is_some_and(|parsed| parsed.eq_ignore_ascii_case(host))
+                            || url.port().is_some()
+                            || url.path() != "/"
+                            || url.query().is_some()
+                            || url.fragment().is_some()
+                            || !url.username().is_empty()
+                            || url.password().is_some()
+                    })
+                    .unwrap_or(true)
+            {
+                return Err(
+                    "LDK_NODE_BITCOIND_RPC_HOST must be a host without a scheme, port, or path"
+                        .into(),
+                );
+            }
+            if config.ldk_node_bitcoind_rpc_port == 0 {
+                return Err("LDK_NODE_BITCOIND_RPC_PORT must be nonzero".into());
+            }
+            if config.ldk_node_bitcoind_rpc_user.trim().is_empty() {
+                return Err(
+                    "LDK_NODE_BITCOIND_RPC_USER is required for the bitcoind chain source".into(),
+                );
+            }
+            let password = if !config.ldk_node_bitcoind_rpc_password_file.is_empty() {
+                std::fs::read_to_string(&config.ldk_node_bitcoind_rpc_password_file)
+                    .map_err(|_| "cannot read LDK_NODE_BITCOIND_RPC_PASSWORD_FILE")?
+                    .trim_end_matches(['\r', '\n'])
+                    .to_owned()
+            } else {
+                config.ldk_node_bitcoind_rpc_password.clone()
+            };
+            if password.is_empty() {
+                return Err(
+                    "LDK_NODE_BITCOIND_RPC_PASSWORD or a nonempty password file is required".into(),
+                );
+            }
+            builder.set_chain_source_bitcoind_rpc(
+                host.clone(),
+                config.ldk_node_bitcoind_rpc_port,
+                config.ldk_node_bitcoind_rpc_user.clone(),
+                password,
+                config.ldk_node_bitcoind_rescan_from_height,
+            );
+        }
+    }
+    Ok(())
 }
 
 fn load_entropy(dir: &Path, required: bool) -> Result<NodeEntropy, String> {

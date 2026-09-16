@@ -36,6 +36,14 @@ The SSP calls existing operator consensus code through this RPC.
 | `SSP_FROST_THRESHOLD` | Spark wallet signing threshold |
 | `SPARK_ADMIN_TOKEN` | Bearer token for the liquidity endpoints |
 | `LDK_BACKEND` | `server` (default) or `embedded`; see [embedded configuration](../README.md#lightning-backend) |
+| `LDK_NODE_CHAIN_SOURCE` | Embedded mode: `esplora` (default) or `bitcoind` |
+| `LDK_NODE_ESPLORA_URL` | Required for embedded Esplora mode |
+| `LDK_NODE_BITCOIND_RPC_HOST` | Required for embedded bitcoind mode; host only, no scheme, port, or wallet path |
+| `LDK_NODE_BITCOIND_RPC_PORT` | Core RPC port; defaults to `8332`, set explicitly for other ports |
+| `LDK_NODE_BITCOIND_RPC_USER` | Core RPC user for embedded bitcoind mode |
+| `LDK_NODE_BITCOIND_RPC_PASSWORD_FILE` | RPC password file; takes precedence over the password variable |
+| `LDK_NODE_BITCOIND_RPC_PASSWORD` | RPC password when no password file is configured |
+| `LDK_NODE_BITCOIND_RESCAN_FROM_HEIGHT` | Optional first-start wallet scan height; unset checkpoints at the current tip |
 | `LDK_GRPC_ADDR` | `ldk-server` gRPC address without a URL scheme |
 | `LDK_API_KEY` | Hex API key; use this or `LDK_API_KEY_FILE` |
 | `LDK_API_KEY_FILE` | Mounted raw `ldk-server` API-key file |

@@ -16,7 +16,14 @@ pub struct Config {
     pub ldk_backend: LdkBackendMode,
     /// Empty selects <SSP_DATA_DIR>/ldk-node.
     pub ldk_node_data_dir: String,
+    pub ldk_node_chain_source: LdkChainSource,
     pub ldk_node_esplora_url: String,
+    pub ldk_node_bitcoind_rpc_host: String,
+    pub ldk_node_bitcoind_rpc_port: u16,
+    pub ldk_node_bitcoind_rpc_user: String,
+    pub ldk_node_bitcoind_rpc_password: String,
+    pub ldk_node_bitcoind_rpc_password_file: String,
+    pub ldk_node_bitcoind_rescan_from_height: Option<u32>,
     pub ldk_node_listen_addr: String,
     /// Refuse to generate a seed on an existing deployment.
     pub ldk_node_seed_required: bool,
@@ -86,7 +93,21 @@ impl Config {
             data_dir: get("SSP_DATA_DIR", "./data"),
             ldk_backend: parsed("LDK_BACKEND", LdkBackendMode::Server)?,
             ldk_node_data_dir: get("LDK_NODE_DATA_DIR", ""),
+            ldk_node_chain_source: parsed("LDK_NODE_CHAIN_SOURCE", LdkChainSource::Esplora)?,
             ldk_node_esplora_url: get("LDK_NODE_ESPLORA_URL", ""),
+            ldk_node_bitcoind_rpc_host: get("LDK_NODE_BITCOIND_RPC_HOST", ""),
+            ldk_node_bitcoind_rpc_port: parsed("LDK_NODE_BITCOIND_RPC_PORT", 8332)?,
+            ldk_node_bitcoind_rpc_user: get("LDK_NODE_BITCOIND_RPC_USER", ""),
+            ldk_node_bitcoind_rpc_password: get("LDK_NODE_BITCOIND_RPC_PASSWORD", ""),
+            ldk_node_bitcoind_rpc_password_file: get("LDK_NODE_BITCOIND_RPC_PASSWORD_FILE", ""),
+            ldk_node_bitcoind_rescan_from_height: {
+                let height = get("LDK_NODE_BITCOIND_RESCAN_FROM_HEIGHT", "");
+                if height.trim().is_empty() {
+                    None
+                } else {
+                    Some(parsed("LDK_NODE_BITCOIND_RESCAN_FROM_HEIGHT", 0)?)
+                }
+            },
             ldk_node_listen_addr: get("LDK_NODE_LISTEN_ADDR", "0.0.0.0:9735"),
             ldk_node_seed_required: parsed("LDK_NODE_SEED_REQUIRED", false)?,
             ldk_grpc_addr: get("LDK_GRPC_ADDR", ""),
@@ -125,7 +146,7 @@ impl Config {
 
 #[cfg(test)]
 mod tests {
-    use super::{parsed, LdkBackendMode};
+    use super::{parsed, LdkBackendMode, LdkChainSource};
 
     #[test]
     fn lightning_backend_selection_is_explicit() {
@@ -140,6 +161,21 @@ mod tests {
         );
         assert!("embeded".parse::<LdkBackendMode>().is_err());
         assert!("".parse::<LdkBackendMode>().is_err());
+    }
+
+    #[test]
+    fn embedded_chain_selection_preserves_esplora_default() {
+        assert_eq!(LdkChainSource::default(), LdkChainSource::Esplora);
+        assert_eq!(
+            "esplora".parse::<LdkChainSource>().unwrap(),
+            LdkChainSource::Esplora
+        );
+        assert_eq!(
+            "bitcoind".parse::<LdkChainSource>().unwrap(),
+            LdkChainSource::Bitcoind
+        );
+        assert!("bitcoin".parse::<LdkChainSource>().is_err());
+        assert!("".parse::<LdkChainSource>().is_err());
     }
 
     #[test]
@@ -174,6 +210,27 @@ impl std::str::FromStr for LdkBackendMode {
             "server" => Ok(Self::Server),
             "embedded" => Ok(Self::Embedded),
             _ => Err("expected server or embedded".into()),
+        }
+    }
+}
+
+/// Embedded chain selection never falls back after a connection error.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum LdkChainSource {
+    #[default]
+    Esplora,
+    Bitcoind,
+}
+
+impl std::str::FromStr for LdkChainSource {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "esplora" => Ok(Self::Esplora),
+            "bitcoind" => Ok(Self::Bitcoind),
+            _ => Err("expected esplora or bitcoind".into()),
         }
     }
 }

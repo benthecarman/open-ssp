@@ -43,7 +43,7 @@ ldk-server-client = { git = "https://github.com/lightningdevkit/ldk-server", rev
 
 # Match the node revision used by the pinned ldk-server. Filesystem storage
 # avoids linking a second SQLite version alongside the SSP database.
-ldk-node = { git = "https://github.com/lightningdevkit/ldk-node", rev = "b1337d2f1665716313d2ccf849a04114f8b3ca19", default-features = false, features = ["chain-esplora", "storage-filesystem"] }
+ldk-node = { git = "https://github.com/lightningdevkit/ldk-node", rev = "b1337d2f1665716313d2ccf849a04114f8b3ca19", default-features = false, features = ["chain-esplora", "chain-bitcoind", "storage-filesystem"] }
 fs2 = "0.4"
 
 [dev-dependencies]

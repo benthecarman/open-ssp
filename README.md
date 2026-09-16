@@ -160,6 +160,7 @@ and TLS settings. Set `LDK_BACKEND=embedded` to run LDK Node inside the SSP:
 
 ```sh
 LDK_BACKEND=embedded
+LDK_NODE_CHAIN_SOURCE=esplora
 LDK_NODE_ESPLORA_URL=http://127.0.0.1:30000
 LDK_NODE_LISTEN_ADDR=0.0.0.0:9735
 SSP_NETWORK=REGTEST
@@ -170,7 +171,40 @@ Embedded mode needs no ldk-server process, API key, or gRPC certificate. Both
 modes share the BOLT11/BOLT12 settlement and restart-recovery logic. The
 embedded node uses the same pinned LDK Node revision as ldk-server.
 
-The Esplora service must track the selected network. Node state and a separate
+To use Bitcoin Core directly, replace the Esplora settings with:
+
+```sh
+LDK_NODE_CHAIN_SOURCE=bitcoind
+LDK_NODE_BITCOIND_RPC_HOST=127.0.0.1
+LDK_NODE_BITCOIND_RPC_PORT=18443
+LDK_NODE_BITCOIND_RPC_USER=ssp
+LDK_NODE_BITCOIND_RPC_PASSWORD_FILE=/run/secrets/ldk-bitcoin-rpc-password
+```
+
+This example uses Core's usual regtest RPC port; set the port to your node's
+actual RPC port (the SSP setting defaults to `8332`). The host has no URL
+scheme, port, or wallet path; bracket IPv6 addresses, such as `[::1]`. LDK uses
+HTTP RPC, so use a trusted private connection to Core. Core must have RPC
+enabled (`server=1`). LDK manages its own wallet; no Core wallet endpoint or
+Electrs service is needed for this chain source.
+
+`LDK_NODE_BITCOIND_RPC_PASSWORD` can supply the password directly. A configured
+password file takes precedence, with trailing line endings removed; an
+unreadable or empty file prevents startup. Chain selection is explicit and
+never falls back to another source when a connection fails. Esplora remains
+the default for existing embedded deployments.
+
+For a restored seed without wallet state, set
+`LDK_NODE_BITCOIND_RESCAN_FROM_HEIGHT` to a height at or before the wallet's
+first transaction (`0` scans from genesis). This only applies before wallet
+state exists; an existing wallet is not rewound. If unset, a new bitcoind wallet
+starts at the current tip. Core must retain the blocks needed for the scan.
+
+These settings are independent of `COOP_BITCOIN_RPC_*`, which still configure
+the SSP's dedicated Core wallet for deposits and withdrawals. Breez client
+wallets may still need their own Esplora service.
+
+The chain source must track the selected network. Node state and a separate
 Lightning seed live in `<SSP_DATA_DIR>/ldk-node`, overridable with
 `LDK_NODE_DATA_DIR`. Persist and back up that entire directory along with SSP
 state. After first boot, set `LDK_NODE_SEED_REQUIRED=true`. A missing seed next

@@ -10,7 +10,7 @@ Upgrade SSP and LDK server together: the payment event layout, payment ID
 field, pagination tokens, and BOLT11 claim/fail RPCs changed upstream.
 
 Embedded mode pins LDK Node to `b1337d2f1665716313d2ccf849a04114f8b3ca19`,
-the revision used by this server. It uses an Esplora chain source, filesystem
+the revision used by this server. It supports Esplora or Bitcoin Core RPC chain sources, filesystem
 storage, and a persistent event queue. Blocking node calls run off the async
 executor. Both transports provide the same payment snapshots to the settlement
 and reconciliation code. Embedded events are acknowledged after processing;

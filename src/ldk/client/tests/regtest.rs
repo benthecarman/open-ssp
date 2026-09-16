@@ -112,7 +112,17 @@ fn send(invoice: String, kind: SendKind, expected_id: String) -> LightningSend {
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires native Bitcoin Core and Esplora electrs binaries"]
-async fn embedded_regtest_payments_and_restart() {
+async fn embedded_regtest_payments_and_restart_esplora() {
+    payments_and_restart(LdkChainSource::Esplora).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires a native Bitcoin Core binary"]
+async fn embedded_regtest_payments_and_restart_bitcoind() {
+    payments_and_restart(LdkChainSource::Bitcoind).await;
+}
+
+async fn payments_and_restart(source: LdkChainSource) {
     let chain_dir = TestDir::new();
     let bitcoin_dir = chain_dir.0.join("bitcoin");
     std::fs::create_dir(&bitcoin_dir).unwrap();
@@ -154,46 +164,51 @@ async fn embedded_regtest_payments_and_restart() {
     chain.rpc("createwallet", json!(["miner"])).await.unwrap();
     chain.mine(101).await;
 
-    let http_port = port();
-    let electrs_log = File::create(chain_dir.0.join("electrs.log")).unwrap();
-    let electrs = std::env::var("LDK_TEST_ELECTRS")
-        .unwrap_or_else(|_| ".regtest/native-tools/electrs".into());
-    let _electrs = Process(
-        Command::new(electrs)
-            .args([
-                "--network=regtest",
-                "--jsonrpc-import",
-                "--cookie=testutil:testutilpassword",
-                &format!("--daemon-rpc-addr=127.0.0.1:{rpc_port}"),
-                &format!("--daemon-dir={}", bitcoin_dir.display()),
-                &format!("--db-dir={}", chain_dir.0.join("electrs").display()),
-                &format!("--http-addr=127.0.0.1:{http_port}"),
-                &format!("--electrum-rpc-addr=127.0.0.1:{}", port()),
-                &format!("--monitoring-addr=127.0.0.1:{}", port()),
-            ])
-            .stdout(Stdio::from(electrs_log.try_clone().unwrap()))
-            .stderr(Stdio::from(electrs_log))
-            .spawn()
-            .unwrap(),
-    );
-    let esplora = format!("http://127.0.0.1:{http_port}");
-    tokio::time::timeout(Duration::from_secs(60), async {
-        loop {
-            if let Ok(response) = chain
-                .client
-                .get(format!("{esplora}/blocks/tip/height"))
-                .send()
-                .await
-            {
-                if response.text().await.unwrap_or_default() == "101" {
-                    break;
+    let (_electrs, esplora) = if source == LdkChainSource::Esplora {
+        let http_port = port();
+        let electrs_log = File::create(chain_dir.0.join("electrs.log")).unwrap();
+        let electrs = std::env::var("LDK_TEST_ELECTRS")
+            .unwrap_or_else(|_| ".regtest/native-tools/electrs".into());
+        let electrs = Process(
+            Command::new(electrs)
+                .args([
+                    "--network=regtest",
+                    "--jsonrpc-import",
+                    "--cookie=testutil:testutilpassword",
+                    &format!("--daemon-rpc-addr=127.0.0.1:{rpc_port}"),
+                    &format!("--daemon-dir={}", bitcoin_dir.display()),
+                    &format!("--db-dir={}", chain_dir.0.join("electrs").display()),
+                    &format!("--http-addr=127.0.0.1:{http_port}"),
+                    &format!("--electrum-rpc-addr=127.0.0.1:{}", port()),
+                    &format!("--monitoring-addr=127.0.0.1:{}", port()),
+                ])
+                .stdout(Stdio::from(electrs_log.try_clone().unwrap()))
+                .stderr(Stdio::from(electrs_log))
+                .spawn()
+                .unwrap(),
+        );
+        let esplora = format!("http://127.0.0.1:{http_port}");
+        tokio::time::timeout(Duration::from_secs(60), async {
+            loop {
+                if let Ok(response) = chain
+                    .client
+                    .get(format!("{esplora}/blocks/tip/height"))
+                    .send()
+                    .await
+                {
+                    if response.text().await.unwrap_or_default() == "101" {
+                        break;
+                    }
                 }
+                tokio::time::sleep(Duration::from_millis(200)).await;
             }
-            tokio::time::sleep(Duration::from_millis(200)).await;
-        }
-    })
-    .await
-    .unwrap();
+        })
+        .await
+        .unwrap();
+        (Some(electrs), esplora)
+    } else {
+        (None, String::new())
+    };
 
     let sender_dir = TestDir::new();
     let receiver_dir = TestDir::new();
@@ -203,6 +218,18 @@ async fn embedded_regtest_payments_and_restart() {
     let mut receiver_config = config(&receiver_dir);
     receiver_config.ldk_node_esplora_url = esplora;
     receiver_config.ldk_node_listen_addr = format!("127.0.0.1:{}", port());
+    for config in [&mut sender_config, &mut receiver_config] {
+        config.ldk_node_chain_source = source;
+        config.ldk_node_bitcoind_rpc_host = "127.0.0.1".into();
+        config.ldk_node_bitcoind_rpc_port = rpc_port;
+        config.ldk_node_bitcoind_rpc_user = "testutil".into();
+        config.ldk_node_bitcoind_rpc_password = "testutilpassword".into();
+    }
+    // Exercise file precedence (including a trailing newline) on real RPC calls.
+    let password_file = receiver_dir.0.join("rpc-password");
+    std::fs::write(&password_file, "testutilpassword\n").unwrap();
+    receiver_config.ldk_node_bitcoind_rpc_password_file = password_file.to_str().unwrap().into();
+    receiver_config.ldk_node_bitcoind_rpc_password = "wrong-password".into();
     let (sender, _) = LdkClient::connect(&sender_config, bitcoin::Network::Regtest)
         .await
         .unwrap();

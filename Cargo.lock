@@ -1880,6 +1880,7 @@ dependencies = [
  "libc",
  "lightning",
  "lightning-background-processor",
+ "lightning-block-sync",
  "lightning-invoice 0.35.0-rc1",
  "lightning-liquidity",
  "lightning-macros",
@@ -2002,6 +2003,18 @@ dependencies = [
  "lightning-liquidity",
  "lightning-rapid-gossip-sync",
  "possiblyrandom",
+]
+
+[[package]]
+name = "lightning-block-sync"
+version = "0.3.0-rc1"
+source = "git+https://github.com/lightningdevkit/rust-lightning?rev=4219131b05e44663a1b417e4f6cf09c7740ead2a#4219131b05e44663a1b417e4f6cf09c7740ead2a"
+dependencies = [
+ "bitcoin",
+ "bitreq",
+ "lightning",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]
