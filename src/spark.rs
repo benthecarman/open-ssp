@@ -1272,6 +1272,10 @@ impl SparkService {
     }
 
     async fn ensure_exact_liquidity(&self, amount_sats: u64) -> Result<(), String> {
+        // A disconnected HTTP client can cancel a split after submission. The
+        // liquidity lock excludes live splits, so finish those checkpoints
+        // before deciding whether the wallet can fund another payment.
+        self.recover_incomplete_splits().await?;
         for _ in 0..32 {
             let leaves = self.wallet.list_leaves().await.map_err(|e| e.to_string())?;
             let mut available = leaves
@@ -1297,6 +1301,7 @@ impl SparkService {
     }
 
     async fn ensure_denominated_liquidity(&self, amounts: &[u64]) -> Result<(), String> {
+        self.recover_incomplete_splits().await?;
         for _ in 0..32 {
             let leaves = self.wallet.list_leaves().await.map_err(|e| e.to_string())?;
             let mut available = leaves
