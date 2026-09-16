@@ -7,7 +7,9 @@ use reqwest::Client;
 use tempfile::TempDir;
 use tokio::process::Command;
 
-use super::{LdkClient, TestConfig, acceptance, fund_ssp, optional_env, poll, setup_lightning};
+use super::{
+    LdkClient, TestConfig, acceptance, fund_ssp, optional_env, poll, setup_lightning, timed,
+};
 
 const HELP: &str = "Usage: cargo regtest [--project NAME] COMMAND
 
@@ -25,12 +27,13 @@ const HELP: &str = "Usage: cargo regtest [--project NAME] COMMAND
   reconcile <a|b> ID   Recheck one Lightning send against the backend
   bump <a|b> ID RATE MAX_FEE  Fund a withdrawal CPFP at RATE sat/vB
   ldk <a|b> COMMAND...  Run ldk-server-cli with the node's local credentials
-  test [--keep]         Reset a separate test project and run Breez acceptance
+  test [--keep] [--no-build]  Reset a separate project and run Breez acceptance
 
 Development defaults to open-ssp-regtest; test defaults to open-ssp-breez-e2e.
 Use --project or REGTEST_PROJECT to select a project. Test deletes that project's
 volumes before every run, even with --keep. Other projects can still conflict
 with its host ports. Stop them first.
+--no-build uses existing service images; build the current sources first.
 
 Sources default to vendor/spark and vendor/ldk-server. SPARK_REF and LDK_SERVER_REF
 override those paths. SPARK_OPERATOR_COMMIT selects a committed operator revision.
@@ -64,6 +67,7 @@ enum Action {
     },
     Test {
         keep: bool,
+        build: bool,
     },
 }
 
@@ -152,8 +156,18 @@ impl Options {
                     args: args[2..].to_vec(),
                 }
             }
-            ["test"] => Action::Test { keep: false },
-            ["test", "--keep"] => Action::Test { keep: true },
+            ["test", flags @ ..] => {
+                ensure!(
+                    flags
+                        .iter()
+                        .all(|flag| matches!(*flag, "--keep" | "--no-build")),
+                    "invalid test option; run cargo regtest --help"
+                );
+                Action::Test {
+                    keep: flags.contains(&"--keep"),
+                    build: !flags.contains(&"--no-build"),
+                }
+            }
             _ => bail!("invalid command; run cargo regtest --help"),
         };
         Ok(Self { project, action })
@@ -355,14 +369,14 @@ impl Stack {
         Ok(())
     }
 
-    async fn start_services(&self) -> Result<()> {
+    async fn start_services(&self, build: bool) -> Result<()> {
         println!(
             "Start Bitcoin, operators, and Lightning nodes ({})",
             self.project
         );
         self.run_compose(&[
             "up",
-            "--build",
+            if build { "--build" } else { "--no-build" },
             "-d",
             "postgres",
             "bitcoind",
@@ -425,8 +439,10 @@ impl Stack {
             })
             .await?;
         }
-        println!("Build and start both SSP instances");
-        self.run_compose(&["build", "ssp"]).await?;
+        if build {
+            timed("SSP build", self.run_compose(&["build", "ssp"])).await?;
+        }
+        println!("Start both SSP instances");
         self.run_compose(&["up", "--no-build", "--no-deps", "-d", "ssp", "ssp-2"])
             .await?;
         self.ready().await?;
@@ -442,7 +458,7 @@ impl Stack {
             ..self.clone()
         };
         let result = interruptible(async {
-            build_stack.start_services().await?;
+            build_stack.start_services(true).await?;
             let config = self.config().await?;
             setup_lightning(&self.client, &config, &self.node("ldk-server").await?, &self.node("ldk-server-2").await?).await?;
             for (port, url) in [(5000, "http://127.0.0.1:5000"), (5001, "http://127.0.0.1:5001")] {
@@ -461,11 +477,18 @@ impl Stack {
         result
     }
 
-    async fn test(&self, keep: bool) -> Result<()> {
+    async fn test(&self, keep: bool, build: bool) -> Result<()> {
+        let started = std::time::Instant::now();
         self.check_sources()?;
-        let source = CleanSource::create(self).await?;
+        let source = if build {
+            Some(CleanSource::create(self).await?)
+        } else {
+            None
+        };
         let stack = Self {
-            spark: source.path.clone(),
+            spark: source
+                .as_ref()
+                .map_or_else(|| self.spark.clone(), |source| source.path.clone()),
             ..self.clone()
         };
         println!(
@@ -474,8 +497,8 @@ impl Stack {
         );
         let result = interruptible(async {
             stack.run_compose(&["down", "--volumes", "--remove-orphans"]).await?;
-            stack.start_services().await?;
-            acceptance(stack.config().await?, stack.node("ldk-server").await?, stack.node("ldk-server-2").await?).await?;
+            timed("stack setup", stack.start_services(build)).await?;
+            timed("acceptance", acceptance(stack.config().await?, stack.node("ldk-server").await?, stack.node("ldk-server-2").await?)).await?;
             println!("Verify repeated split trees on every operator");
             for index in 0..3 {
                 let depth = stack.output(&[
@@ -502,9 +525,11 @@ impl Stack {
             println!("Kept test project {} and its certificates", self.project);
             Ok(())
         } else {
-            let cleanup = stack
-                .run_compose(&["down", "--volumes", "--remove-orphans"])
-                .await;
+            let cleanup = timed(
+                "teardown",
+                stack.run_compose(&["down", "--volumes", "--remove-orphans"]),
+            )
+            .await;
             if cleanup.is_ok() && self.cert_dir().exists() {
                 std::fs::remove_dir_all(self.cert_dir())?;
             }
@@ -513,7 +538,13 @@ impl Stack {
         if let Err(error) = &cleanup {
             eprintln!("Test cleanup failed: {error:#}");
         }
-        result.and(cleanup)
+        let result = result.and(cleanup);
+        println!(
+            "TIMING total: {:.1}s ({})",
+            started.elapsed().as_secs_f64(),
+            if result.is_ok() { "ok" } else { "failed" }
+        );
+        result
     }
 
     async fn failure_logs(&self) {
@@ -629,9 +660,12 @@ pub(super) async fn run() -> Result<()> {
             stack.check_sources()?;
         }
         Action::Up => stack.up().await?,
-        Action::Test { keep } => {
+        Action::Test { keep, build } => {
             stack
-                .test(keep || optional_env("KEEP_BREEZ_E2E_STACK", "0") == "1")
+                .test(
+                    keep || optional_env("KEEP_BREEZ_E2E_STACK", "0") == "1",
+                    build,
+                )
                 .await?
         }
         Action::Stop => stack.run_compose(&["stop"]).await?,
@@ -762,8 +796,35 @@ mod tests {
         assert!(parse(&["down", "--volumes"]).is_err());
         assert_eq!(
             parse(&["test", "--keep"]).unwrap().action,
-            Action::Test { keep: true }
+            Action::Test {
+                keep: true,
+                build: true
+            }
         );
+    }
+
+    #[test]
+    fn skipping_builds_does_not_imply_keeping_test_data() {
+        assert_eq!(
+            parse(&["test", "--no-build"]).unwrap().action,
+            Action::Test {
+                keep: false,
+                build: false
+            }
+        );
+        for flags in [
+            ["test", "--keep", "--no-build"],
+            ["test", "--no-build", "--keep"],
+        ] {
+            assert_eq!(
+                parse(&flags).unwrap().action,
+                Action::Test {
+                    keep: true,
+                    build: false
+                }
+            );
+        }
+        assert!(parse(&["test", "--no-buid"]).is_err());
     }
 
     #[test]

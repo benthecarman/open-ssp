@@ -775,16 +775,34 @@ async fn completed_payment(wallet: &Wallet, payment_id: &str) -> Result<Payment>
     Ok(payment)
 }
 
+async fn timed<T>(label: &str, work: impl std::future::Future<Output = Result<T>>) -> Result<T> {
+    let started = Instant::now();
+    let result = work.await;
+    println!(
+        "TIMING {label}: {:.1}s ({})",
+        started.elapsed().as_secs_f64(),
+        if result.is_ok() { "ok" } else { "failed" }
+    );
+    result
+}
+
 async fn poll<T, F, Fut>(label: &str, timeout: Duration, mut check: F) -> Result<T>
 where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = Result<T>>,
 {
-    let deadline = Instant::now() + timeout;
+    let started = Instant::now();
+    let deadline = started + timeout;
     let mut last_error = None;
     while Instant::now() < deadline {
         match check().await {
-            Ok(value) => return Ok(value),
+            Ok(value) => {
+                println!(
+                    "TIMING wait {label}: {:.1}s",
+                    started.elapsed().as_secs_f64()
+                );
+                return Ok(value);
+            }
             Err(error) => last_error = Some(error),
         }
         tokio::time::sleep(Duration::from_secs(1)).await;
@@ -888,11 +906,41 @@ async fn setup_lightning(
         ldk_a
             .json(&["open-channel", node_b_id, "ldk-server-2:9735", "2000000sat"])
             .await?;
+    }
+    // Opening a channel returns before its funding transaction is broadcast.
+    // Mine only after Bitcoin sees that specific output (possibly already
+    // confirmed by the background miner), including when resuming setup.
+    let confirmations = poll("Lightning funding broadcast", config.timeout, || async {
+        let response = ldk_a.json(&["list-channels"]).await?;
+        let channel = response["channels"]
+            .as_array()
+            .and_then(|channels| {
+                channels
+                    .iter()
+                    .find(|channel| channel["counterparty_node_id"].as_str() == Some(node_b_id))
+            })
+            .context("Lightning channel is not yet available")?;
+        if channel["is_channel_ready"].as_bool() == Some(true) {
+            return Ok(6);
+        }
+        let txid = channel["funding_txo"]["txid"]
+            .as_str()
+            .context("Lightning funding transaction is not yet known")?;
+        let vout = channel["funding_txo"]["vout"]
+            .as_u64()
+            .context("Lightning funding output is not yet known")?;
+        let output = bitcoin_rpc(client, config, "gettxout", json!([txid, vout, true])).await?;
+        output["confirmations"]
+            .as_u64()
+            .context("Lightning funding output is not yet broadcast")
+    })
+    .await?;
+    if confirmations < 6 {
         bitcoin_rpc(
             client,
             config,
             "generatetoaddress",
-            json!([6, miner_address]),
+            json!([6 - confirmations, miner_address]),
         )
         .await?;
     }
@@ -2161,7 +2209,11 @@ async fn acceptance(config: TestConfig, ldk_a: LdkClient, ldk_b: LdkClient) -> R
         .build()
         .context("could not build HTTP client")?;
     println!("create bidirectional Lightning liquidity");
-    setup_lightning(&client, &config, &ldk_a, &ldk_b).await?;
+    timed(
+        "Lightning setup",
+        setup_lightning(&client, &config, &ldk_a, &ldk_b),
+    )
+    .await?;
 
     swaps::run(&client, &config, &ldk_a).await?;
     println!("connect Breez wallets");

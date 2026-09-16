@@ -161,6 +161,20 @@ cargo regtest --project open-ssp-breez-e2e status
 cargo regtest --project open-ssp-breez-e2e reset
 ```
 
+For repeated runs against images you have already built, use
+`cargo regtest test --no-build`. This still creates fresh test data and runs the
+entire suite. Rebuild after changing SSP, operator, or LDK sources; the default
+`cargo regtest test` does this automatically. `--no-build` can be combined with
+`--keep`. Operator and LDK instances share one image per service type, overridable
+with `SPARK_OPERATOR_IMAGE` and `LDK_SERVER_IMAGE`; `SSP_IMAGE` selects the SSP image.
+
+The runner prints `TIMING` lines for setup, Lightning provisioning, individual
+waits, acceptance, teardown, and the total run. Cargo compilation happens before
+the runner's total timer starts. CI builds and caches the three service images
+separately, runs with `--no-build`, and uploads `e2e.log` as an artifact. Its first
+run populates the caches; later runs reuse unchanged build layers. The image
+publication job imports the SSP build cache produced by e2e.
+
 The test wallets use temporary storage, which is removed when the client exits.
 Use your own seed and persistent storage for application development. After a
 full network reset, use a fresh regtest wallet and current operator certificates.

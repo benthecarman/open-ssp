@@ -3,7 +3,7 @@
 # Usage:
 #   git submodule update --init --recursive
 #   SPARK_ADMIN_TOKEN=regtest-spark-admin-token docker compose -f docker-compose.regtest.yml up --build -d
-#   ./e2e/e2e.sh   # runs the SDK end-to-end test, tears nothing down
+#   ./e2e/e2e.sh   # resets a separate test project and tears it down afterward
 #   docker compose -f docker-compose.regtest.yml down
 #
 # Sources default to the pinned Git submodules in vendor/. Override SPARK_REF
@@ -13,6 +13,7 @@
 # 8535-8537, and SSP uses 5000. PostgreSQL and bitcoind ZMQ stay private.
 
 x-operator-common: &operator-common
+  image: ${SPARK_OPERATOR_IMAGE:-open-ssp-spark-operator:regtest}
   build:
     context: ${SPARK_REF:-./vendor/spark}
     dockerfile: Dockerfile
@@ -226,6 +227,7 @@ services:
   # Built from a local ldk-server checkout (set LDK_SERVER_REF). The SSP talks
   # to it over gRPC whenever LDK_GRPC_ADDR and credentials are set.
   ldk-server:
+    image: ${LDK_SERVER_IMAGE:-open-ssp-ldk-server:regtest}
     build:
       context: ${LDK_SERVER_REF:-./vendor/ldk-server}
       dockerfile: Dockerfile
@@ -262,6 +264,7 @@ services:
 
   # Second node: LN counterparty for e2e send/receive (channel peer for ldk-server).
   ldk-server-2:
+    image: ${LDK_SERVER_IMAGE:-open-ssp-ldk-server:regtest}
     build:
       context: ${LDK_SERVER_REF:-./vendor/ldk-server}
       dockerfile: Dockerfile

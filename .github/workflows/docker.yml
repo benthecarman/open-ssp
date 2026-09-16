@@ -6,6 +6,10 @@ on:
     tags: ["v*"]
   workflow_dispatch:
 
+concurrency:
+  group: docker-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   REGISTRY: ghcr.io
   # Override in repo Settings > Variables if the image owner differs.
@@ -20,6 +24,9 @@ jobs:
       - uses: actions/checkout@v5
         with:
           submodules: recursive
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: server
       - name: Install protobuf compiler
         run: sudo apt-get update && sudo apt-get install -y libprotobuf-dev protobuf-compiler
       - run: rustup component add clippy
@@ -34,18 +41,56 @@ jobs:
     env:
       SPARK_ADMIN_TOKEN: regtest-spark-admin-token
       BREEZ_E2E_PROJECT_NAME: open-ssp-breez-e2e-ci
+      SPARK_OPERATOR_IMAGE: open-ssp-spark-operator:${{ github.sha }}
+      LDK_SERVER_IMAGE: open-ssp-ldk-server:${{ github.sha }}
+      SSP_IMAGE: open-ssp:${{ github.sha }}
     steps:
       - uses: actions/checkout@v5
         with:
           submodules: recursive
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: e2e
+          workspaces: e2e/breez -> target
       - name: Install build dependencies
         run: sudo apt-get update && sudo apt-get install -y libprotobuf-dev protobuf-compiler
       - name: Check Rust regtest runner
         run: |
           cargo test --locked --manifest-path e2e/breez/Cargo.toml
           cargo clippy --locked --manifest-path e2e/breez/Cargo.toml --all-targets -- -D warnings
+      - uses: docker/setup-buildx-action@v4
+        with:
+          buildkitd-config-inline: |
+            [worker.oci]
+              max-parallelism = 2
+      - name: Build cached test images
+        uses: docker/bake-action@v7
+        with:
+          source: .
+          files: docker-compose.regtest.yml
+          targets: |
+            spark-operator-0
+            ldk-server
+            ssp
+          load: true
+          set: |
+            spark-operator-0.cache-from=type=gha,scope=spark-operator
+            spark-operator-0.cache-to=type=gha,scope=spark-operator,mode=max
+            ldk-server.cache-from=type=gha,scope=ldk-server
+            ldk-server.cache-to=type=gha,scope=ldk-server,mode=max
+            ssp.cache-from=type=gha,scope=ssp
+            ssp.cache-to=type=gha,scope=ssp,mode=max
       - name: Run Breez SDK regtest
-        run: cargo regtest test
+        run: |
+          set -o pipefail
+          cargo regtest test --no-build 2>&1 | tee e2e.log
+      - name: Upload test timings and output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-log
+          path: e2e.log
+          if-no-files-found: ignore
       - name: Stop SDK test stack
         if: always()
         run: cargo regtest --project "$BREEZ_E2E_PROJECT_NAME" reset
@@ -82,5 +127,5 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: type=gha,scope=ssp
+          cache-to: type=gha,scope=ssp,mode=max
