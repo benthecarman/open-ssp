@@ -41,7 +41,7 @@ the directory reported by `pg_config`. The fixture starts its own PostgreSQL
 instance on port 54329; it does not use your system database.
 
 Rust launches and manages the real service binaries. Docker is not required.
-The first `cargo regtest build` downloads checksum-verified Bitcoin Core 28.0,
+The first `cargo regtest build` downloads checksum-verified Bitcoin Core 29.0,
 an Esplora-enabled Electrs build, and Atlas Community 1.0.0 for migrations.
 Exact URLs and SHA-256 pins live in
 [`native/tools.rs`](../e2e/breez/src/native/tools.rs). It then builds the Spark
@@ -50,6 +50,11 @@ The signer uses optimization level 1 so its curve arithmetic fits DKG RPC
 deadlines on small CI runners. The other Rust services use development builds.
 Downloaded tools and compiler outputs persist under `.regtest/native-tools`
 and `.regtest/native-build`; resetting test data keeps these caches.
+
+Core 29 supports package relay for clients that require zero-fee commitments.
+Use the local Bitcoin RPC service for those clients: the bundled Electrs
+build does not expose Esplora's `/txs/package` endpoint. Breez Spark wallets
+can continue using the local Esplora service.
 
 ## 2. Clone the repository and its sources
 

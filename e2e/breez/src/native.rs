@@ -444,7 +444,7 @@ impl Runtime {
         fs::write(self.data("bitcoin.conf"), bitcoin_config)?;
         self.configure(
             "bitcoind",
-            bin.join("bitcoin-28.0/bin/bitcoind"),
+            bin.join("bitcoin-29.0/bin/bitcoind"),
             vec![
                 format!("-datadir={}", self.data("bitcoin").display()),
                 format!("-conf={}", self.data("bitcoin.conf").display()),

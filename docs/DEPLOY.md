@@ -188,7 +188,7 @@ Create and fund a dedicated Bitcoin Core wallet on the SSP network. Keep this
 wallet exclusive to one SSP and its SQLite database. Other processes must not
 spend its coins: withdrawal input reservations are stored in the SSP database.
 The Core wallet must have private keys, be unlocked for signing, and finish
-scanning before the SSP starts. The regtest fixture uses Bitcoin Core 28.
+scanning before the SSP starts. The native regtest fixture uses Bitcoin Core 29.
 
 | Variable | Requirement |
 |---|---|
