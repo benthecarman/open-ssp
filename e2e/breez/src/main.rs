@@ -1,4 +1,5 @@
 mod instant;
+mod native;
 mod regtest;
 mod swaps;
 mod webhooks;
@@ -35,7 +36,7 @@ impl breez_sdk_spark::Logger for SdkLogger {
 
 struct TestConfig {
     admin_token: String,
-    ssp_container: String,
+    runtime: native::Runtime,
     bitcoin_rpc_url: String,
     bitcoin_rpc_user: String,
     bitcoin_rpc_password: String,
@@ -51,7 +52,9 @@ struct TestConfig {
 
 #[derive(Clone)]
 struct LdkClient {
-    container: String,
+    cli: PathBuf,
+    data: PathBuf,
+    address: String,
     api_key: String,
 }
 
@@ -68,7 +71,7 @@ fn optional_env(name: &str, default: &str) -> String {
 }
 
 impl TestConfig {
-    fn from_env(admin_token: String, cert_dir: PathBuf, ssp_container: String) -> Result<Self> {
+    fn from_env(admin_token: String, cert_dir: PathBuf, runtime: native::Runtime) -> Result<Self> {
         let send_amount_sats = optional_env("BREEZ_SEND_AMOUNT_SATS", "1000")
             .parse()
             .context("BREEZ_SEND_AMOUNT_SATS is not an integer")?;
@@ -104,7 +107,7 @@ impl TestConfig {
 
         Ok(Self {
             admin_token,
-            ssp_container,
+            runtime,
             bitcoin_rpc_url: optional_env(
                 "BITCOIN_RPC_URL",
                 &format!(
@@ -126,52 +129,36 @@ impl TestConfig {
     }
 }
 
-async fn command_output(program: &str, args: &[&str]) -> Result<String> {
-    let output = Command::new(program)
-        .kill_on_drop(true)
-        .args(args)
-        .output()
-        .await
-        .with_context(|| format!("could not run {program}"))?;
-    ensure!(
-        output.status.success(),
-        "{} failed: {}",
-        program,
-        String::from_utf8_lossy(&output.stderr).trim()
-    );
-    String::from_utf8(output.stdout).context("command output was not UTF-8")
-}
-
 impl LdkClient {
-    async fn connect(container: String) -> Result<Self> {
-        let output = Command::new("docker")
-            .kill_on_drop(true)
-            .args(["exec", &container, "cat", "/data/regtest/api_key"])
-            .output()
-            .await?;
-        ensure!(output.status.success(), "could not read the LDK API key");
-        ensure!(!output.stdout.is_empty(), "LDK API key is empty");
-        let key = hex::encode(output.stdout);
+    async fn connect(runtime: &native::Runtime, service: &str) -> Result<Self> {
+        let data = runtime.data(service);
+        let api_key = hex::encode(std::fs::read(data.join("regtest/api_key"))?);
+        ensure!(!api_key.is_empty(), "LDK API key is empty");
         Ok(Self {
-            container,
-            api_key: key,
+            cli: runtime.ldk_cli(),
+            data,
+            api_key,
+            address: format!(
+                "localhost:{}",
+                if service == "ldk-server" { 3536 } else { 3537 }
+            ),
         })
     }
 
     async fn output(&self, args: &[&str]) -> Result<String> {
-        let mut command_args = vec![
-            "exec",
-            self.container.as_str(),
-            "ldk-server-cli",
-            "--base-url",
-            "localhost:3536",
-            "--api-key",
-            self.api_key.as_str(),
-            "--tls-cert",
-            "/data/tls.crt",
-        ];
-        command_args.extend_from_slice(args);
-        command_output("docker", &command_args).await
+        native::tools::output(
+            Command::new(&self.cli)
+                .args([
+                    "--base-url",
+                    &self.address,
+                    "--api-key",
+                    &self.api_key,
+                    "--tls-cert",
+                ])
+                .arg(self.data.join("tls.crt"))
+                .args(args),
+        )
+        .await
     }
 
     async fn json(&self, args: &[&str]) -> Result<Value> {
@@ -460,8 +447,7 @@ async fn ssp_available_balance(client: &Client, config: &TestConfig, ssp_url: &s
 }
 
 async fn restart_ssp(client: &Client, config: &TestConfig, ssp_url: &str) -> Result<()> {
-    let container = &config.ssp_container;
-    command_output("docker", &["restart", container]).await?;
+    config.runtime.restart("ssp").await?;
     poll("SSP restart", config.timeout, || async {
         admin_json(client, config, ssp_url, "/status", None)
             .await
@@ -894,7 +880,7 @@ async fn setup_lightning(
     .await?;
 
     let _ = ldk_a
-        .json(&["connect-peer", node_b_id, "ldk-server-2:9735", "--persist"])
+        .json(&["connect-peer", node_b_id, "127.0.0.1:19736", "--persist"])
         .await;
     let channels = ldk_a.json(&["list-channels"]).await?;
     let has_channel = channels["channels"].as_array().is_some_and(|channels| {
@@ -904,7 +890,7 @@ async fn setup_lightning(
     });
     if !has_channel {
         ldk_a
-            .json(&["open-channel", node_b_id, "ldk-server-2:9735", "2000000sat"])
+            .json(&["open-channel", node_b_id, "127.0.0.1:19736", "2000000sat"])
             .await?;
     }
     // Opening a channel returns before its funding transaction is broadcast.
@@ -1203,34 +1189,7 @@ async fn pay_between(
 }
 
 async fn static_deposit(client: &Client, config: &TestConfig, wallet: &Wallet) -> Result<()> {
-    let project = command_output(
-        "docker",
-        &[
-            "inspect",
-            "--format",
-            "{{ index .Config.Labels \"com.docker.compose.project\" }}",
-            &config.ssp_container,
-        ],
-    )
-    .await?;
-    let project_filter = format!("label=com.docker.compose.project={}", project.trim());
-    let miner_container = command_output(
-        "docker",
-        &[
-            "ps",
-            "-q",
-            "--filter",
-            &project_filter,
-            "--filter",
-            "label=com.docker.compose.service=bitcoin-miner",
-        ],
-    )
-    .await?;
-    ensure!(
-        miner_container.lines().count() == 1,
-        "test needs exactly one miner"
-    );
-    command_output("docker", &["stop", miner_container.trim()]).await?;
+    config.runtime.stop("bitcoin-miner").await?;
     let ssp_before = ssp_available_balance(client, config, wallet.ssp_url).await?;
     let before = wallet_balance(wallet).await?;
     let address = wallet
@@ -1356,7 +1315,7 @@ async fn static_deposit(client: &Client, config: &TestConfig, wallet: &Wallet) -
     let replay = sdk_request(wallet, "UserRequest", json!({"request_id":id})).await?;
     ensure!(confirmed == replay, "deposit read changed durable metadata");
     println!("PASS static deposit: 9901 sats credited, recovery confirmed, stable metadata");
-    command_output("docker", &["start", miner_container.trim()]).await?;
+    config.runtime.start("bitcoin-miner").await?;
     Ok(())
 }
 
@@ -1711,9 +1670,8 @@ async fn missed_receive(
         .await?
         .payment_request;
     let hash = decode_payment_hash(&wallet.ldk, &invoice).await?;
-    let container = &config.ssp_container;
     let start = Instant::now();
-    command_output("docker", &["stop", "--time", "10", container]).await?;
+    config.runtime.stop("ssp").await?;
     let stop_elapsed = start.elapsed();
     let held = async {
         ensure!(
@@ -1741,7 +1699,7 @@ async fn missed_receive(
         .await
     }
     .await;
-    command_output("docker", &["start", container]).await?;
+    config.runtime.start("ssp").await?;
     held?;
     poll("SSP restart", config.timeout, || async {
         admin_json(client, config, wallet.ssp_url, "/status", None)
@@ -1959,31 +1917,7 @@ async fn withdraw_bitcoin(client: &Client, config: &TestConfig, wallet: &Wallet)
     };
     let fee = fee_quote.speed_fast.total_fee_sat();
     ensure!(before > fee, "wallet cannot cover the withdrawal fee");
-    let project = command_output(
-        "docker",
-        &[
-            "inspect",
-            "--format",
-            "{{ index .Config.Labels \"com.docker.compose.project\" }}",
-            &config.ssp_container,
-        ],
-    )
-    .await?;
-    let project_filter = format!("label=com.docker.compose.project={}", project.trim());
-    let miner = command_output(
-        "docker",
-        &[
-            "ps",
-            "-q",
-            "--filter",
-            &project_filter,
-            "--filter",
-            "label=com.docker.compose.service=bitcoin-miner",
-        ],
-    )
-    .await?;
-    ensure!(miner.lines().count() == 1, "test needs exactly one miner");
-    command_output("docker", &["stop", miner.trim()]).await?;
+    config.runtime.stop("bitcoin-miner").await?;
     let sent = wallet
         .sdk
         .send_payment(SendPaymentRequest {
@@ -2033,7 +1967,7 @@ async fn withdraw_bitcoin(client: &Client, config: &TestConfig, wallet: &Wallet)
         replay["txid"] == bump["txid"],
         "fee bump retry changed the transaction"
     );
-    command_output("docker", &["start", miner.trim()]).await?;
+    config.runtime.start("bitcoin-miner").await?;
     let mining_address = bitcoin_rpc(client, config, "getnewaddress", json!([])).await?;
     bitcoin_rpc(
         client,

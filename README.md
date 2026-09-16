@@ -109,8 +109,10 @@ For setup instructions and a client configuration example, see
 
 The Lightning acceptance stack contains bitcoind, a local Electrs Esplora
 service, PostgreSQL, three Spark Operators, two `ldk-server` nodes, two SSP
-instances, and three Breez SDK wallets. It needs Docker Compose, Rust, and
-the pinned Spark and `ldk-server` Git submodules in `vendor/`. See
+instances, and three Breez SDK wallets. Rust starts and manages the real service
+binaries on Linux x86_64. Install Rust, Go, PostgreSQL server tools, and the build
+dependencies in the guide; Docker is not required. The source revisions are
+pinned by the Git submodules in `vendor/`. See
 [the fixture README](e2e/upstream/README.md) for source and update details.
 
 Clone with `git clone --recurse-submodules`, or initialize an existing
@@ -124,7 +126,7 @@ cargo regtest test
 For a persistent development stack, use `cargo regtest up`. The `stop`,
 `start`, `status`, `fund`, and `ldk` commands manage it from Rust.
 
-The test runner creates a separate Compose project with empty volumes and
+The test runner creates a separate project with fresh native data and
 two real LDK nodes. It funds each SSP with a coarse leaf, then receives exact amounts
 through the Breez SDK. A restart between receives checks that the SSP can
 split a previous change leaf again using persisted keys.

@@ -21,7 +21,7 @@ or call the JavaScript Spark SDK.
 | Request history | `ServiceProvider::list_request_history`, `get_request_record` | Pagination, type/status/network filters, owner-bound cursors, stable reads |
 | Webhooks | `register_webhook`, `list_webhooks`, `unregister_webhook` | Owner isolation, HMAC verification, repeated delivery of identical bytes, deletion |
 
-Bitcoin Core, LDK, Docker, and SSP admin calls are fixture controls and
+Bitcoin Core, LDK, native process management, and SSP admin calls are fixture controls and
 independent settlement checks. They mine blocks, provide liquidity, act as
 external payers, restart services, and inspect real Bitcoin and Lightning
 state. Wallet operations under test go through Breez.

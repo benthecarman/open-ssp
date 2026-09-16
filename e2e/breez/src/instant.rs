@@ -7,34 +7,7 @@ pub async fn run(
     wallet: &Wallet,
     other: &Wallet,
 ) -> Result<()> {
-    let project = command_output(
-        "docker",
-        &[
-            "inspect",
-            "--format",
-            "{{ index .Config.Labels \"com.docker.compose.project\" }}",
-            &config.ssp_container,
-        ],
-    )
-    .await?;
-    let project_filter = format!("label=com.docker.compose.project={}", project.trim());
-    let miner = command_output(
-        "docker",
-        &[
-            "ps",
-            "-q",
-            "--filter",
-            &project_filter,
-            "--filter",
-            "label=com.docker.compose.service=bitcoin-miner",
-        ],
-    )
-    .await?;
-    ensure!(
-        miner.lines().count() == 1,
-        "instant test needs exactly one miner"
-    );
-    command_output("docker", &["stop", miner.trim()]).await?;
+    config.runtime.stop("bitcoin-miner").await?;
     let mining_address = bitcoin_rpc(client, config, "getnewaddress", json!([])).await?;
     let address = wallet
         .sdk
@@ -162,7 +135,7 @@ pub async fn run(
                 "RBF did not replace the deposit"
             );
         }
-        command_output("docker", &["restart", &config.ssp_container]).await?;
+        config.runtime.restart("ssp").await?;
         poll(
             "SSP after instant advance restart",
             config.timeout,
@@ -236,6 +209,6 @@ pub async fn run(
             "PASS instant deposit: 1901 sats advanced at zero confirmations, restart replay, recovery confirmed; replacement={replace}"
         );
     }
-    command_output("docker", &["start", miner.trim()]).await?;
+    config.runtime.start("bitcoin-miner").await?;
     Ok(())
 }

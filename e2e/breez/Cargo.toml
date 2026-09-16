@@ -13,6 +13,8 @@ breez-sdk-spark = { path = "../../vendor/breez-sdk/crates/breez-sdk/core", featu
 hex = "0.4"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde_json = "1"
+serde = { version = "1", features = ["derive"] }
+libc = "0.2"
 sha2 = "0.10"
 tempfile = "3"
 tokio = { version = "1", features = ["macros", "process", "rt-multi-thread", "signal", "time"] }

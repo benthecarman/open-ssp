@@ -15,29 +15,41 @@ cooperative Bitcoin withdrawals, fee bumps, and restart recovery.
 
 ## 1. Install the tools
 
-You need Git, Docker with Compose v2, and a current stable Rust toolchain
-installed through rustup. On Debian or Ubuntu, install the host build tools:
+The native runner currently supports **Linux x86_64**. Install Git, a current
+stable Rust toolchain through rustup, Go (the version in
+`vendor/spark/spark/go.mod`), and PostgreSQL server tools. On Debian or Ubuntu:
 
 ```sh
 sudo apt-get update
-sudo apt-get install -y build-essential pkg-config libssl-dev \
-  libprotobuf-dev protobuf-compiler git curl
+sudo apt-get install -y build-essential pkg-config libssl-dev libzmq3-dev \
+  libprotobuf-dev protobuf-compiler postgresql libpq-dev git curl unzip
 rustup update stable
 ```
 
-Check Docker access and Rust:
+Check the host tools:
 
 ```sh
-docker info
-docker compose version
 cargo +stable --version
+go version
 protoc --version
+pg_config --bindir
 ```
 
-The Rust CLI runs Docker Compose and Git directly. It handles service readiness,
-certificates, funding, channel setup, and tests. You do not need Bash helper
-functions, Node.js, or a JavaScript SDK build for this guide. Docker Compose
-still defines the service containers.
+Run the fixture as a regular user: PostgreSQL's `initdb` refuses root. Set
+`PGBIN` to the directory containing `initdb`, `postgres`, and `psql` if it is not
+the directory reported by `pg_config`. The fixture starts its own PostgreSQL
+instance on port 54329; it does not use your system database.
+
+Rust launches and manages the real service binaries. Docker is not required.
+The first `cargo regtest build` downloads checksum-verified Bitcoin Core 28.0,
+an Esplora-enabled Electrs build, and Atlas Community 1.0.0 for migrations.
+Exact URLs and SHA-256 pins live in
+[`native/tools.rs`](../e2e/breez/src/native/tools.rs). It then builds the Spark
+operator (Go), Spark signer (Rust), LDK server/client, and SSP from source.
+The signer uses optimization level 1 so its curve arithmetic fits DKG RPC
+deadlines on small CI runners. The other Rust services use development builds.
+Downloaded tools and compiler outputs persist under `.regtest/native-tools`
+and `.regtest/native-build`; resetting test data keeps these caches.
 
 ## 2. Clone the repository and its sources
 
@@ -87,18 +99,18 @@ cargo regtest status
 `up` builds and starts Bitcoin Core, an automatic miner, Electrs with an
 Esplora API, PostgreSQL, three Spark Operators, two LDK nodes, and two SSPs.
 It waits for readiness, opens and funds a Lightning channel in both directions,
-and gives each SSP at least 10,000 sats of Spark liquidity. It copies the
-operator certificates to `.regtest/open-ssp-regtest/operator-certs`.
+and gives each SSP at least 10,000 sats of Spark liquidity. Operator certificates are stored in
+`.regtest/open-ssp-regtest/native/tls`.
 
 The development project is `open-ssp-regtest`. Repeated `up` calls preserve
-its volumes and reuse its channel. They add funding when needed. The command
+its native data and reuse its channel. They add funding when needed. The command
 prints `Regtest is ready` after setup completes. On failure, it prints logs
 and keeps the development data for inspection.
 
-`status` shows the containers, authenticated status for each SSP, and the
+`status` shows the processes, authenticated status for each SSP, and the
 Esplora block height. Each SSP must have `ldk_mode: live`, `spark_error: null`,
 and a Spark wallet. Use `spark.available_sats` to check its available liquidity.
-A container health check alone does not prove that payments work.
+A running process alone does not prove that payments work.
 
 | Service | Address from the host |
 |---|---|
@@ -107,6 +119,8 @@ A container health check alone does not prove that payments work.
 | Esplora | `http://127.0.0.1:30000` |
 | Bitcoin RPC | `http://127.0.0.1:8332` |
 | LDK gRPC A / B | `localhost:3536` / `localhost:3537` |
+| PostgreSQL | `127.0.0.1:54329` |
+| Operator SSP APIs | `localhost:18535`, `:18536`, `:18537` |
 | LDK peer A / B | `localhost:19735` / `localhost:19736` |
 
 These ports bind to loopback. Run the SDK client on the same host. The operator
@@ -118,21 +132,21 @@ Use these commands to manage the stack:
 
 | Command | Result |
 |---|---|
-| `cargo regtest stop` | Stop the containers and keep all data |
-| `cargo regtest start` | Resume stopped containers and wait for SSP readiness |
-| `cargo regtest down` | Remove containers and keep volumes; use `up` to recreate |
-| `cargo regtest reset` | **Delete this project's containers and volumes** |
+| `cargo regtest stop` | Stop the processes and keep all data |
+| `cargo regtest start` | Resume stopped processes and wait for SSP readiness |
+| `cargo regtest down` | Stop processes and keep all data (same as `stop`) |
+| `cargo regtest reset` | **Stop processes and delete this project's native data** |
 | `cargo regtest logs ssp ldk-server` | Show recent logs for selected services |
 | `cargo regtest fund a 1000` | Add one 1,000-sat Spark leaf to SSP A |
 | `cargo regtest settlements a` | List unresolved SSP A settlements |
 | `cargo regtest reconcile a REQUEST_ID` | Reconcile one Lightning send |
 | `cargo regtest bump a REQUEST_ID 5 5000` | Spend at most 5,000 sats on a 5 sat/vB withdrawal fee bump |
 | `cargo regtest ldk b list-channels` | Inspect LDK B's channel |
-| `cargo regtest certs` | Refresh and print the local operator certificate directory |
+| `cargo regtest certs` | Print the local operator certificate directory |
 | `cargo regtest --help` | Show all commands |
 
 The default admin token is `regtest-spark-admin-token`. The CLI passes it to
-Compose and uses it for admin requests. This is a local test credential.
+the services and uses it for admin requests. This is a local test credential.
 Set `SPARK_ADMIN_TOKEN` consistently if you change it. No Breez API key is used
 by this local setup.
 
@@ -147,12 +161,12 @@ cargo regtest start
 ```
 
 `test` uses a separate project, `open-ssp-breez-e2e`. It **deletes that project's
-volumes before each run**, then creates a fresh stack. It checks BOLT11 receives
+native data before each run**, then creates a fresh stack. It checks BOLT11 receives
 and sends, recovery after restart, invalid requests, a Bitcoin withdrawal,
 BOLT12 extensions, and repeated operator splits. The final success message is
 `PASS Breez regtest acceptance and operator split checks`.
 
-The runner removes test containers and volumes on success, failure, or Ctrl-C.
+The runner stops test processes and deletes their data on success, failure, or Ctrl-C.
 To keep them for inspection, use `cargo regtest test --keep`. This still resets
 the test project at startup. To inspect and remove the retained test stack:
 
@@ -161,19 +175,36 @@ cargo regtest --project open-ssp-breez-e2e status
 cargo regtest --project open-ssp-breez-e2e reset
 ```
 
-For repeated runs against images you have already built, use
+For repeated runs against binaries you have already built, use
 `cargo regtest test --no-build`. This still creates fresh test data and runs the
 entire suite. Rebuild after changing SSP, operator, or LDK sources; the default
 `cargo regtest test` does this automatically. `--no-build` can be combined with
-`--keep`. Operator and LDK instances share one image per service type, overridable
-with `SPARK_OPERATOR_IMAGE` and `LDK_SERVER_IMAGE`; `SSP_IMAGE` selects the SSP image.
+`--keep`.
 
-The runner prints `TIMING` lines for setup, Lightning provisioning, individual
-waits, acceptance, teardown, and the total run. Cargo compilation happens before
-the runner's total timer starts. CI builds and caches the three service images
-separately, runs with `--no-build`, and uploads `e2e.log` as an artifact. Its first
-run populates the caches; later runs reuse unchanged build layers. The image
-publication job imports the SSP build cache produced by e2e.
+The runner prints `TIMING` lines for native builds, setup, Lightning provisioning,
+individual waits, acceptance, teardown, and the total run. Compiling the runner
+itself happens before its total timer starts. CI caches native service builds,
+Go modules, and Cargo dependencies, runs `cargo regtest build` followed by
+`cargo regtest test --no-build --keep`, and uploads `e2e.log` plus full service
+logs as an artifact before cleanup. Native build caches are saved before
+acceptance, so a test failure does not discard those successful builds. A separate
+job still builds and publishes the deployment Docker image after tests pass.
+
+Processes have separate process groups and logs under
+`.regtest/<project>/native`. The runner checks saved PID start times before
+stopping a service, rejects occupied ports, and serializes commands that mutate
+state within a repository. Only one stack can use the fixed ports at a time.
+`cargo regtest miner stop` and `cargo regtest miner start` control automatic
+mining for manual tests.
+
+When migrating an existing Docker fixture, stop it once with its old Compose
+command before using native commands. Native `reset` never deletes Docker
+volumes, and existing Docker data is not imported:
+
+```sh
+SPARK_ADMIN_TOKEN=regtest-spark-admin-token \
+  docker compose -p open-ssp-regtest -f docker-compose.regtest.yml stop
+```
 
 The test wallets use temporary storage, which is removed when the client exits.
 Use your own seed and persistent storage for application development. After a
@@ -366,11 +397,11 @@ and settlement checks.
 
 | Symptom | Check or action |
 |---|---|
-| Port already in use | Stop the conflicting stack. Project names isolate volumes, not host ports. |
+| Port already in use | Stop the conflicting stack. Project names isolate data, not host ports. |
 | Bitcoin RPC port conflict | Set `BITCOIN_RPC_PORT=18443` for the CLI. It also selects that port for host RPC requests unless `BITCOIN_RPC_URL` overrides it. |
 | Missing source checkout | Run `cargo regtest init`. Remove stale `SPARK_REF` or `LDK_SERVER_REF` overrides. |
 | Missing compiler or `protoc` | Install the build dependencies in section 1. |
-| HTTP 401 | Use the same `SPARK_ADMIN_TOKEN` as the running containers. |
+| HTTP 401 | Use the same `SPARK_ADMIN_TOKEN` as the running services. |
 | Operator TLS error | Run `cargo regtest certs`, use `https://localhost`, and reconnect the SDK. |
 | Operators never become ready | Use `cargo regtest logs spark-operator-0 postgres` and check the submodule pin. |
 | SSP startup or connection fails | Use `cargo regtest logs ssp ldk-server` and `cargo regtest status`. A live LDK backend is required. |
@@ -382,14 +413,17 @@ and settlement checks.
 Use `--project NAME` before the command to manage another project. The
 `REGTEST_PROJECT` environment variable also selects a project. `test` accepts
 `BREEZ_E2E_PROJECT_NAME` as a fallback for CI compatibility. A custom project
-passed to `test` will have its volumes deleted, so keep it separate from your
+passed to `test` will have its native data deleted, so keep it separate from your
 development project.
 
 For source development, `SPARK_REF` and `LDK_SERVER_REF` override the submodule
-paths. Operator builds use a clean detached worktree at the Spark checkout's
-`HEAD`; they exclude uncommitted changes. `SPARK_OPERATOR_COMMIT` can select
-another commit available in that checkout. Temporary worktrees are removed
-after the command exits.
+paths. Operator and signer builds use a cached `git archive` snapshot of the
+Spark checkout's `HEAD`, excluding uncommitted changes. `SPARK_OPERATOR_COMMIT`
+can select another commit available in that checkout. A Go build overlay binds
+the operator's four TCP listeners to loopback, replacing Compose's loopback port
+publishing. The overlay checks the expected source layout and fails if an update
+requires review; it does not modify your checkout. LDK and SSP builds include
+local source changes.
 
 The fixture automatically mines a block about every ten seconds. Wait for
 chain and operator synchronization after funding. Test BOLT11 first: the

@@ -41,9 +41,8 @@ jobs:
     env:
       SPARK_ADMIN_TOKEN: regtest-spark-admin-token
       BREEZ_E2E_PROJECT_NAME: open-ssp-breez-e2e-ci
-      SPARK_OPERATOR_IMAGE: open-ssp-spark-operator:${{ github.sha }}
-      LDK_SERVER_IMAGE: open-ssp-ldk-server:${{ github.sha }}
-      SSP_IMAGE: open-ssp:${{ github.sha }}
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
     steps:
       - uses: actions/checkout@v5
         with:
@@ -51,45 +50,54 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: e2e
-          workspaces: e2e/breez -> target
-      - name: Install build dependencies
-        run: sudo apt-get update && sudo apt-get install -y libprotobuf-dev protobuf-compiler
+          workspaces: |
+            . -> target
+            e2e/breez -> target
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: vendor/spark/spark/go.mod
+          cache-dependency-path: vendor/spark/spark/go.sum
+      - name: Cache native tools and service builds
+        uses: actions/cache/restore@v4
+        id: native-cache
+        with:
+          path: |
+            .regtest/native-tools
+            .regtest/native-build
+          key: native-${{ runner.os }}-${{ runner.arch }}-${{ github.sha }}
+          restore-keys: native-${{ runner.os }}-${{ runner.arch }}-
+      - name: Install native build and database tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential pkg-config libssl-dev libzmq3-dev \
+            libprotobuf-dev protobuf-compiler postgresql libpq-dev unzip
       - name: Check Rust regtest runner
         run: |
           cargo test --locked --manifest-path e2e/breez/Cargo.toml
           cargo clippy --locked --manifest-path e2e/breez/Cargo.toml --all-targets -- -D warnings
-      - uses: docker/setup-buildx-action@v4
+      - name: Build native test services
+        run: cargo regtest build
+      - name: Save native builds before acceptance
+        if: steps.native-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
         with:
-          buildkitd-config-inline: |
-            [worker.oci]
-              max-parallelism = 2
-      - name: Build cached test images
-        uses: docker/bake-action@v7
-        with:
-          source: .
-          files: docker-compose.regtest.yml
-          targets: |
-            spark-operator-0
-            ldk-server
-            ssp
-          load: true
-          set: |
-            spark-operator-0.cache-from=type=gha,scope=spark-operator
-            spark-operator-0.cache-to=type=gha,scope=spark-operator,mode=max
-            ldk-server.cache-from=type=gha,scope=ldk-server
-            ldk-server.cache-to=type=gha,scope=ldk-server,mode=max
-            ssp.cache-from=type=gha,scope=ssp
-            ssp.cache-to=type=gha,scope=ssp,mode=max
+          path: |
+            .regtest/native-tools
+            .regtest/native-build
+          key: ${{ steps.native-cache.outputs.cache-primary-key }}
       - name: Run Breez SDK regtest
         run: |
           set -o pipefail
-          cargo regtest test --no-build 2>&1 | tee e2e.log
+          cargo regtest test --no-build --keep 2>&1 | tee e2e.log
       - name: Upload test timings and output
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: e2e-log
-          path: e2e.log
+          include-hidden-files: true
+          path: |
+            e2e.log
+            .regtest/*/native/*.log
           if-no-files-found: ignore
       - name: Stop SDK test stack
         if: always()

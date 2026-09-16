@@ -59,9 +59,9 @@ impl Drop for Callbacks {
 }
 impl Callbacks {
     pub async fn start(wallet: &Wallet, other: &Wallet) -> Result<Self> {
-        let listener = tokio::net::TcpListener::bind("0.0.0.0:0").await?;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         let url = format!(
-            "http://host.docker.internal:{}/callback",
+            "http://127.0.0.1:{}/callback",
             listener.local_addr()?.port()
         );
         let inbox = Inbox::default();
