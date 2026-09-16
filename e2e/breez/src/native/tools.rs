@@ -86,6 +86,63 @@ async fn download(path: &Path, url: &str, hash: &str) -> Result<()> {
     Ok(())
 }
 
+const ELECTRS_REVISION: &str = "8c06d8010e43f793b1a65f83695ea846e5cd83ed";
+
+pub fn electrs_binary(root: &Path) -> PathBuf {
+    root.join(".regtest/native-tools")
+        .join(format!("electrs-{ELECTRS_REVISION}"))
+}
+
+async fn provision_electrs(root: &Path) -> Result<()> {
+    let binary = electrs_binary(root);
+    if binary.is_file() {
+        return Ok(());
+    }
+    let sources = root.join(".regtest/native-sources");
+    std::fs::create_dir_all(&sources)?;
+    let source = sources.join(format!("electrs-{ELECTRS_REVISION}"));
+    if !source.is_dir() {
+        let temporary = tempfile::tempdir_in(&sources)?;
+        let checkout = temporary.path().join("electrs");
+        run(Command::new("git")
+            .args([
+                "clone",
+                "--depth",
+                "1",
+                "--branch",
+                "2026-05-26-electrum-submit-package",
+                "https://github.com/tankyleo/blockstream-electrs.git",
+            ])
+            .arg(&checkout))
+        .await?;
+        std::fs::rename(checkout, &source)?;
+    }
+    let revision = output(
+        Command::new("git")
+            .arg("-C")
+            .arg(&source)
+            .args(["rev-parse", "HEAD"]),
+    )
+    .await?;
+    ensure!(
+        revision == ELECTRS_REVISION,
+        "unexpected Electrs revision: {revision}"
+    );
+    println!("Build Electrs with package broadcasting");
+    let target = root.join(".regtest/native-build/electrs");
+    run(Command::new("cargo")
+        .args(["build", "--release", "--locked", "--manifest-path"])
+        .arg(source.join("Cargo.toml"))
+        .arg("--target-dir")
+        .arg(&target)
+        .env("RUSTFLAGS", ""))
+    .await?;
+    let temporary = binary.with_extension("partial");
+    std::fs::copy(target.join("release/electrs"), &temporary)?;
+    std::fs::rename(temporary, binary)?;
+    Ok(())
+}
+
 pub async fn provision(root: &Path) -> Result<()> {
     ensure!(
         cfg!(all(target_os = "linux", target_arch = "x86_64")),
@@ -107,26 +164,14 @@ pub async fn provision(root: &Path) -> Result<()> {
             .arg(&dir))
         .await?;
     }
-    download(&dir.join("electrs.zip"),
-        "https://github.com/RCasatta/electrsd/releases/download/electrs_releases/electrs_linux_esplora_a33e97e1a1fc63fa9c20a116bb92579bbf43b254.zip",
-        "865e26a96e8df77df01d96f2f569dcf9622fc87a8d99a9b8fe30861a4db9ddf1").await?;
-    if !dir.join("electrs").is_file() {
-        run(Command::new("unzip")
-            .arg("-o")
-            .arg(dir.join("electrs.zip"))
-            .arg("-d")
-            .arg(&dir))
-        .await?;
-    }
+    provision_electrs(root).await?;
     download(
         &dir.join("atlas"),
         "https://release.ariga.io/atlas/atlas-community-linux-amd64-v1.0.0",
         "9933f9a75cad6962ba0cf39813ecc2b1454aa35e952e4bcc36ee714c921ac860",
     )
     .await?;
-    for name in ["electrs", "atlas"] {
-        std::fs::set_permissions(dir.join(name), std::fs::Permissions::from_mode(0o755))?;
-    }
+    std::fs::set_permissions(dir.join("atlas"), std::fs::Permissions::from_mode(0o755))?;
     pg_bin().await?;
     Ok(())
 }

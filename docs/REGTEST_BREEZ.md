@@ -22,7 +22,7 @@ stable Rust toolchain through rustup, Go (the version in
 ```sh
 sudo apt-get update
 sudo apt-get install -y build-essential pkg-config libssl-dev libzmq3-dev \
-  libprotobuf-dev protobuf-compiler postgresql libpq-dev git curl unzip
+  libprotobuf-dev protobuf-compiler postgresql libpq-dev libclang-dev git curl unzip
 rustup update stable
 ```
 
@@ -41,20 +41,21 @@ the directory reported by `pg_config`. The fixture starts its own PostgreSQL
 instance on port 54329; it does not use your system database.
 
 Rust launches and manages the real service binaries. Docker is not required.
-The first `cargo regtest build` downloads checksum-verified Bitcoin Core 29.0,
-an Esplora-enabled Electrs build, and Atlas Community 1.0.0 for migrations.
-Exact URLs and SHA-256 pins live in
-[`native/tools.rs`](../e2e/breez/src/native/tools.rs). It then builds the Spark
+The first `cargo regtest build` downloads checksum-verified Bitcoin Core 29.0
+and Atlas Community 1.0.0 for migrations. It builds Electrs from revision
+`8c06d8010e43f793b1a65f83695ea846e5cd83ed`, which adds Esplora package
+broadcasting, and verifies the checkout revision before compilation.
+Exact source and artifact pins live in
+[`native/tools.rs`](../e2e/breez/src/native/tools.rs). It also builds the Spark
 operator (Go), Spark signer (Rust), LDK server/client, and SSP from source.
 The signer uses optimization level 1 so its curve arithmetic fits DKG RPC
-deadlines on small CI runners. The other Rust services use development builds.
+deadlines on small CI runners. Electrs uses a release build; the other Rust services use development builds.
 Downloaded tools and compiler outputs persist under `.regtest/native-tools`
 and `.regtest/native-build`; resetting test data keeps these caches.
 
-Core 29 supports package relay for clients that require zero-fee commitments.
-Use the local Bitcoin RPC service for those clients: the bundled Electrs
-build does not expose Esplora's `/txs/package` endpoint. Breez Spark wallets
-can continue using the local Esplora service.
+Core 29 and the bundled Electrs support package relay for clients that use
+zero-fee commitments. Clients can broadcast packages through Bitcoin RPC or
+Esplora's `/txs/package` endpoint.
 
 ## 2. Clone the repository and its sources
 

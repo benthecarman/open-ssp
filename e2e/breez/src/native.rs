@@ -676,7 +676,7 @@ impl Runtime {
         fs::create_dir_all(self.data("electrs"))?;
         self.configure(
             "electrs",
-            bin.join("electrs"),
+            tools::electrs_binary(&self.root),
             vec![
                 "--network=regtest".into(),
                 "--jsonrpc-import".into(),
