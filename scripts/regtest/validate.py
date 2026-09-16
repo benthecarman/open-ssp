@@ -40,7 +40,12 @@ def inner():
             return json.load(response)
 
     def height():
-        return get('http://127.0.0.1:30000/blocks/tip/height')
+        # Esplora can still be indexing old blocks after mining has stopped.
+        # Use the authoritative tip, also exercising the bundled Bitcoin CLI.
+        return int(subprocess.check_output([
+            '/opt/fixture/bin/bitcoin-cli', '-regtest', '-rpcconnect=127.0.0.1',
+            '-rpcport=8332', '-rpcuser=testutil', '-rpcpassword=testutilpassword',
+            'getblockcount'], env=env, text=True, timeout=20))
 
     def collect(label):
         destination = Path('/state/logs') / label
@@ -75,6 +80,10 @@ def inner():
         before = height()
         time.sleep(12)
         assert height() == before, 'automatic mining did not stop'
+        deadline = time.monotonic() + 60
+        while get('http://127.0.0.1:30000/blocks/tip/height') != before:
+            assert time.monotonic() < deadline, 'Esplora did not catch up'
+            time.sleep(1)
         cli('miner', 'start')
         deadline = time.monotonic() + 30
         while height() <= before:
