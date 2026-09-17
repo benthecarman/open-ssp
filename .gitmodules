@@ -1,6 +1,7 @@
 [submodule "vendor/spark"]
 	path = vendor/spark
 	url = https://github.com/benthecarman/spark.git
+	branch = open-ssp
 [submodule "vendor/ldk-server"]
 	path = vendor/ldk-server
 	url = https://github.com/lightningdevkit/ldk-server.git

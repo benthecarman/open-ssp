@@ -645,6 +645,8 @@ impl Runtime {
                     format!("unix://{}", socket.display()),
                     "-port".into(),
                     (8535 + i).to_string(),
+                    "-listen-address".into(),
+                    "127.0.0.1".into(),
                     "-database".into(),
                     format!(
                         "postgresql://postgres@127.0.0.1:54329/sparkoperator_{i}?sslmode=disable"

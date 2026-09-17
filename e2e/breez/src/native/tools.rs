@@ -223,29 +223,9 @@ pub async fn build(root: &Path, spark: &Path, ldk: &Path) -> Result<()> {
     let build = root.join(".regtest/native-build");
     let bins = root.join(".regtest/native-tools");
     println!("Build native Spark operator and signer");
-    // Compose used loopback port publishing. Preserve that boundary without
-    // changing the pinned source checkout or the operator's protocol behavior.
-    let main = spark.join("spark/bin/operator/main.go");
-    let original = std::fs::read_to_string(&main)?;
-    let listener = "fmt.Sprintf(\":%d\", args.";
-    ensure!(
-        original.matches(listener).count() == 4,
-        "Spark listener layout changed; review the native loopback overlay"
-    );
-    let patched = bins.join("operator-loopback.go");
-    std::fs::write(
-        &patched,
-        original.replace(listener, "fmt.Sprintf(\"127.0.0.1:%d\", args."),
-    )?;
-    let overlay = bins.join("operator-overlay.json");
-    std::fs::write(
-        &overlay,
-        serde_json::to_vec(&serde_json::json!({"Replace": {main.display().to_string(): patched}}))?,
-    )?;
     run(Command::new(executable("go")?)
         .current_dir(spark.join("spark"))
-        .args(["build", "-buildvcs=false", "-overlay"])
-        .arg(overlay)
+        .args(["build", "-buildvcs=false"])
         .arg("-o")
         .arg(bins.join("spark-operator"))
         .arg("./bin/operator"))

@@ -37,8 +37,9 @@ dependencies.
 
 The operator and signer build uses a cached archive of the Spark checkout's
 `HEAD`, excluding uncommitted changes. `SPARK_OPERATOR_COMMIT` selects another
-commit present in that checkout. A Go build overlay restricts the operator's
-TCP listeners to loopback without modifying the checkout. LDK and SSP builds
+commit present in that checkout. The runner passes `-listen-address 127.0.0.1`
+to restrict the operator's HTTP and gRPC listeners to loopback. Alternate Spark
+revisions must support this flag. LDK and SSP builds
 include local edits.
 
 `cargo regtest build` provisions checksum-verified tools and builds the service
