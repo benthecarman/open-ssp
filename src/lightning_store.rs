@@ -55,6 +55,9 @@ pub struct LightningSend {
     pub amount_override: Option<u64>,
     pub kind: SendKind,
     pub expected_id: String,
+    /// The most total CLTV, in blocks, the BOLT11 route may take so the payment
+    /// resolves before the Spark funding transfer expires. None for BOLT12.
+    pub max_route_cltv: Option<u32>,
     pub payment_id: Option<String>,
     pub status: SendStatus,
 }
@@ -75,9 +78,10 @@ fn send_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<LightningSend> {
         expected_id: row.get(7)?,
         payment_id: row.get(8)?,
         status: row.get(9)?,
+        max_route_cltv: row.get(10)?,
     })
 }
-const SEND_COLUMNS: &str = "request_id,owner,outbound_transfer_id,invoice,amount_sats,amount_override,kind,expected_id,payment_id,status";
+const SEND_COLUMNS: &str = "request_id,owner,outbound_transfer_id,invoice,amount_sats,amount_override,kind,expected_id,payment_id,status,max_route_cltv";
 
 pub fn migrate(conn: &rusqlite::Connection) -> Result<(), String> {
     // Removal must not silently strand an old SSP-owned receive or internal send.
@@ -110,6 +114,13 @@ pub fn migrate(conn: &rusqlite::Connection) -> Result<(), String> {
         receiver TEXT NOT NULL, amount_sats INTEGER NOT NULL, invoice TEXT NOT NULL, expires_at INTEGER NOT NULL,
         kind TEXT NOT NULL CHECK(kind IN ('BOLT11','BOLT12')), settled_payment_hash TEXT);
         CREATE INDEX IF NOT EXISTS lightning_receive_invoice ON lightning_receives(invoice);").map_err(|e| e.to_string())?;
+    crate::db::ensure_column(
+        &tx,
+        "lightning_sends",
+        "max_route_cltv",
+        "ALTER TABLE lightning_sends ADD COLUMN max_route_cltv INTEGER",
+    )
+    .map_err(|e| e.to_string())?;
     {
         let mut statement = tx.prepare("SELECT id,kind,owner,created_at,payload FROM requests WHERE kind IN ('LIGHTNING_SEND','LIGHTNING_RECEIVE') AND id NOT IN (SELECT request_id FROM lightning_sends UNION ALL SELECT request_id FROM lightning_receives)").map_err(|e| e.to_string())?;
         let rows = statement
@@ -253,8 +264,8 @@ impl Db {
             )?;
             tx.execute(
                 "INSERT INTO lightning_sends(request_id,owner,outbound_transfer_id,
-                    invoice,amount_sats,amount_override,kind,expected_id,status)
-                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,'PREPARED')",
+                    invoice,amount_sats,amount_override,kind,expected_id,status,max_route_cltv)
+                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,'PREPARED',?9)",
                 params![
                     send.request_id,
                     send.owner,
@@ -263,7 +274,8 @@ impl Db {
                     send.amount_sats,
                     send.amount_override,
                     send.kind,
-                    send.expected_id
+                    send.expected_id,
+                    send.max_route_cltv
                 ],
             )?;
             let funding_kind = match send.kind {
@@ -303,6 +315,23 @@ impl Db {
                 send_row,
             )
             .optional()
+        })
+        .await
+    }
+
+    /// Record the route CLTV cap a re-verified funding transfer allows.
+    pub async fn set_lightning_send_route_cltv(
+        &self,
+        request_id: &str,
+        max_route_cltv: Option<u32>,
+    ) -> Result<(), String> {
+        let request_id = request_id.to_string();
+        self.with(move |c| {
+            c.execute(
+                "UPDATE lightning_sends SET max_route_cltv=?2 WHERE request_id=?1",
+                params![request_id, max_route_cltv],
+            )
+            .map(|_| ())
         })
         .await
     }
@@ -431,6 +460,7 @@ mod tests {
             amount_override: Some(1000),
             kind: SendKind::Bolt12,
             expected_id: "offer-id".into(),
+            max_route_cltv: None,
             payment_id: None,
             status: SendStatus::Prepared,
         };
@@ -505,6 +535,7 @@ mod tests {
             amount_override: None,
             kind: SendKind::Bolt11,
             expected_id: "hash".into(),
+            max_route_cltv: Some(1008),
             payment_id: None,
             status: SendStatus::Prepared,
         };

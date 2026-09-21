@@ -12,7 +12,10 @@ use ldk_server_client::{
             ListPaymentsRequest,
         },
         events::event_envelope::Event as LdkRawEvent,
-        types::{Bolt11InvoiceDescription, Payment, PaymentDirection, PaymentStatus},
+        types::{
+            Bolt11InvoiceDescription, Payment, PaymentDirection, PaymentStatus,
+            RouteParametersConfig,
+        },
     },
 };
 use sha2::{Digest, Sha256};
@@ -23,6 +26,20 @@ use crate::{
     lightning_store::{LightningSend, SendKind, SendStatus},
     spark::{LightningReceiveSwap, SparkService},
 };
+
+/// LDK's route parameters with only the total CLTV bounded. The proto has no
+/// unset value for the other limits, so they carry LDK's own defaults.
+fn route_parameters_with_cltv(max_total_cltv_expiry_delta: u32) -> RouteParametersConfig {
+    let defaults = ldk_node::lightning::routing::router::RouteParametersConfig::default();
+    RouteParametersConfig {
+        max_total_routing_fee_msat: None,
+        max_total_cltv_expiry_delta,
+        max_path_count: u32::from(defaults.max_path_count),
+        max_channel_saturation_power_of_half: u32::from(
+            defaults.max_channel_saturation_power_of_half,
+        ),
+    }
+}
 
 #[async_trait::async_trait]
 trait SendLdk: Send + Sync {
@@ -39,7 +56,7 @@ impl SendLdk for LdkServerClient {
                 .bolt11_send(Bolt11SendRequest {
                     invoice: send.invoice.clone(),
                     amount_msat,
-                    route_parameters: None,
+                    route_parameters: send.max_route_cltv.map(route_parameters_with_cltv),
                 })
                 .await
                 .map(|r| r.payment_id)
@@ -688,6 +705,8 @@ trait InternalSpark: ReceiveSpark {
 #[async_trait::async_trait]
 impl InternalSpark for SparkService {
     async fn verify_sender(&self, send: &LightningSend) -> Result<(), String> {
+        // An internal send settles through Spark without a Lightning route,
+        // so the route CLTV cap the funding allows is not needed here.
         self.verify_lightning_send(
             &send.owner,
             &send.outbound_transfer_id,
@@ -695,6 +714,7 @@ impl InternalSpark for SparkService {
             send.amount_sats,
         )
         .await
+        .map(|_| ())
     }
     async fn settle_sender(&self, send: &LightningSend, preimage: &str) -> Result<(), String> {
         self.settle_lightning_send(&send.outbound_transfer_id, &send.expected_id, preimage)
@@ -822,7 +842,8 @@ impl LdkBackend {
             (SendKind::Bolt11, decoded.payment_hash().to_string(), sats)
         };
         sats_to_msats(total)?;
-        self.verify_lightning_send_funding(owner, transfer, invoice, amount)
+        let max_route_cltv = self
+            .verify_lightning_send_funding(owner, transfer, invoice, amount)
             .await?;
         Ok(LightningSend {
             request_id: uuid::Uuid::new_v4().to_string(),
@@ -833,6 +854,7 @@ impl LdkBackend {
             amount_override: amount,
             kind,
             expected_id,
+            max_route_cltv,
             payment_id: None,
             status: SendStatus::Prepared,
         })
@@ -852,15 +874,32 @@ impl LdkBackend {
             return Ok(());
         }
         // A prepared request can survive a restart before submission. Recheck
-        // that its funding is still claimable before crossing the checkpoint.
-        self.verify_lightning_send_funding(
-            &send.owner,
-            &send.outbound_transfer_id,
-            &send.invoice,
-            send.amount_override,
-        )
-        .await?;
-        submit_durable_send(&self.db, &self.client, send).await
+        // that its funding is still claimable before crossing the checkpoint,
+        // and submit with the CLTV room the funding has left now.
+        let send = self.refresh_route_cltv(send).await?;
+        submit_durable_send(&self.db, &self.client, &send).await
+    }
+
+    /// Re-verify a send's Spark funding and return the intent with the route
+    /// CLTV cap that funding allows at this moment.
+    async fn refresh_route_cltv(&self, send: &LightningSend) -> Result<LightningSend, String> {
+        let max_route_cltv = self
+            .verify_lightning_send_funding(
+                &send.owner,
+                &send.outbound_transfer_id,
+                &send.invoice,
+                send.amount_override,
+            )
+            .await?;
+        if max_route_cltv != send.max_route_cltv {
+            self.db
+                .set_lightning_send_route_cltv(&send.request_id, max_route_cltv)
+                .await?;
+        }
+        Ok(LightningSend {
+            max_route_cltv,
+            ..send.clone()
+        })
     }
 
     async fn recover_send(&self, send: &LightningSend) -> Result<(), String> {
@@ -885,14 +924,8 @@ impl LdkBackend {
             && send.status == SendStatus::Submitting
             && send.payment_id.is_none()
         {
-            self.verify_lightning_send_funding(
-                &send.owner,
-                &send.outbound_transfer_id,
-                &send.invoice,
-                send.amount_override,
-            )
-            .await?;
-            retry_missing_bolt11(&self.db, &self.client, send).await?;
+            let send = self.refresh_route_cltv(send).await?;
+            retry_missing_bolt11(&self.db, &self.client, &send).await?;
         } else {
             self.db.lightning_submission_error(&send.request_id,"LDK has no matching payment; inspect the backend and its event log. This intent will not be resubmitted without an idempotent backend contract.").await?;
         }
@@ -1293,23 +1326,25 @@ impl LdkBackend {
         0
     }
 
+    /// Verify the Spark funding for a send. For BOLT11, returns the most total
+    /// CLTV, in blocks, the route may take before the funding transfer expires.
     pub async fn verify_lightning_send_funding(
         &self,
         owner: &str,
         outbound_transfer_id: &str,
         invoice: &str,
         amount_sats: Option<u64>,
-    ) -> Result<(), String> {
+    ) -> Result<Option<u32>, String> {
         if invoice.to_ascii_lowercase().starts_with("lno1") {
             let amount_sats =
                 amount_sats.ok_or_else(|| "BOLT12 sends require amount_sats".to_string())?;
             if amount_sats == 0 {
                 return Err("Lightning send amount must be positive".to_string());
             }
-            return self
-                .spark
+            self.spark
                 .verify_bolt12_send(owner, outbound_transfer_id, amount_sats)
-                .await;
+                .await?;
+            return Ok(None);
         }
         let decoded = lightning_invoice::Bolt11Invoice::from_str(invoice)
             .map_err(|error| format!("decode invoice: {error}"))?;
@@ -1339,6 +1374,7 @@ impl LdkBackend {
                 total_sats,
             )
             .await
+            .map(Some)
     }
 
     pub async fn reconcile_request(&self, id: &str) -> Result<String, String> {
@@ -1625,6 +1661,7 @@ mod tests {
             amount_override: None,
             kind,
             expected_id: "expected".into(),
+            max_route_cltv: None,
             payment_id: None,
             status: SendStatus::Prepared,
         }

@@ -8,7 +8,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
         Arc,
     },
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use ::spark::{
@@ -24,12 +24,13 @@ use ::spark::{
     session_store::InMemorySessionStore,
     signer::SparkSigner as CoreSparkSigner,
     tree::{select_leaves_by_exact_amounts, LeafLike, TreeNode, TreeNodeStatus, TreeServiceError},
+    utils::htlc_transactions::create_htlc_taproot_address,
 };
 use bip39::{Language, Mnemonic};
 use bitcoin::{
     consensus::deserialize,
     hashes::{sha256, Hash as BitcoinHash},
-    Transaction,
+    ScriptBuf, Sequence, Transaction,
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -836,13 +837,15 @@ impl SparkService {
             .map_err(|e| e.to_string())
     }
 
+    /// Verify the preimage-swap transfer that funds a BOLT11 send and return
+    /// the most total CLTV, in blocks, the Lightning route may take.
     pub async fn verify_lightning_send(
         &self,
         owner: &str,
         outbound_transfer_id: &str,
         payment_hash: &str,
         amount_sats: u64,
-    ) -> Result<(), String> {
+    ) -> Result<u32, String> {
         let request = self
             .find_htlc(outbound_transfer_id, payment_hash)
             .await?
@@ -850,23 +853,21 @@ impl SparkService {
         let transfer = request
             .transfer
             .ok_or_else(|| "preimage swap has no transfer".to_string())?;
-        if transfer.sender_identity_public_key.to_string() != owner.to_lowercase() {
-            return Err("preimage swap sender does not match session owner".to_string());
-        }
-        if transfer.receiver_identity_public_key != self.identity {
-            return Err("preimage swap receiver does not match the SSP".to_string());
-        }
-        if transfer.total_value != amount_sats {
-            return Err(format!(
-                "preimage swap has {} sats; expected {amount_sats}",
-                transfer.total_value
-            ));
-        }
         if request.status != PreimageRequestStatus::WaitingForPreimage || request.preimage.is_some()
         {
             return Err("preimage swap is not waiting for payment".to_string());
         }
-        Ok(())
+        let sender = spark_wallet::PublicKey::from_str(&owner.to_lowercase())
+            .map_err(|e| format!("invalid session owner key: {e}"))?;
+        validate_lightning_send_transfer(
+            &transfer,
+            sender,
+            self.identity,
+            amount_sats,
+            &request.payment_hash,
+            self.network,
+            SystemTime::now(),
+        )
     }
 
     /// Verify an unconditional Spark transfer that prepays a BOLT12 send.
@@ -1940,6 +1941,156 @@ fn wallet_leaf_to_tree_node(leaf: WalletLeaf) -> Result<TreeNode, String> {
     })
 }
 
+/// The relative timelock, in blocks, that the Spark SDK locks a Lightning HTLC
+/// leaf's reclaim path to. The sender can only take a paid leaf back after it.
+const LIGHTNING_HTLC_TIMELOCK_BLOCKS: u16 = 2160;
+
+/// The operators refuse a receiver's claim of a leaf whose refund timelock is
+/// under this many blocks, even one they accepted into the send.
+const MIN_CLAIMABLE_REFUND_TIMELOCK: u32 = 200;
+
+/// A payment can stay pending for its route's whole CLTV and still succeed, so
+/// fewer blocks leave more room before the sender's transfer expires. This is
+/// LDK's own default limit.
+const MAX_ROUTE_CLTV_BLOCKS: u32 = 1008;
+
+/// Blocks are assumed to take up to this long on average, so a payment pending
+/// for its whole route still resolves before the transfer expires.
+const SLOW_BLOCK_INTERVAL: Duration = Duration::from_secs(30 * 60);
+
+/// Time kept between the latest a payment can resolve and the sender's
+/// transfer expiring, for the SSP to reveal the preimage to the operators.
+const PREIMAGE_REVEAL_MARGIN: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// Check that a preimage-swap transfer really pays the SSP for this invoice.
+///
+/// The operators validate the swap request, but the SSP fronts the Lightning
+/// payment from its own funds, so it independently checks that every leaf
+/// refund pays the HTLC script built from this payment hash, the SSP's hash
+/// lock, and the sender's timelock. A refund to any other script, or with a
+/// timelock the operators would refuse to claim, leaves the SSP unable to
+/// collect after it reveals the preimage.
+///
+/// Returns the most total CLTV, in blocks, the route may take when paying.
+fn validate_lightning_send_transfer(
+    transfer: &SparkTransfer,
+    sender: spark_wallet::PublicKey,
+    receiver: spark_wallet::PublicKey,
+    amount_sats: u64,
+    payment_hash: &sha256::Hash,
+    network: Network,
+    now: SystemTime,
+) -> Result<u32, String> {
+    if transfer.transfer_type != TransferType::PreimageSwap {
+        return Err("send funding is not a preimage swap".to_string());
+    }
+    if transfer.sender_identity_public_key != sender {
+        return Err("preimage swap sender does not match session owner".to_string());
+    }
+    if transfer.receiver_identity_public_key != receiver {
+        return Err("preimage swap receiver does not match the SSP".to_string());
+    }
+    if transfer.total_value != amount_sats {
+        return Err(format!(
+            "preimage swap has {} sats; expected {amount_sats}",
+            transfer.total_value
+        ));
+    }
+    if !matches!(
+        transfer.status,
+        TransferStatus::SenderKeyTweakPending | TransferStatus::SenderInitiatedCoordinator
+    ) {
+        return Err(format!(
+            "preimage swap transfer is {}, not waiting on the SSP",
+            transfer.status
+        ));
+    }
+    if transfer.leaves.is_empty() {
+        return Err("preimage swap transfer has no leaves".to_string());
+    }
+    let expected = lightning_htlc_script(payment_hash, &receiver, &sender, network)?;
+    for leaf in &transfer.leaves {
+        if !refund_timelock_survives_claim(leaf.leaf.refund_tx.as_ref()) {
+            return Err(format!(
+                "leaf {} refund timelock is under {MIN_CLAIMABLE_REFUND_TIMELOCK} blocks and must be renewed before it can be sent",
+                leaf.leaf.id
+            ));
+        }
+        for refund in [
+            Some(&leaf.intermediate_refund_tx),
+            leaf.intermediate_direct_refund_tx.as_ref(),
+            leaf.intermediate_direct_from_cpfp_refund_tx.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            let output = refund
+                .output
+                .first()
+                .ok_or_else(|| format!("leaf {} refund has no output", leaf.leaf.id))?;
+            if output.script_pubkey != expected {
+                return Err(format!(
+                    "leaf {} refund does not pay the expected Lightning HTLC; refusing to pay",
+                    leaf.leaf.id
+                ));
+            }
+        }
+    }
+    route_cltv_within_expiry(MAX_ROUTE_CLTV_BLOCKS, transfer.expiry_time, now)
+}
+
+fn lightning_htlc_script(
+    payment_hash: &sha256::Hash,
+    hash_lock_key: &spark_wallet::PublicKey,
+    timelock_key: &spark_wallet::PublicKey,
+    network: Network,
+) -> Result<ScriptBuf, String> {
+    create_htlc_taproot_address(
+        payment_hash,
+        hash_lock_key,
+        Sequence::from_height(LIGHTNING_HTLC_TIMELOCK_BLOCKS),
+        timelock_key,
+        network,
+    )
+    .map_err(|e| format!("cannot rebuild the expected Lightning HTLC script: {e}"))
+}
+
+fn refund_timelock_survives_claim(refund_tx: Option<&Transaction>) -> bool {
+    refund_tx
+        .and_then(|tx| tx.input.first())
+        .is_some_and(|input| {
+            input.sequence.to_consensus_u32() & 0xFFFF >= MIN_CLAIMABLE_REFUND_TIMELOCK
+        })
+}
+
+/// Bound the route CLTV so the payment resolves, and the SSP reveals the
+/// preimage, before the sender's transfer expires. A transfer without an
+/// expiry keeps the full cap.
+fn route_cltv_within_expiry(
+    cap: u32,
+    expiry_time: Option<u64>,
+    now: SystemTime,
+) -> Result<u32, String> {
+    let Some(expiry) = expiry_time
+        .filter(|secs| *secs > 0)
+        .and_then(|secs| UNIX_EPOCH.checked_add(Duration::from_secs(secs)))
+    else {
+        return Ok(cap);
+    };
+    let blocks = expiry
+        .duration_since(now)
+        .ok()
+        .and_then(|lifetime| lifetime.checked_sub(PREIMAGE_REVEAL_MARGIN))
+        .map(|time| time.as_secs() / SLOW_BLOCK_INTERVAL.as_secs())
+        .unwrap_or(0);
+    match cap.min(u32::try_from(blocks).unwrap_or(u32::MAX)) {
+        0 => Err(
+            "preimage swap transfer expires before a Lightning payment could resolve".to_string(),
+        ),
+        cap => Ok(cap),
+    }
+}
+
 fn validate_transfer(
     transfer: &WalletTransfer,
     sender: spark_wallet::PublicKey,
@@ -2580,5 +2731,218 @@ mod tests {
         let mode = std::fs::metadata(&path).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600);
         std::fs::remove_file(&path).unwrap();
+    }
+
+    fn lightning_send_fixture() -> (
+        SparkTransfer,
+        spark_wallet::PublicKey,
+        spark_wallet::PublicKey,
+        sha256::Hash,
+    ) {
+        use ::spark::{
+            services::TransferLeaf,
+            tree::{SigningKeyshare, TreeNodeId},
+        };
+        use bitcoin::{
+            absolute::LockTime,
+            secp256k1::{Secp256k1, SecretKey},
+            transaction::Version,
+            Amount, OutPoint, TxIn, TxOut,
+        };
+        let key = |byte| {
+            spark_wallet::PublicKey::from_secret_key(
+                &Secp256k1::new(),
+                &SecretKey::from_slice(&[byte; 32]).unwrap(),
+            )
+        };
+        let sender = key(1);
+        let ssp = key(2);
+        let payment_hash = sha256::Hash::hash(b"preimage");
+        let htlc = lightning_htlc_script(&payment_hash, &ssp, &sender, Network::Regtest).unwrap();
+        let refund_with = |sequence: u32, script: ScriptBuf| Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::null(),
+                sequence: Sequence::from_consensus(sequence),
+                ..Default::default()
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(10_000),
+                script_pubkey: script,
+            }],
+        };
+        let refund = refund_with(1000, ScriptBuf::new());
+        let htlc_refund = refund_with(1000, htlc);
+        let leaf = TreeNode {
+            id: TreeNodeId::from_str("leaf-1").unwrap(),
+            tree_id: "tree".into(),
+            value: 10_000,
+            parent_node_id: None,
+            node_tx: refund.clone(),
+            refund_tx: Some(refund.clone()),
+            direct_tx: None,
+            direct_refund_tx: None,
+            direct_from_cpfp_refund_tx: Some(refund),
+            vout: 0,
+            verifying_public_key: sender,
+            owner_identity_public_key: Some(sender),
+            signing_keyshare: SigningKeyshare {
+                owner_identifiers: vec![],
+                threshold: 2,
+                public_key: sender,
+            },
+            status: TreeNodeStatus::TransferLocked,
+        };
+        let transfer = SparkTransfer {
+            id: TransferId::generate(),
+            sender_identity_public_key: sender,
+            receiver_identity_public_key: ssp,
+            status: TransferStatus::SenderKeyTweakPending,
+            total_value: 10_000,
+            expiry_time: None,
+            created_time: None,
+            updated_time: None,
+            spark_invoice: None,
+            transfer_type: TransferType::PreimageSwap,
+            leaves: vec![TransferLeaf {
+                leaf,
+                secret_cipher: vec![],
+                signature: None,
+                intermediate_refund_tx: htlc_refund.clone(),
+                intermediate_direct_refund_tx: Some(htlc_refund.clone()),
+                intermediate_direct_from_cpfp_refund_tx: Some(htlc_refund),
+            }],
+        };
+        (transfer, sender, ssp, payment_hash)
+    }
+
+    #[test]
+    fn lightning_send_funding_must_pay_the_expected_htlc() {
+        let (transfer, sender, ssp, hash) = lightning_send_fixture();
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let check = |transfer: &SparkTransfer| {
+            validate_lightning_send_transfer(
+                transfer,
+                sender,
+                ssp,
+                10_000,
+                &hash,
+                Network::Regtest,
+                now,
+            )
+        };
+        assert_eq!(check(&transfer), Ok(MAX_ROUTE_CLTV_BLOCKS));
+
+        let mut changed = transfer.clone();
+        changed.transfer_type = TransferType::Transfer;
+        assert!(check(&changed).unwrap_err().contains("not a preimage swap"));
+
+        changed = transfer.clone();
+        changed.receiver_identity_public_key = sender;
+        assert!(check(&changed).unwrap_err().contains("receiver"));
+
+        changed = transfer.clone();
+        changed.total_value -= 1;
+        assert!(check(&changed).unwrap_err().contains("expected 10000"));
+
+        for status in [
+            TransferStatus::SenderInitiated,
+            TransferStatus::SenderKeyTweaked,
+            TransferStatus::Completed,
+            TransferStatus::Expired,
+            TransferStatus::Returned,
+        ] {
+            changed = transfer.clone();
+            changed.status = status;
+            assert!(check(&changed)
+                .unwrap_err()
+                .contains("not waiting on the SSP"));
+        }
+        changed = transfer.clone();
+        changed.status = TransferStatus::SenderInitiatedCoordinator;
+        assert!(check(&changed).is_ok());
+
+        changed = transfer.clone();
+        changed.leaves.clear();
+        assert!(check(&changed).unwrap_err().contains("no leaves"));
+
+        // A refund to a different hash, or to the wrong key roles, is not an
+        // HTLC the SSP can collect after revealing this preimage.
+        let other_hash = sha256::Hash::hash(b"other");
+        let wrong_hash =
+            lightning_htlc_script(&other_hash, &ssp, &sender, Network::Regtest).unwrap();
+        changed = transfer.clone();
+        changed.leaves[0]
+            .intermediate_direct_refund_tx
+            .as_mut()
+            .unwrap()
+            .output[0]
+            .script_pubkey = wrong_hash;
+        assert!(check(&changed).unwrap_err().contains("refusing to pay"));
+
+        let swapped_roles = lightning_htlc_script(&hash, &sender, &ssp, Network::Regtest).unwrap();
+        changed = transfer.clone();
+        changed.leaves[0].intermediate_refund_tx.output[0].script_pubkey = swapped_roles;
+        assert!(check(&changed).unwrap_err().contains("refusing to pay"));
+
+        changed = transfer.clone();
+        changed.leaves[0]
+            .intermediate_direct_from_cpfp_refund_tx
+            .as_mut()
+            .unwrap()
+            .output
+            .clear();
+        assert!(check(&changed).unwrap_err().contains("no output"));
+
+        // The operators refuse to claim a leaf whose refund timelock is nearly spent.
+        changed = transfer.clone();
+        changed.leaves[0].leaf.refund_tx.as_mut().unwrap().input[0].sequence =
+            Sequence::from_consensus(199);
+        assert!(check(&changed).unwrap_err().contains("renewed"));
+        changed = transfer.clone();
+        changed.leaves[0].leaf.refund_tx = None;
+        assert!(check(&changed).unwrap_err().contains("renewed"));
+    }
+
+    #[test]
+    fn lightning_send_route_cltv_fits_the_funding_expiry() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let at =
+            |offset: Duration| Some((now + offset).duration_since(UNIX_EPOCH).unwrap().as_secs());
+        // No expiry, or an unset zero, keeps LDK's default cap.
+        assert_eq!(route_cltv_within_expiry(1008, None, now), Ok(1008));
+        assert_eq!(route_cltv_within_expiry(1008, Some(0), now), Ok(1008));
+        // A long-lived transfer is capped, not extended.
+        assert_eq!(
+            route_cltv_within_expiry(1008, at(Duration::from_secs(60 * 24 * 60 * 60)), now),
+            Ok(1008)
+        );
+        // Two days leaves one day of blocks after the preimage-reveal margin.
+        assert_eq!(
+            route_cltv_within_expiry(1008, at(Duration::from_secs(2 * 24 * 60 * 60)), now),
+            Ok(48)
+        );
+        // Inside the margin, or already expired, there is no room to pay.
+        assert!(
+            route_cltv_within_expiry(1008, at(Duration::from_secs(24 * 60 * 60)), now).is_err()
+        );
+        assert!(route_cltv_within_expiry(1008, at(Duration::from_secs(25 * 60 * 60)), now).is_ok());
+        assert!(route_cltv_within_expiry(1008, Some(1), now).is_err());
+
+        let (mut transfer, sender, ssp, hash) = lightning_send_fixture();
+        transfer.expiry_time = at(Duration::from_secs(2 * 24 * 60 * 60));
+        assert_eq!(
+            validate_lightning_send_transfer(
+                &transfer,
+                sender,
+                ssp,
+                10_000,
+                &hash,
+                Network::Regtest,
+                now
+            ),
+            Ok(48)
+        );
     }
 }

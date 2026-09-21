@@ -8,7 +8,9 @@ use std::{fs::File, path::Path, str::FromStr, sync::Arc};
 use fs2::FileExt;
 use ldk_node::{
     entropy::NodeEntropy,
-    lightning::{ln::channelmanager::PaymentId, offers::offer::Offer},
+    lightning::{
+        ln::channelmanager::PaymentId, offers::offer::Offer, routing::router::RouteParametersConfig,
+    },
     lightning_invoice::{Bolt11Invoice, Bolt11InvoiceDescription, Description},
     lightning_types::payment::{PaymentHash, PaymentPreimage},
     payment::{self, PaymentDetails},
@@ -266,6 +268,9 @@ impl LdkClient {
         let send = send.clone();
         node.call(move |node| {
             let amount = send.amount_override.map(super::sats_to_msats).transpose()?;
+            let route = send
+                .max_route_cltv
+                .map(|cap| RouteParametersConfig::default().with_max_total_cltv_expiry_delta(cap));
             let id = match send.kind {
                 SendKind::Bolt11 => {
                     let invoice =
@@ -273,8 +278,8 @@ impl LdkClient {
                     match amount {
                         Some(amount) => node
                             .bolt11_payment()
-                            .send_using_amount(&invoice, amount, None),
-                        None => node.bolt11_payment().send(&invoice, None),
+                            .send_using_amount(&invoice, amount, route),
+                        None => node.bolt11_payment().send(&invoice, route),
                     }
                 }
                 SendKind::Bolt12 => {

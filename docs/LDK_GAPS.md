@@ -21,7 +21,13 @@ drains HTTP requests and stops the embedded node.
 
 ### BOLT11 send
 
-The SSP verifies a matching Spark preimage-swap transfer. It stores the send
+The SSP verifies a matching Spark preimage-swap transfer. It checks the
+sender, receiver, amount, and pending status, then rebuilds the expected
+Lightning HTLC script from the payment hash, the SSP hash lock, and the
+sender timelock. Every leaf refund must pay that script, and each leaf must
+keep a refund timelock the operators will still claim. It bounds the route
+CLTV so the payment resolves at least a day before the funding transfer
+expires, and passes that limit to LDK. It stores the send
 intent, funding transfer, and wallet idempotency key in one SQLite transaction
 before it calls `Bolt11Send`. Events and reconciliation then update the send.
 On success, the SSP gives the Lightning preimage to the Spark transfer.

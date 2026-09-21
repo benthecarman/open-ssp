@@ -45,7 +45,7 @@ pub struct SparkLeafKeyOverride {
     pub key_material: Vec<u8>,
 }
 
-fn ensure_column(
+pub(crate) fn ensure_column(
     conn: &rusqlite::Connection,
     table: &str,
     column: &str,

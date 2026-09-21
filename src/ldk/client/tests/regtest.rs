@@ -105,6 +105,7 @@ fn send(invoice: String, kind: SendKind, expected_id: String) -> LightningSend {
         amount_override: (kind == SendKind::Bolt12).then_some(1_000),
         kind,
         expected_id,
+        max_route_cltv: (kind == SendKind::Bolt11).then_some(1008),
         payment_id: None,
         status: SendStatus::Submitting,
     }

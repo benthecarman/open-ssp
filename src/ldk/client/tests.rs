@@ -190,6 +190,7 @@ fn payment_snapshots_preserve_settlement_and_recovery_fields() {
         amount_override: Some(42),
         kind: SendKind::Bolt12,
         expected_id: "04".repeat(32),
+        max_route_cltv: None,
         payment_id: None,
         status: SendStatus::Submitting,
     };
