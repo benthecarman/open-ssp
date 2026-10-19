@@ -152,11 +152,11 @@ pub async fn provision(root: &Path) -> Result<()> {
     std::fs::create_dir_all(&dir)?;
     download(
         &dir.join("bitcoin.tar.gz"),
-        "https://bitcoincore.org/bin/bitcoin-core-29.0/bitcoin-29.0-x86_64-linux-gnu.tar.gz",
-        "a681e4f6ce524c338a105f214613605bac6c33d58c31dc5135bbc02bc458bb6c",
+        "https://bitcoincore.org/bin/bitcoin-core-31.1/bitcoin-31.1-x86_64-linux-gnu.tar.gz",
+        "b80d9c3e04da78fb6f0569685673418cf686fadba9042d926d13fb87ff503f9e",
     )
     .await?;
-    if !dir.join("bitcoin-29.0/bin/bitcoind").is_file() {
+    if !dir.join("bitcoin-31.1/bin/bitcoind").is_file() {
         run(Command::new("tar")
             .arg("-xzf")
             .arg(dir.join("bitcoin.tar.gz"))
@@ -167,8 +167,8 @@ pub async fn provision(root: &Path) -> Result<()> {
     provision_electrs(root).await?;
     download(
         &dir.join("atlas"),
-        "https://release.ariga.io/atlas/atlas-community-linux-amd64-v1.0.0",
-        "9933f9a75cad6962ba0cf39813ecc2b1454aa35e952e4bcc36ee714c921ac860",
+        "https://release.ariga.io/atlas/atlas-community-linux-amd64-v1.3.0",
+        "10d7913e3dce43ab99b8d71534a4cbadaf11a16dc293adf3b91d10e83a0ac70b",
     )
     .await?;
     std::fs::set_permissions(dir.join("atlas"), std::fs::Permissions::from_mode(0o755))?;

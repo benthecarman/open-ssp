@@ -41,8 +41,8 @@ the directory reported by `pg_config`. The fixture starts its own PostgreSQL
 instance on port 54329; it does not use your system database.
 
 Rust launches and manages the real service binaries. Docker is not required.
-The first `cargo regtest build` downloads checksum-verified Bitcoin Core 29.0
-and Atlas Community 1.0.0 for migrations. It builds Electrs from revision
+The first `cargo regtest build` downloads checksum-verified Bitcoin Core 31.1
+and Atlas Community 1.3.0 for migrations. It builds Electrs from revision
 `8c06d8010e43f793b1a65f83695ea846e5cd83ed`, which adds Esplora package
 broadcasting, and verifies the checkout revision before compilation.
 Exact source and artifact pins live in

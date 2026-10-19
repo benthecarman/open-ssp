@@ -5,7 +5,7 @@ embedded `ldk-node` (`LDK_BACKEND=embedded`) and keeps all Spark settlement
 state in the SSP. See [backend configuration](../README.md#lightning-backend). This document lists the current integration boundary and
 verified limitations.
 
-The client and server are pinned to `c31191ae6cf70b22b49473b2b435656fc3516ef9`.
+The client and server are pinned to `c17dc11dde38f88c53457039ddf30c6b90a63ba2`.
 Upgrade SSP and LDK server together: the payment event layout, payment ID
 field, pagination tokens, and BOLT11 claim/fail RPCs changed upstream.
 
@@ -177,8 +177,8 @@ See [SSP API coverage](SSP_API_COVERAGE.md) for the operation-level status.
 
 ## Deployment requirements
 
-Production must provide `LDK_GRPC_ADDR`, either `LDK_API_KEY` or
-`LDK_API_KEY_FILE`, and `LDK_TLS_CERT_FILE`. Authenticated `/status` must report
+Production must provide `LDK_GRPC_ADDR`, either `LDK_MACAROON` or
+`LDK_MACAROON_FILE`, and `LDK_TLS_CERT_FILE`. Authenticated `/status` must report
 `ldk_mode: "live"` and the expected `ldk_node_id`; `/health` reports only basic
 process liveness.
 

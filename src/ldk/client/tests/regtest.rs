@@ -130,7 +130,7 @@ async fn payments_and_restart(source: LdkChainSource) {
     let rpc_port = port();
     let bitcoin_log = File::create(chain_dir.0.join("bitcoin.log")).unwrap();
     let bitcoind = std::env::var("LDK_TEST_BITCOIND")
-        .unwrap_or_else(|_| ".regtest/native-tools/bitcoin-29.0/bin/bitcoind".into());
+        .unwrap_or_else(|_| ".regtest/native-tools/bitcoin-31.1/bin/bitcoind".into());
     let _bitcoin = Process(
         Command::new(bitcoind)
             .args([

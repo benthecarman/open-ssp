@@ -444,7 +444,7 @@ impl Runtime {
         fs::write(self.data("bitcoin.conf"), bitcoin_config)?;
         self.configure(
             "bitcoind",
-            bin.join("bitcoin-29.0/bin/bitcoind"),
+            bin.join("bitcoin-31.1/bin/bitcoind"),
             vec![
                 format!("-datadir={}", self.data("bitcoin").display()),
                 format!("-conf={}", self.data("bitcoin.conf").display()),
@@ -764,8 +764,10 @@ impl Runtime {
                 ("SSP_MIN_SPLIT_CHILD_SATS".into(), min_split.to_string()),
                 ("LDK_GRPC_ADDR".into(), format!("localhost:{grpc}")),
                 (
-                    "LDK_API_KEY_FILE".into(),
-                    data.join("regtest/api_key").display().to_string(),
+                    "LDK_MACAROON_FILE".into(),
+                    data.join("regtest/macaroons/admin.macaroon")
+                        .display()
+                        .to_string(),
                 ),
                 (
                     "LDK_TLS_CERT_FILE".into(),
