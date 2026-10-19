@@ -5,7 +5,7 @@ embedded `ldk-node` (`LDK_BACKEND=embedded`) and keeps all Spark settlement
 state in the SSP. See [backend configuration](../README.md#lightning-backend). This document lists the current integration boundary and
 verified limitations.
 
-The client and server are pinned to `c31191ae6cf70b22b49473b2b435656fc3516ef9`.
+The client and server are pinned to `c17dc11dde38f88c53457039ddf30c6b90a63ba2`.
 Upgrade SSP and LDK server together: the payment event layout, payment ID
 field, pagination tokens, and BOLT11 claim/fail RPCs changed upstream.
 
