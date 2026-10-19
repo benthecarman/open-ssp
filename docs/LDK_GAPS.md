@@ -177,8 +177,8 @@ See [SSP API coverage](SSP_API_COVERAGE.md) for the operation-level status.
 
 ## Deployment requirements
 
-Production must provide `LDK_GRPC_ADDR`, either `LDK_API_KEY` or
-`LDK_API_KEY_FILE`, and `LDK_TLS_CERT_FILE`. Authenticated `/status` must report
+Production must provide `LDK_GRPC_ADDR`, either `LDK_MACAROON` or
+`LDK_MACAROON_FILE`, and `LDK_TLS_CERT_FILE`. Authenticated `/status` must report
 `ldk_mode: "live"` and the expected `ldk_node_id`; `/health` reports only basic
 process liveness.
 

@@ -45,8 +45,8 @@ The SSP calls existing operator consensus code through this RPC.
 | `LDK_NODE_BITCOIND_RPC_PASSWORD` | RPC password when no password file is configured |
 | `LDK_NODE_BITCOIND_RESCAN_FROM_HEIGHT` | Optional first-start wallet scan height; unset checkpoints at the current tip |
 | `LDK_GRPC_ADDR` | `ldk-server` gRPC address without a URL scheme |
-| `LDK_API_KEY` | Hex API key; use this or `LDK_API_KEY_FILE` |
-| `LDK_API_KEY_FILE` | Mounted raw `ldk-server` API-key file |
+| `LDK_MACAROON` | Hex `ldk-server` macaroon; use this or `LDK_MACAROON_FILE` |
+| `LDK_MACAROON_FILE` | Mounted `ldk-server` macaroon file (`<network_dir>/macaroons/admin.macaroon`) |
 | `LDK_TLS_CERT_FILE` | Mounted `ldk-server` TLS certificate |
 | `SSP_SWAP_FEE_SATS` | Flat leaf-swap fee |
 | `SSP_INSTANT_MAX_OUTSTANDING_SATS` | Maximum pending instant credit; default `0` disables new advances |

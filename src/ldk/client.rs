@@ -222,22 +222,23 @@ impl LdkClient {
                 if config.ldk_grpc_addr.is_empty() {
                     return Err("LDK_GRPC_ADDR unset".into());
                 }
-                let api_key = if !config.ldk_api_key.is_empty() {
-                    config.ldk_api_key.clone()
-                } else if !config.ldk_api_key_file.is_empty() {
-                    hex::encode(
-                        std::fs::read(&config.ldk_api_key_file)
-                            .map_err(|e| format!("read LDK_API_KEY_FILE: {e}"))?,
-                    )
+                // ldk-server stores the macaroon as hex text (not raw bytes like the old API key).
+                let macaroon = if !config.ldk_macaroon.is_empty() {
+                    config.ldk_macaroon.trim().to_string()
+                } else if !config.ldk_macaroon_file.is_empty() {
+                    std::fs::read_to_string(&config.ldk_macaroon_file)
+                        .map_err(|e| format!("read LDK_MACAROON_FILE: {e}"))?
+                        .trim()
+                        .to_string()
                 } else {
-                    return Err("LDK_API_KEY or LDK_API_KEY_FILE required for server mode".into());
+                    return Err("LDK_MACAROON or LDK_MACAROON_FILE required for server mode".into());
                 };
-                if api_key.is_empty() {
-                    return Err("empty LDK api key".into());
+                if macaroon.is_empty() {
+                    return Err("empty LDK macaroon".into());
                 }
                 let cert = std::fs::read(&config.ldk_tls_cert_file)
                     .map_err(|e| format!("read LDK_TLS_CERT_FILE: {e}"))?;
-                let client = LdkServerClient::new(config.ldk_grpc_addr.clone(), api_key, &cert)?;
+                let client = LdkServerClient::new(config.ldk_grpc_addr.clone(), macaroon, &cert)?;
                 let info = tokio::time::timeout(
                     std::time::Duration::from_secs(15),
                     client.get_node_info(GetNodeInfoRequest {}),

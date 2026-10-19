@@ -55,7 +55,7 @@ struct LdkClient {
     cli: PathBuf,
     data: PathBuf,
     address: String,
-    api_key: String,
+    macaroon: String,
 }
 
 struct Wallet {
@@ -132,12 +132,14 @@ impl TestConfig {
 impl LdkClient {
     async fn connect(runtime: &native::Runtime, service: &str) -> Result<Self> {
         let data = runtime.data(service);
-        let api_key = hex::encode(std::fs::read(data.join("regtest/api_key"))?);
-        ensure!(!api_key.is_empty(), "LDK API key is empty");
+        let macaroon = std::fs::read_to_string(data.join("regtest/macaroons/admin.macaroon"))?
+            .trim()
+            .to_string();
+        ensure!(!macaroon.is_empty(), "LDK macaroon is empty");
         Ok(Self {
             cli: runtime.ldk_cli(),
             data,
-            api_key,
+            macaroon,
             address: format!(
                 "localhost:{}",
                 if service == "ldk-server" { 3536 } else { 3537 }
@@ -151,8 +153,8 @@ impl LdkClient {
                 .args([
                     "--base-url",
                     &self.address,
-                    "--api-key",
-                    &self.api_key,
+                    "--macaroon",
+                    &self.macaroon,
                     "--tls-cert",
                 ])
                 .arg(self.data.join("tls.crt"))
