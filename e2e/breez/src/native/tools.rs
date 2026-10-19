@@ -167,8 +167,8 @@ pub async fn provision(root: &Path) -> Result<()> {
     provision_electrs(root).await?;
     download(
         &dir.join("atlas"),
-        "https://release.ariga.io/atlas/atlas-community-linux-amd64-v1.0.0",
-        "9933f9a75cad6962ba0cf39813ecc2b1454aa35e952e4bcc36ee714c921ac860",
+        "https://release.ariga.io/atlas/atlas-community-linux-amd64-v1.3.0",
+        "10d7913e3dce43ab99b8d71534a4cbadaf11a16dc293adf3b91d10e83a0ac70b",
     )
     .await?;
     std::fs::set_permissions(dir.join("atlas"), std::fs::Permissions::from_mode(0o755))?;
