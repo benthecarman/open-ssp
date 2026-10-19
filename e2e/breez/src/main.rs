@@ -1422,8 +1422,9 @@ async fn send_bolt12(
     let offer_response = recipient_ldk
         .json(&[
             "bolt12-receive",
-            "breez-bolt12-send",
             &format!("{amount_sats}sat"),
+            "--description",
+            "breez-bolt12-send",
             "--expiry-secs",
             "300",
         ])
