@@ -152,11 +152,11 @@ pub async fn provision(root: &Path) -> Result<()> {
     std::fs::create_dir_all(&dir)?;
     download(
         &dir.join("bitcoin.tar.gz"),
-        "https://bitcoincore.org/bin/bitcoin-core-29.0/bitcoin-29.0-x86_64-linux-gnu.tar.gz",
-        "a681e4f6ce524c338a105f214613605bac6c33d58c31dc5135bbc02bc458bb6c",
+        "https://bitcoincore.org/bin/bitcoin-core-31.1/bitcoin-31.1-x86_64-linux-gnu.tar.gz",
+        "b80d9c3e04da78fb6f0569685673418cf686fadba9042d926d13fb87ff503f9e",
     )
     .await?;
-    if !dir.join("bitcoin-29.0/bin/bitcoind").is_file() {
+    if !dir.join("bitcoin-31.1/bin/bitcoind").is_file() {
         run(Command::new("tar")
             .arg("-xzf")
             .arg(dir.join("bitcoin.tar.gz"))
