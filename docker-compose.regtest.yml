@@ -238,7 +238,7 @@ services:
       - "127.0.0.1:3536:3536"
       - "127.0.0.1:19735:9735"
     healthcheck:
-      test: ["CMD-SHELL", "test -r /data/regtest/api_key && ldk-server-cli --base-url localhost:3536 --api-key $$(od -A n -t x1 /data/regtest/api_key | tr -d ' \\n') --tls-cert /data/tls.crt get-node-info >/dev/null"]
+      test: ["CMD-SHELL", "test -r /data/regtest/macaroons/admin.macaroon && ldk-server-cli --base-url localhost:3536 --macaroon $$(tr -d '[:space:]' < /data/regtest/macaroons/admin.macaroon) --tls-cert /data/tls.crt get-node-info >/dev/null"]
       interval: 10s
       timeout: 5s
       retries: 12
@@ -252,9 +252,9 @@ services:
         PID=$$!
         trap 'kill -TERM "$$PID"' TERM INT
         while kill -0 "$$PID" 2>/dev/null; do
-          if [ -f /data/regtest/api_key ] && [ -f /data/tls.crt ]; then
-            chmod 0755 /data/regtest
-            chmod 0444 /data/regtest/api_key /data/tls.crt
+          if [ -f /data/regtest/macaroons/admin.macaroon ] && [ -f /data/tls.crt ]; then
+            chmod 0755 /data/regtest /data/regtest/macaroons
+            chmod 0444 /data/regtest/macaroons/admin.macaroon /data/tls.crt
             break
           fi
           sleep 1
@@ -284,9 +284,9 @@ services:
         PID=$$!
         trap 'kill -TERM "$$PID"' TERM INT
         while kill -0 "$$PID" 2>/dev/null; do
-          if [ -f /data/regtest/api_key ] && [ -f /data/tls.crt ]; then
-            chmod 0755 /data/regtest
-            chmod 0444 /data/regtest/api_key /data/tls.crt
+          if [ -f /data/regtest/macaroons/admin.macaroon ] && [ -f /data/tls.crt ]; then
+            chmod 0755 /data/regtest /data/regtest/macaroons
+            chmod 0444 /data/regtest/macaroons/admin.macaroon /data/tls.crt
             break
           fi
           sleep 1
@@ -294,7 +294,7 @@ services:
         wait "$$PID"
     restart: unless-stopped
     healthcheck:
-      test: ["CMD-SHELL", "test -r /data/regtest/api_key && ldk-server-cli --base-url localhost:3536 --api-key $$(od -A n -t x1 /data/regtest/api_key | tr -d ' \\n') --tls-cert /data/tls.crt get-node-info >/dev/null"]
+      test: ["CMD-SHELL", "test -r /data/regtest/macaroons/admin.macaroon && ldk-server-cli --base-url localhost:3536 --macaroon $$(tr -d '[:space:]' < /data/regtest/macaroons/admin.macaroon) --tls-cert /data/tls.crt get-node-info >/dev/null"]
       interval: 10s
       timeout: 5s
       retries: 12
@@ -350,8 +350,8 @@ services:
       SPARK_ADMIN_TOKEN: ${SPARK_ADMIN_TOKEN:?set SPARK_ADMIN_TOKEN}
       # Live LDK backend: bitcoind-backed ldk-server above.
       LDK_GRPC_ADDR: ${LDK_GRPC_ADDR:-ldk-server:3536}
-      LDK_API_KEY: ${LDK_API_KEY:-}
-      LDK_API_KEY_FILE: ${LDK_API_KEY_FILE:-/ldk-data/regtest/api_key}
+      LDK_MACAROON: ${LDK_MACAROON:-}
+      LDK_MACAROON_FILE: ${LDK_MACAROON_FILE:-/ldk-data/regtest/macaroons/admin.macaroon}
       LDK_TLS_CERT_FILE: ${LDK_TLS_CERT_FILE:-/ldk-data/tls.crt}
       SSP_SWAP_FEE_SATS: 0
       SSP_FROST_THRESHOLD: 2
@@ -403,7 +403,7 @@ services:
       SSP_MIN_SPLIT_CHILD_SATS: 330
       SPARK_ADMIN_TOKEN: ${SPARK_ADMIN_TOKEN:?set SPARK_ADMIN_TOKEN}
       LDK_GRPC_ADDR: ldk-server-2:3536
-      LDK_API_KEY_FILE: /ldk-data/regtest/api_key
+      LDK_MACAROON_FILE: /ldk-data/regtest/macaroons/admin.macaroon
       LDK_TLS_CERT_FILE: /ldk-data/tls.crt
       SSP_SWAP_FEE_SATS: 0
       SSP_FROST_THRESHOLD: 2

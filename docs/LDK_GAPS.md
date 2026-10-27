@@ -5,11 +5,11 @@ embedded `ldk-node` (`LDK_BACKEND=embedded`) and keeps all Spark settlement
 state in the SSP. See [backend configuration](../README.md#lightning-backend). This document lists the current integration boundary and
 verified limitations.
 
-The client and server are pinned to `c31191ae6cf70b22b49473b2b435656fc3516ef9`.
+The client and server are pinned to `762bc473342c8f945475785ec6743a9b26f56aff`.
 Upgrade SSP and LDK server together: the payment event layout, payment ID
 field, pagination tokens, and BOLT11 claim/fail RPCs changed upstream.
 
-Embedded mode pins LDK Node to `b1337d2f1665716313d2ccf849a04114f8b3ca19`,
+Embedded mode pins LDK Node to `179b4b263762155a7ff515ddad7e757a80807fd5`,
 the revision used by this server. It supports Esplora or Bitcoin Core RPC chain sources, filesystem
 storage, and a persistent event queue. Blocking node calls run off the async
 executor. Both transports provide the same payment snapshots to the settlement
@@ -177,8 +177,8 @@ See [SSP API coverage](SSP_API_COVERAGE.md) for the operation-level status.
 
 ## Deployment requirements
 
-Production must provide `LDK_GRPC_ADDR`, either `LDK_API_KEY` or
-`LDK_API_KEY_FILE`, and `LDK_TLS_CERT_FILE`. Authenticated `/status` must report
+Production must provide `LDK_GRPC_ADDR`, either `LDK_MACAROON` or
+`LDK_MACAROON_FILE`, and `LDK_TLS_CERT_FILE`. Authenticated `/status` must report
 `ldk_mode: "live"` and the expected `ldk_node_id`; `/health` reports only basic
 process liveness.
 
