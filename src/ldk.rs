@@ -1852,7 +1852,7 @@ mod tests {
             }
             if self
                 .failures
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |value| {
+                .try_update(Ordering::SeqCst, Ordering::SeqCst, |value| {
                     value.checked_sub(1)
                 })
                 .is_ok()
@@ -1889,7 +1889,7 @@ mod tests {
             self.log.lock().push("claim");
             if self
                 .failures
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |value| {
+                .try_update(Ordering::SeqCst, Ordering::SeqCst, |value| {
                     value.checked_sub(1)
                 })
                 .is_ok()

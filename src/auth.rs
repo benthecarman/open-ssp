@@ -145,8 +145,8 @@ fn decode_signature(encoded: &str) -> Result<Signature, String> {
     URL_SAFE_NO_PAD
         .decode(encoded)
         .ok()
-        .and_then(&parse)
-        .or_else(|| B64.decode(encoded).ok().and_then(&parse))
+        .and_then(parse)
+        .or_else(|| B64.decode(encoded).ok().and_then(parse))
         .or_else(|| hex::decode(encoded).ok().and_then(parse))
         .ok_or_else(|| "malformed signature".to_string())
 }

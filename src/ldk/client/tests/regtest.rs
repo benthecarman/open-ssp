@@ -169,7 +169,7 @@ async fn payments_and_restart(source: LdkChainSource) {
         let http_port = port();
         let electrs_log = File::create(chain_dir.0.join("electrs.log")).unwrap();
         let electrs = std::env::var("LDK_TEST_ELECTRS")
-            .unwrap_or_else(|_| ".regtest/native-tools/electrs".into());
+            .unwrap_or_else(|_| ".regtest/native-build/electrs/release/electrs".into());
         let electrs = Process(
             Command::new(electrs)
                 .args([
